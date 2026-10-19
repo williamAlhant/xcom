@@ -64,6 +64,15 @@ struct ConnectArgs {
     /// Write the largest window's final frame to this PPM file (test aid).
     #[arg(long)]
     dump_ppm: Option<std::path::PathBuf>,
+    /// Map windows fullscreen (test aid for screen-vs-store comparison).
+    #[arg(long)]
+    fullscreen: bool,
+    /// Test aid: type this text (Latin-1) after the session comes up.
+    #[arg(long, allow_hyphen_values = true)]
+    type_text: Option<String>,
+    /// Seconds to wait before typing (lets windows open and take focus).
+    #[arg(long, default_value_t = 3)]
+    type_delay: u64,
 }
 
 struct Handshake {
@@ -223,6 +232,22 @@ fn main() -> Result<()> {
         proxy_ctrl.send_event(UserEvent::ConnectionLost).ok();
     });
 
+    if let Some(text) = args.type_text.clone() {
+        let tx = input_tx.clone();
+        let delay = args.type_delay;
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(delay));
+            eprintln!("[xcom] typing {text:?}");
+            for c in text.chars() {
+                let sym = c as u32;
+                for pressed in [true, false] {
+                    tx.send(Message::InputKey { sym, pressed }).ok();
+                }
+                std::thread::sleep(Duration::from_millis(30));
+            }
+        });
+    }
+
     if args.seconds > 0 {
         let proxy_timer = proxy.clone();
         let secs = args.seconds;
@@ -241,7 +266,7 @@ fn main() -> Result<()> {
         proxy_bulk.send_event(UserEvent::ConnectionLost).ok();
     });
 
-    let mut app = App::new(proxy, input_tx, args.dump_ppm.clone());
+    let mut app = App::new(proxy, input_tx, args.dump_ppm.clone(), args.fullscreen);
     let result = event_loop.run_app(&mut app).context("event loop");
 
     if let Some(mut ssh) = handshake.ssh.take() {

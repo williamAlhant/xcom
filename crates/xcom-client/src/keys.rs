@@ -71,3 +71,29 @@ pub fn keysym_for(key: &Key) -> Option<u32> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use winit::keyboard::{Key, NamedKey};
+
+    #[test]
+    fn character_keys() {
+        assert_eq!(keysym_for(&Key::Character("e".into())), Some(0x65));
+        assert_eq!(keysym_for(&Key::Character("E".into())), Some(0x45));
+        assert_eq!(keysym_for(&Key::Character("1".into())), Some(0x31));
+        assert_eq!(keysym_for(&Key::Character(" ".into())), Some(0x20));
+        assert_eq!(keysym_for(&Key::Character("é".into())), Some(0xe9));
+    }
+
+    #[test]
+    fn named_keys() {
+        assert_eq!(keysym_for(&Key::Named(NamedKey::Enter)), Some(XK_RETURN));
+        assert_eq!(keysym_for(&Key::Named(NamedKey::Escape)), Some(XK_ESCAPE));
+        assert_eq!(keysym_for(&Key::Named(NamedKey::ArrowLeft)), Some(XK_LEFT));
+        assert_eq!(keysym_for(&Key::Named(NamedKey::Space)), Some(0x20));
+        assert_eq!(keysym_for(&Key::Named(NamedKey::Shift)), Some(XK_SHIFT_L));
+        assert_eq!(keysym_for(&Key::Named(NamedKey::F5)), Some(XK_F1 + 4));
+        assert_eq!(keysym_for(&Key::Named(NamedKey::CapsLock)), None);
+    }
+}

@@ -25,6 +25,7 @@ pub const MSG_WINDOW_DESTROY: u8 = 11;
 pub const MSG_WINDOW_GEOMETRY: u8 = 12;
 
 // Input and control (client -> server).
+pub const MSG_FOCUS: u8 = 19;
 pub const MSG_INPUT_KEY: u8 = 20;
 pub const MSG_INPUT_BUTTON: u8 = 21;
 pub const MSG_INPUT_MOTION: u8 = 22;
@@ -189,6 +190,10 @@ pub enum Message {
         w: u16,
         h: u16,
     },
+    /// Keyboard focus moved to this remote window (client -> server).
+    Focus {
+        window: u32,
+    },
     InputKey {
         sym: u32,
         pressed: bool,
@@ -275,6 +280,7 @@ impl Message {
             Message::WindowCreate { .. } => MSG_WINDOW_CREATE,
             Message::WindowDestroy { .. } => MSG_WINDOW_DESTROY,
             Message::WindowGeometry { .. } => MSG_WINDOW_GEOMETRY,
+            Message::Focus { .. } => MSG_FOCUS,
             Message::InputKey { .. } => MSG_INPUT_KEY,
             Message::InputButton { .. } => MSG_INPUT_BUTTON,
             Message::InputMotion { .. } => MSG_INPUT_MOTION,
@@ -311,6 +317,7 @@ impl Message {
                 put_u16(&mut out, *w);
                 put_u16(&mut out, *h);
             }
+            Message::Focus { window } => put_u32(&mut out, *window),
             Message::InputKey { sym, pressed } => {
                 put_u32(&mut out, *sym);
                 out.push(*pressed as u8);
@@ -363,6 +370,9 @@ impl Message {
                 id: take_u32(&mut p)?,
                 w: take_u16(&mut p)?,
                 h: take_u16(&mut p)?,
+            },
+            MSG_FOCUS => Message::Focus {
+                window: take_u32(&mut p)?,
             },
             MSG_INPUT_KEY => Message::InputKey {
                 sym: take_u32(&mut p)?,
@@ -601,6 +611,7 @@ mod tests {
                 w: 1024,
                 h: 768,
             },
+            Message::Focus { window: 7 },
             Message::InputKey {
                 sym: 0xff0d,
                 pressed: true,

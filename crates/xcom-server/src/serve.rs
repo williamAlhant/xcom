@@ -251,6 +251,9 @@ fn control_loop(
                 Message::InputKey { sym, pressed } => {
                     injector.key(sym, pressed)?;
                 }
+                Message::Focus { window } => {
+                    injector.focus(window)?;
+                }
                 Message::InputButton {
                     window,
                     button,
@@ -261,6 +264,11 @@ fn control_loop(
                     let (rx, ry) = root_coords(&geo, window, x, y);
                     injector.motion(rx, ry)?;
                     injector.button(button, pressed)?;
+                    if pressed && button == 1 {
+                        // Click-to-focus (there is no WM on the virtual
+                        // display to do it for us).
+                        injector.focus(window)?;
+                    }
                 }
                 Message::InputMotion { window, x, y } => {
                     let (rx, ry) = root_coords(&geo, window, x, y);
@@ -350,10 +358,16 @@ fn is_timeout(e: &xcom_transport::TransportError) -> bool {
     io.kind() == std::io::ErrorKind::WouldBlock || io.kind() == std::io::ErrorKind::TimedOut
 }
 
-/// Bookkeeping for the "second chance" full sync.
+/// Bookkeeping for the post-paint full sync.
+///
+/// A window's pixmap is undefined until the app paints it (toolkits like GTK
+/// draw everything themselves; map-time captures can read recycled server
+/// memory), and a resize leaves newly exposed regions undefined the same way.
+/// Damage frames only ever cover the rects the app drew, so garbage outside
+/// them would survive forever: after every full sync, re-sync once more a bit
+/// later, unconditionally, to overwrite it with what the app has painted.
 struct SyncState {
     last_full: Instant,
-    damaged_since: bool,
     attempts: u8,
 }
 
@@ -376,7 +390,6 @@ fn serve_loop(
                 w,
                 SyncState {
                     last_full: Instant::now(),
-                    damaged_since: false,
                     attempts: 1,
                 },
             )
@@ -406,20 +419,16 @@ fn serve_loop(
                 win,
                 SyncState {
                     last_full: Instant::now(),
-                    damaged_since: false,
                     attempts: 1,
                 },
             );
         }
 
-        // Second-chance syncs for windows that never produced damage.
+        // Post-paint re-syncs (see SyncState): overwrite undefined pixmap
+        // regions with whatever the app has painted in the meantime.
         let stale: Vec<Window> = sync
             .iter()
-            .filter(|(_, s)| {
-                !s.damaged_since
-                    && s.attempts < 2
-                    && s.last_full.elapsed() >= Duration::from_millis(300)
-            })
+            .filter(|(_, s)| s.attempts < 3 && s.last_full.elapsed() >= Duration::from_millis(400))
             .map(|(w, _)| *w)
             .collect();
         for win in stale {
@@ -444,15 +453,23 @@ fn serve_loop(
                     shutdown.store(true, Ordering::SeqCst);
                     return Ok(());
                 }
-                if let Some(st) = sync.get_mut(&frame.window) {
-                    st.damaged_since = true;
-                }
                 stats_frames += 1;
                 stats_raw += stats.raw_bytes as u64;
                 stats_comp += stats.comp_bytes as u64;
             }
             Some(PumpEvent::Mapped(win)) => {
                 if let Some((x, y, w, h)) = session.window_geometry(win) {
+                    // No WM on this display: give new windows keyboard focus,
+                    // or XTEST keystrokes go to whatever the pointer is over.
+                    session
+                        .connection()
+                        .set_input_focus(
+                            xproto::InputFocus::PARENT,
+                            win,
+                            xproto::Timestamp::from(0u32),
+                        )
+                        .map_err(|e| anyhow::anyhow!("set_input_focus: {e}"))?;
+                    session.connection().flush().ok();
                     let title = windows::window_name(session.connection().as_ref(), win)
                         .unwrap_or_default();
                     geo.lock().unwrap().insert(win, (x, y));
@@ -473,7 +490,6 @@ fn serve_loop(
                         win,
                         SyncState {
                             last_full: Instant::now(),
-                            damaged_since: false,
                             attempts: 1,
                         },
                     );
@@ -499,6 +515,15 @@ fn serve_loop(
                     geo.lock().unwrap().insert(window, (x, y));
                 }
                 ctrl_tx.send(Message::WindowGeometry { id: window, w, h }).ok();
+                // Newly exposed regions are undefined until the app repaints:
+                // schedule post-paint re-syncs like on map.
+                sync.insert(
+                    window,
+                    SyncState {
+                        last_full: Instant::now(),
+                        attempts: 1,
+                    },
+                );
             }
             None => {}
         }

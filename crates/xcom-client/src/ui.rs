@@ -110,7 +110,11 @@ impl Pixels {
                         break;
                     }
                     let b = &decode_buf[src_off + col * 4..src_off + col * 4 + 4];
-                    self.buf[dst_off + col] = u32::from_le_bytes(b.try_into().unwrap());
+                    // X's 4th byte is undefined padding for depth-24 windows;
+                    // present it as opaque or compositors blend us into the
+                    // desktop (Wayland ARGB).
+                    self.buf[dst_off + col] =
+                        u32::from_le_bytes(b.try_into().unwrap()) | 0xff00_0000;
                 }
             }
         }
@@ -138,6 +142,7 @@ pub struct App {
     presents: u64,
     present_errors: u64,
     dump: Option<PathBuf>,
+    fullscreen: bool,
 }
 
 impl App {
@@ -145,6 +150,7 @@ impl App {
         _proxy: EventLoopProxy<UserEvent>,
         input_tx: Sender<Message>,
         dump: Option<PathBuf>,
+        fullscreen: bool,
     ) -> App {
         App {
             input_tx,
@@ -156,6 +162,7 @@ impl App {
             presents: 0,
             present_errors: 0,
             dump,
+            fullscreen,
         }
     }
 
@@ -184,6 +191,15 @@ impl App {
             return;
         };
         let pix = &self.pixels[&id];
+        // Alpha bytes come from X's undefined padding for depth-24 windows and
+        // matter on Wayland (ARGB); histogram them to see what we are shipping.
+        let mut alphas = std::collections::HashMap::<u8, u64>::new();
+        for px in &pix.buf {
+            *alphas.entry((px >> 24) as u8).or_default() += 1;
+        }
+        let mut alphas: Vec<(u8, u64)> = alphas.into_iter().collect();
+        alphas.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+        eprintln!("[ui] store alpha histogram: {:#04x?}", &alphas[..alphas.len().min(6)]);
         let store = ppm_bytes(pix.w, pix.h, &pix.buf);
         match std::fs::write(path, &store) {
             Ok(()) => eprintln!("[ui] dumped store {}x{} to {}", pix.w, pix.h, path.display()),
@@ -246,6 +262,11 @@ impl App {
         };
         let attrs = Window::default_attributes()
             .with_title(title)
+            .with_fullscreen(if self.fullscreen {
+                Some(winit::window::Fullscreen::Borderless(None))
+            } else {
+                None
+            })
             // 1:1 pixel mapping for now; DPI-aware scaling lands with M3.
             .with_inner_size(PhysicalSize::new(w, h))
             .with_position(winit::dpi::PhysicalPosition::new(
@@ -328,7 +349,7 @@ impl App {
         // Letterbox: rows of the remote image into the local surface. With the
         // current 1:1 mapping this is an exact copy except after WM/DPI
         // rounding; M3 adds scaling.
-        buf.fill(0);
+        buf.fill(0xff00_0000); // opaque black, never transparent
         let lw = att.local.0 as usize;
         let (rw, rh) = (pix.w as usize, pix.h as usize);
         if lw > 0 {
@@ -513,6 +534,12 @@ impl ApplicationHandler<UserEvent> for App {
                         y,
                     });
                 }
+            }
+            WindowEvent::Focused(true) => {
+                // Keyboard focus follows OS window focus: without a WM on the
+                // remote display, XTEST keystrokes would go to whatever the
+                // remote pointer happens to be over.
+                self.send(Message::Focus { window: remote });
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.repeat {
