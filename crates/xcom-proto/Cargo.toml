@@ -1,0 +1,9 @@
+[package]
+name = "xcom-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Wire protocol for the xcom channel"
+
+[dependencies]
+libc = { workspace = true }

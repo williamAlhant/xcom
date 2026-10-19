@@ -1,0 +1,23 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/xcom-codec",
+    "crates/xcom-proto",
+    "crates/xcom-x11",
+    "crates/xcom-server",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+libc = "0.2"
+lz4_flex = "0.11"
+x11rb = { version = "0.13", features = ["composite", "damage", "shm", "xfixes", "xtest"] }
+
+[profile.release]
+debug = true

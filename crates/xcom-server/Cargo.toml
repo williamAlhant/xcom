@@ -1,0 +1,19 @@
+[package]
+name = "xcom-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "xcom session daemon (xcomd)"
+
+[[bin]]
+name = "xcomd"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+libc = { workspace = true }
+x11rb = { workspace = true }
+xcom-codec = { path = "../xcom-codec" }
+xcom-proto = { path = "../xcom-proto" }
+xcom-x11 = { path = "../xcom-x11" }

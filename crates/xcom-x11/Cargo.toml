@@ -1,0 +1,13 @@
+[package]
+name = "xcom-x11"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "X11 display lifecycle, window capture and input injection for xcom"
+
+[dependencies]
+anyhow = { workspace = true }
+libc = { workspace = true }
+x11rb = { workspace = true }
+xcom-codec = { path = "../xcom-codec" }
+xcom-proto = { path = "../xcom-proto" }
