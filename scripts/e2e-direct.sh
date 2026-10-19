@@ -44,14 +44,19 @@ TOKEN=$(sed -n 's/.*"token":"\([^"]*\)".*/\1/p' <<< "$LINE")
 FP=$(sed -n 's/.*"cert_sha256":"\([^"]*\)".*/\1/p' <<< "$LINE")
 
 DISPLAY=${CLIENT_DISPLAY:-:0} "$XCOM" connect --direct "$ADDR" --token "$TOKEN" \
-    --fingerprint "$FP" --seconds "$SECS" > "$OUT/client.log" 2>&1 || true
+    --fingerprint "$FP" --seconds "$SECS" --dump-ppm "$OUT/frame.ppm" \
+    > "$OUT/client.log" 2>&1 || true
 
 echo "--- client ---"
 cat "$OUT/client.log"
 echo "--- server ---"
 grep -vE '^\[serve\] (waiting|client)' "$OUT/serve.log" | tail -8
 
-if grep -qE '[1-9][0-9]* frames blitted' "$OUT/client.log" && grep -q 'window .* opened' "$OUT/client.log"; then
+PASS=1
+grep -qE '[1-9][0-9]* frames blitted' "$OUT/client.log" || PASS=0
+grep -q 'window .* opened' "$OUT/client.log" || PASS=0
+python3 "$REPO/scripts/check-ppm.py" "$OUT/frame.ppm" box || PASS=0
+if [ "$PASS" = 1 ]; then
     echo "=== e2e-direct: PASS ==="
 else
     echo "=== e2e-direct: FAIL ==="

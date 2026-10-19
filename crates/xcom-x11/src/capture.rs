@@ -537,6 +537,8 @@ impl CaptureSession {
         stats.encode_ns = encode_ns;
         let frame = DamageFrame {
             window: win,
+            win_w: state.w,
+            win_h: state.h,
             t_event_ns,
             t_capture_ns,
             rects: wire,

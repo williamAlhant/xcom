@@ -58,9 +58,16 @@ pub struct WireRect {
 }
 
 /// One damage batch: everything that was dirty in a window when we sampled it.
+///
+/// Frames are self-describing: `win_w`/`win_h` are the window's size at capture
+/// time and the blit stride, so a frame is correct even when it arrives before
+/// its `WindowCreate` (the two channels are not ordered against each other) or
+/// while a resize is in flight.
 #[derive(Debug)]
 pub struct DamageFrame {
     pub window: u32,
+    pub win_w: u16,
+    pub win_h: u16,
     /// Monotonic ns when the first damage event of this batch was seen.
     pub t_event_ns: u64,
     /// Monotonic ns after capture+encode of the whole frame.
@@ -70,12 +77,14 @@ pub struct DamageFrame {
 
 impl DamageFrame {
     pub fn encoded_len(&self) -> usize {
-        4 + 8 + 8 + 2 + self.rects.iter().map(|r| 17 + r.data.len()).sum::<usize>()
+        4 + 2 + 2 + 8 + 8 + 2 + self.rects.iter().map(|r| 17 + r.data.len()).sum::<usize>()
     }
 
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.encoded_len());
         out.extend_from_slice(&self.window.to_le_bytes());
+        out.extend_from_slice(&self.win_w.to_le_bytes());
+        out.extend_from_slice(&self.win_h.to_le_bytes());
         out.extend_from_slice(&self.t_event_ns.to_le_bytes());
         out.extend_from_slice(&self.t_capture_ns.to_le_bytes());
         out.extend_from_slice(&(self.rects.len() as u16).to_le_bytes());
@@ -103,6 +112,8 @@ impl DamageFrame {
             Ok(a)
         };
         let window = u32::from_le_bytes(take(4)?.try_into().unwrap());
+        let win_w = u16::from_le_bytes(take(2)?.try_into().unwrap());
+        let win_h = u16::from_le_bytes(take(2)?.try_into().unwrap());
         let t_event_ns = u64::from_le_bytes(take(8)?.try_into().unwrap());
         let t_capture_ns = u64::from_le_bytes(take(8)?.try_into().unwrap());
         let nrects = u16::from_le_bytes(take(2)?.try_into().unwrap());
@@ -128,6 +139,8 @@ impl DamageFrame {
         }
         Ok(DamageFrame {
             window,
+            win_w,
+            win_h,
             t_event_ns,
             t_capture_ns,
             rects,
@@ -546,6 +559,8 @@ mod tests {
     fn damage_roundtrip() {
         let f = DamageFrame {
             window: 42,
+            win_w: 800,
+            win_h: 600,
             t_event_ns: 111,
             t_capture_ns: 222,
             rects: vec![
@@ -563,6 +578,7 @@ mod tests {
         let bytes = f.encode();
         let g = DamageFrame::decode(&bytes).unwrap();
         assert_eq!(g.window, 42);
+        assert_eq!((g.win_w, g.win_h), (800, 600));
         assert_eq!(g.t_event_ns, 111);
         assert_eq!(g.rects.len(), 1);
         assert_eq!(g.rects[0].data, vec![7, 8, 9]);

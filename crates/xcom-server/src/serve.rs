@@ -8,6 +8,7 @@
 
 use std::io::Write;
 use std::process::{Command, Stdio};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
@@ -349,6 +350,13 @@ fn is_timeout(e: &xcom_transport::TransportError) -> bool {
     io.kind() == std::io::ErrorKind::WouldBlock || io.kind() == std::io::ErrorKind::TimedOut
 }
 
+/// Bookkeeping for the "second chance" full sync.
+struct SyncState {
+    last_full: Instant,
+    damaged_since: bool,
+    attempts: u8,
+}
+
 fn serve_loop(
     session: &mut CaptureSession,
     mut bulk: Channel,
@@ -357,6 +365,24 @@ fn serve_loop(
     shutdown: &AtomicBool,
     geo: &GeometryMap,
 ) -> Result<()> {
+    // A window's first full frame can be captured before the app has painted
+    // (and a freshly named pixmap may hold recycled memory). Static apps never
+    // send damage to correct it, so re-sync any window that produced no damage
+    // shortly after its full frame — a couple of attempts, not an endless poll.
+    let mut sync: HashMap<Window, SyncState> = session
+        .windows()
+        .map(|w| {
+            (
+                w,
+                SyncState {
+                    last_full: Instant::now(),
+                    damaged_since: false,
+                    attempts: 1,
+                },
+            )
+        })
+        .collect();
+
     let mut stats_frames = 0u64;
     let mut stats_raw = 0u64;
     let mut stats_comp = 0u64;
@@ -376,6 +402,38 @@ fn serve_loop(
                     return Ok(());
                 }
             }
+            sync.insert(
+                win,
+                SyncState {
+                    last_full: Instant::now(),
+                    damaged_since: false,
+                    attempts: 1,
+                },
+            );
+        }
+
+        // Second-chance syncs for windows that never produced damage.
+        let stale: Vec<Window> = sync
+            .iter()
+            .filter(|(_, s)| {
+                !s.damaged_since
+                    && s.attempts < 2
+                    && s.last_full.elapsed() >= Duration::from_millis(300)
+            })
+            .map(|(w, _)| *w)
+            .collect();
+        for win in stale {
+            if let Some(st) = sync.get_mut(&win) {
+                st.attempts += 1;
+                st.last_full = Instant::now();
+            }
+            if let Some((frame, _)) = session.capture_full(win)? {
+                let payload = frame.encode();
+                if bulk.send(MSG_DAMAGE, &payload).is_err() {
+                    shutdown.store(true, Ordering::SeqCst);
+                    return Ok(());
+                }
+            }
         }
 
         match session.pump(Some(Instant::now() + Duration::from_millis(200)))? {
@@ -385,6 +443,9 @@ fn serve_loop(
                     eprintln!("[serve] bulk channel closed");
                     shutdown.store(true, Ordering::SeqCst);
                     return Ok(());
+                }
+                if let Some(st) = sync.get_mut(&frame.window) {
+                    st.damaged_since = true;
                 }
                 stats_frames += 1;
                 stats_raw += stats.raw_bytes as u64;
@@ -408,6 +469,14 @@ fn serve_loop(
                     // A freshly mapped window has no damage history: send one
                     // full frame so static windows (xterm idle, dialogs) show
                     // up immediately.
+                    sync.insert(
+                        win,
+                        SyncState {
+                            last_full: Instant::now(),
+                            damaged_since: false,
+                            attempts: 1,
+                        },
+                    );
                     match session.capture_full(win)? {
                         Some((frame, _)) => {
                             eprintln!("[serve] mapped: full frame {win:#x} ({} rects)", frame.rects.len());

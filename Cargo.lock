@@ -2262,6 +2262,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "raw-window-handle",
  "softbuffer",
  "winit",
  "xcom-codec",

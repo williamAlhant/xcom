@@ -61,6 +61,9 @@ struct ConnectArgs {
     /// Command to launch in the remote session (e.g. "xterm").
     #[arg(long, allow_hyphen_values = true)]
     exec: Option<String>,
+    /// Write the largest window's final frame to this PPM file (test aid).
+    #[arg(long)]
+    dump_ppm: Option<std::path::PathBuf>,
 }
 
 struct Handshake {
@@ -212,9 +215,12 @@ fn main() -> Result<()> {
     // Control thread: input out, window lifecycle in.
     let proxy_ctrl = proxy.clone();
     std::thread::spawn(move || {
-        if let Err(e) = control_loop(control, proxy_ctrl, input_rx) {
+        if let Err(e) = control_loop(control, proxy_ctrl.clone(), input_rx) {
             eprintln!("[xcom] control channel: {e}");
         }
+        // EOF or error: the session is gone — make the UI close its windows
+        // instead of leaving stale content on screen.
+        proxy_ctrl.send_event(UserEvent::ConnectionLost).ok();
     });
 
     if args.seconds > 0 {
@@ -229,12 +235,13 @@ fn main() -> Result<()> {
     // Bulk thread: damage frames in.
     let proxy_bulk = proxy.clone();
     std::thread::spawn(move || {
-        if let Err(e) = bulk_loop(bulk, proxy_bulk) {
+        if let Err(e) = bulk_loop(bulk, proxy_bulk.clone()) {
             eprintln!("[xcom] bulk channel: {e}");
         }
+        proxy_bulk.send_event(UserEvent::ConnectionLost).ok();
     });
 
-    let mut app = App::new(proxy, input_tx);
+    let mut app = App::new(proxy, input_tx, args.dump_ppm.clone());
     let result = event_loop.run_app(&mut app).context("event loop");
 
     if let Some(mut ssh) = handshake.ssh.take() {
