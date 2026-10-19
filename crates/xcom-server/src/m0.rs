@@ -22,7 +22,7 @@ use x11rb::protocol::Event;
 
 use xcom_codec::decompress;
 use xcom_proto::{now_ns, DamageFrame, FrameReader, FrameWriter, MSG_DAMAGE, MSG_HELLO, PROTO_VERSION};
-use xcom_x11::capture::{CaptureConfig, Capturer, DamageMode};
+use xcom_x11::capture::{CaptureConfig, CaptureSession, DamageMode, PumpEvent};
 use xcom_x11::input::Injector;
 use xcom_x11::keymap::{Keymap, XK_ESCAPE, XK_RETURN};
 use xcom_x11::windows;
@@ -72,7 +72,8 @@ fn parse_window(s: &str) -> Option<Window> {
 
 #[derive(clap::Args)]
 pub struct AnimArgs {
-    #[arg(long, default_value = ":9")]
+    /// X display; defaults to $DISPLAY, then :9.
+    #[arg(long, default_value = "")]
     pub display: String,
     /// Window size, e.g. 800x600.
     #[arg(long, default_value = "800x600")]
@@ -98,8 +99,13 @@ pub enum AnimMode {
 
 fn anim(args: AnimArgs) -> Result<()> {
     let (w, h) = parse_size(&args.size)?;
-    let (conn, screen_num) = x11rb::connect(Some(&args.display))
-        .with_context(|| format!("connecting to {}", args.display))?;
+    let display = if args.display.is_empty() {
+        std::env::var("DISPLAY").unwrap_or_else(|_| ":9".to_string())
+    } else {
+        args.display.clone()
+    };
+    let (conn, screen_num) = x11rb::connect(Some(display.as_str()))
+        .with_context(|| format!("connecting to {display}"))?;
     let screen = &conn.setup().roots[screen_num];
     let root = screen.root;
 
@@ -305,7 +311,7 @@ fn resolve_window(conn: &impl Connection, root: Window, spec: &str) -> Result<Wi
         return Ok(win);
     }
     let needle = spec.strip_prefix("auto:").unwrap_or("first");
-    let tops = windows::list_top_levels(conn, root)?;
+    let tops = windows::list_top_levels(conn, root, true)?;
     let candidates: Vec<String> = tops
         .iter()
         .map(|t| {
@@ -346,7 +352,8 @@ fn capture(args: CaptureArgs) -> Result<()> {
         },
         max_rects: args.max_rects,
     };
-    let mut cap = Capturer::from_connection(conn, screen_num, win, cfg)?;
+    let mut cap = CaptureSession::from_connection(conn, screen_num, cfg)?;
+    let (_, _, win_w, win_h) = cap.add_window(win)?;
 
     let stream = TcpStream::connect(&args.target)
         .with_context(|| format!("connecting to sink {}", args.target))?;
@@ -358,10 +365,7 @@ fn capture(args: CaptureArgs) -> Result<()> {
     hello.extend_from_slice(&win.to_le_bytes());
     w.write(MSG_HELLO, &hello)?;
 
-    eprintln!(
-        "capturing {win:#010x} ({}x{}) -> {}",
-        cap.width, cap.height, args.target
-    );
+    eprintln!("capturing {win:#010x} ({win_w}x{win_h}) -> {}", args.target);
 
     let deadline =
         (args.seconds > 0).then(|| Instant::now() + Duration::from_secs(args.seconds));
@@ -380,7 +384,7 @@ fn capture(args: CaptureArgs) -> Result<()> {
                 break;
             }
         }
-        let Some((frame, stats)) = cap.pump(deadline)? else {
+        let Some(PumpEvent::Frame { frame, stats, .. }) = cap.pump(deadline)? else {
             continue;
         };
         let payload = frame.encode();
@@ -462,9 +466,29 @@ fn sink(args: SinkArgs) -> Result<()> {
     let listener = TcpListener::bind(&args.listen)
         .with_context(|| format!("binding {}", args.listen))?;
     eprintln!("[sink] listening on {}", args.listen);
-    let (sock, peer) = listener.accept()?;
+
+    // Bound the wait for a connection too: --seconds is a wall-clock limit for
+    // the whole run, not just for the connected phase.
+    let accept_deadline =
+        (args.seconds > 0).then(|| Instant::now() + Duration::from_secs(args.seconds));
+    listener.set_nonblocking(true)?;
+    let sock = loop {
+        match listener.accept() {
+            Ok((sock, peer)) => {
+                eprintln!("[sink] connection from {peer}");
+                break sock;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if accept_deadline.is_some_and(|d| Instant::now() >= d) {
+                    bail!("no connection within {}s", args.seconds);
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => return Err(e.into()),
+        }
+    };
+    sock.set_nonblocking(false)?;
     sock.set_nodelay(true)?;
-    eprintln!("[sink] connection from {peer}");
 
     // A watchdog shuts the socket down at the deadline: the frame reader below
     // blocks in read_exact and would otherwise never notice the deadline.

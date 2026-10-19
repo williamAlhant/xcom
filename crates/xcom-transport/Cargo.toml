@@ -1,0 +1,14 @@
+[package]
+name = "xcom-transport"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "TLS-pinned secure channel, token handshake and framing for xcom"
+
+[dependencies]
+getrandom = "0.3"
+rcgen = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+sha2 = "0.10"
+thiserror = "2"
+xcom-proto = { path = "../xcom-proto" }

@@ -1,8 +1,10 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/xcom-client",
     "crates/xcom-codec",
     "crates/xcom-proto",
+    "crates/xcom-transport",
     "crates/xcom-x11",
     "crates/xcom-server",
 ]

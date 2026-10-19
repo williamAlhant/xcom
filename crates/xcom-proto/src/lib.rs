@@ -16,6 +16,21 @@ pub const MSG_HELLO: u8 = 1;
 pub const MSG_DAMAGE: u8 = 2;
 pub const MSG_PING: u8 = 3;
 pub const MSG_PONG: u8 = 4;
+pub const MSG_AUTH_OK: u8 = 5;
+pub const MSG_AUTH_REJECTED: u8 = 6;
+
+// Window lifecycle (server -> client).
+pub const MSG_WINDOW_CREATE: u8 = 10;
+pub const MSG_WINDOW_DESTROY: u8 = 11;
+pub const MSG_WINDOW_GEOMETRY: u8 = 12;
+
+// Input and control (client -> server).
+pub const MSG_INPUT_KEY: u8 = 20;
+pub const MSG_INPUT_BUTTON: u8 = 21;
+pub const MSG_INPUT_MOTION: u8 = 22;
+pub const MSG_RESIZE: u8 = 23;
+pub const MSG_FULL_REQUEST: u8 = 24;
+pub const MSG_BYE: u8 = 25;
 
 /// Monotonic nanoseconds, comparable between processes on the same host.
 pub fn now_ns() -> u64 {
@@ -30,6 +45,7 @@ pub fn now_ns() -> u64 {
 }
 
 /// One damaged rectangle's pixels on the wire.
+#[derive(Debug)]
 pub struct WireRect {
     pub x: u16,
     pub y: u16,
@@ -42,6 +58,7 @@ pub struct WireRect {
 }
 
 /// One damage batch: everything that was dirty in a window when we sampled it.
+#[derive(Debug)]
 pub struct DamageFrame {
     pub window: u32,
     /// Monotonic ns when the first damage event of this batch was seen.
@@ -123,6 +140,7 @@ pub enum ProtoError {
     Truncated,
     Io(std::io::Error),
     EmptyFrame,
+    BadMessage(&'static str),
 }
 
 impl std::fmt::Display for ProtoError {
@@ -131,15 +149,314 @@ impl std::fmt::Display for ProtoError {
             ProtoError::Truncated => write!(f, "truncated message"),
             ProtoError::Io(e) => write!(f, "io: {e}"),
             ProtoError::EmptyFrame => write!(f, "empty frame"),
+            ProtoError::BadMessage(m) => write!(f, "bad message: {m}"),
         }
     }
 }
 
 impl std::error::Error for ProtoError {}
 
+/// Everything except damage frames (which carry raw pixel payloads and stay
+/// on the fast [`DamageFrame`] path).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Message {
+    WindowCreate {
+        id: u32,
+        x: i16,
+        y: i16,
+        w: u16,
+        h: u16,
+        title: String,
+    },
+    WindowDestroy {
+        id: u32,
+    },
+    WindowGeometry {
+        id: u32,
+        w: u16,
+        h: u16,
+    },
+    InputKey {
+        sym: u32,
+        pressed: bool,
+    },
+    InputButton {
+        window: u32,
+        button: u8,
+        pressed: bool,
+        x: i16,
+        y: i16,
+    },
+    InputMotion {
+        window: u32,
+        x: i16,
+        y: i16,
+    },
+    Resize {
+        id: u32,
+        w: u16,
+        h: u16,
+    },
+    FullRequest {
+        id: u32,
+    },
+    Ping {
+        t: u64,
+    },
+    Pong {
+        t: u64,
+    },
+    Bye,
+}
+
+fn put_u16(out: &mut Vec<u8>, v: u16) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+fn put_u32(out: &mut Vec<u8>, v: u32) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+fn put_i16(out: &mut Vec<u8>, v: i16) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+fn put_u64(out: &mut Vec<u8>, v: u64) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+fn take<'a>(p: &mut &'a [u8], n: usize) -> Result<&'a [u8], ProtoError> {
+    if p.len() < n {
+        return Err(ProtoError::Truncated);
+    }
+    let (a, b) = p.split_at(n);
+    *p = b;
+    Ok(a)
+}
+
+fn take_u16(p: &mut &[u8]) -> Result<u16, ProtoError> {
+    Ok(u16::from_le_bytes(take(p, 2)?.try_into().unwrap()))
+}
+
+fn take_i16(p: &mut &[u8]) -> Result<i16, ProtoError> {
+    Ok(i16::from_le_bytes(take(p, 2)?.try_into().unwrap()))
+}
+
+fn take_u32(p: &mut &[u8]) -> Result<u32, ProtoError> {
+    Ok(u32::from_le_bytes(take(p, 4)?.try_into().unwrap()))
+}
+
+fn take_u64(p: &mut &[u8]) -> Result<u64, ProtoError> {
+    Ok(u64::from_le_bytes(take(p, 8)?.try_into().unwrap()))
+}
+
+fn take_str(p: &mut &[u8]) -> Result<String, ProtoError> {
+    let len = take_u16(p)? as usize;
+    let bytes = take(p, len)?;
+    String::from_utf8(bytes.to_vec()).map_err(|_| ProtoError::BadMessage("title not utf8"))
+}
+
+impl Message {
+    pub fn msg_type(&self) -> u8 {
+        match self {
+            Message::WindowCreate { .. } => MSG_WINDOW_CREATE,
+            Message::WindowDestroy { .. } => MSG_WINDOW_DESTROY,
+            Message::WindowGeometry { .. } => MSG_WINDOW_GEOMETRY,
+            Message::InputKey { .. } => MSG_INPUT_KEY,
+            Message::InputButton { .. } => MSG_INPUT_BUTTON,
+            Message::InputMotion { .. } => MSG_INPUT_MOTION,
+            Message::Resize { .. } => MSG_RESIZE,
+            Message::FullRequest { .. } => MSG_FULL_REQUEST,
+            Message::Ping { .. } => MSG_PING,
+            Message::Pong { .. } => MSG_PONG,
+            Message::Bye => MSG_BYE,
+        }
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(32);
+        match self {
+            Message::WindowCreate {
+                id,
+                x,
+                y,
+                w,
+                h,
+                title,
+            } => {
+                put_u32(&mut out, *id);
+                put_i16(&mut out, *x);
+                put_i16(&mut out, *y);
+                put_u16(&mut out, *w);
+                put_u16(&mut out, *h);
+                put_u16(&mut out, title.len() as u16);
+                out.extend_from_slice(title.as_bytes());
+            }
+            Message::WindowDestroy { id } => put_u32(&mut out, *id),
+            Message::WindowGeometry { id, w, h } => {
+                put_u32(&mut out, *id);
+                put_u16(&mut out, *w);
+                put_u16(&mut out, *h);
+            }
+            Message::InputKey { sym, pressed } => {
+                put_u32(&mut out, *sym);
+                out.push(*pressed as u8);
+            }
+            Message::InputButton {
+                window,
+                button,
+                pressed,
+                x,
+                y,
+            } => {
+                put_u32(&mut out, *window);
+                out.push(*button);
+                out.push(*pressed as u8);
+                put_i16(&mut out, *x);
+                put_i16(&mut out, *y);
+            }
+            Message::InputMotion { window, x, y } => {
+                put_u32(&mut out, *window);
+                put_i16(&mut out, *x);
+                put_i16(&mut out, *y);
+            }
+            Message::Resize { id, w, h } => {
+                put_u32(&mut out, *id);
+                put_u16(&mut out, *w);
+                put_u16(&mut out, *h);
+            }
+            Message::FullRequest { id } => put_u32(&mut out, *id),
+            Message::Ping { t } | Message::Pong { t } => put_u64(&mut out, *t),
+            Message::Bye => {}
+        }
+        out
+    }
+
+    pub fn decode(msg_type: u8, payload: &[u8]) -> Result<Message, ProtoError> {
+        let mut p = payload;
+        Ok(match msg_type {
+            MSG_WINDOW_CREATE => Message::WindowCreate {
+                id: take_u32(&mut p)?,
+                x: take_i16(&mut p)?,
+                y: take_i16(&mut p)?,
+                w: take_u16(&mut p)?,
+                h: take_u16(&mut p)?,
+                title: take_str(&mut p)?,
+            },
+            MSG_WINDOW_DESTROY => Message::WindowDestroy {
+                id: take_u32(&mut p)?,
+            },
+            MSG_WINDOW_GEOMETRY => Message::WindowGeometry {
+                id: take_u32(&mut p)?,
+                w: take_u16(&mut p)?,
+                h: take_u16(&mut p)?,
+            },
+            MSG_INPUT_KEY => Message::InputKey {
+                sym: take_u32(&mut p)?,
+                pressed: take(&mut p, 1)?[0] != 0,
+            },
+            MSG_INPUT_BUTTON => Message::InputButton {
+                window: take_u32(&mut p)?,
+                button: take(&mut p, 1)?[0],
+                pressed: take(&mut p, 1)?[0] != 0,
+                x: take_i16(&mut p)?,
+                y: take_i16(&mut p)?,
+            },
+            MSG_INPUT_MOTION => Message::InputMotion {
+                window: take_u32(&mut p)?,
+                x: take_i16(&mut p)?,
+                y: take_i16(&mut p)?,
+            },
+            MSG_RESIZE => Message::Resize {
+                id: take_u32(&mut p)?,
+                w: take_u16(&mut p)?,
+                h: take_u16(&mut p)?,
+            },
+            MSG_FULL_REQUEST => Message::FullRequest {
+                id: take_u32(&mut p)?,
+            },
+            MSG_PING => Message::Ping { t: take_u64(&mut p)? },
+            MSG_PONG => Message::Pong { t: take_u64(&mut p)? },
+            MSG_BYE => Message::Bye,
+            _ => return Err(ProtoError::BadMessage("unknown message type")),
+        })
+    }
+
+    /// Send on the channel and receive the decoded reply counterpart.
+    pub fn send<W: std::io::Write>(&self, w: &mut W) -> Result<(), ProtoError> {
+        write_frame(w, self.msg_type(), &self.encode())
+    }
+}
+
 impl From<std::io::Error> for ProtoError {
     fn from(e: std::io::Error) -> Self {
         ProtoError::Io(e)
+    }
+}
+
+/// Writes one framed message: `u32le payload_len | u8 msg_type | payload`.
+pub fn write_frame<W: std::io::Write>(
+    w: &mut W,
+    msg_type: u8,
+    payload: &[u8],
+) -> Result<(), ProtoError> {
+    let mut hdr = [0u8; 5];
+    hdr[..4].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+    hdr[4] = msg_type;
+    w.write_all(&hdr)?;
+    w.write_all(payload)?;
+    Ok(())
+}
+
+/// Resumable frame reader state (no I/O ownership).
+///
+/// Partial frames survive `WouldBlock`/`TimedOut`, which makes it safe to use
+/// on sockets with read timeouts — the control channel polls with a short
+/// timeout so it can interleave outbound writes.
+#[derive(Default)]
+pub struct FrameState {
+    hdr: [u8; 5],
+    hdr_have: usize,
+    payload: Vec<u8>,
+    payload_have: usize,
+}
+
+impl FrameState {
+    /// Try to read one frame from `r`.
+    ///
+    /// `Ok(None)` = clean EOF between frames, `Err(Io(WouldBlock|TimedOut))` =
+    /// nothing arrived yet (any partial frame is kept for the next call).
+    pub fn read_from<R: std::io::Read>(
+        &mut self,
+        r: &mut R,
+    ) -> Result<Option<(u8, Vec<u8>)>, ProtoError> {
+        while self.hdr_have < self.hdr.len() {
+            match r.read(&mut self.hdr[self.hdr_have..]) {
+                Ok(0) if self.hdr_have == 0 => return Ok(None),
+                Ok(0) => return Err(ProtoError::Truncated),
+                Ok(n) => self.hdr_have += n,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        if self.payload.is_empty() && self.payload_have == 0 {
+            let len = u32::from_le_bytes(self.hdr[..4].try_into().unwrap()) as usize;
+            if len > 512 << 20 {
+                return Err(ProtoError::Truncated);
+            }
+            self.payload.resize(len, 0);
+        }
+        while self.payload_have < self.payload.len() {
+            match r.read(&mut self.payload[self.payload_have..]) {
+                Ok(0) => return Err(ProtoError::Truncated),
+                Ok(n) => self.payload_have += n,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        let msg_type = self.hdr[4];
+        let payload = std::mem::take(&mut self.payload);
+        self.hdr_have = 0;
+        self.payload_have = 0;
+        Ok(Some((msg_type, payload)))
     }
 }
 
@@ -154,12 +471,7 @@ impl<W: std::io::Write> FrameWriter<W> {
     }
 
     pub fn write(&mut self, msg_type: u8, payload: &[u8]) -> Result<(), ProtoError> {
-        let mut hdr = [0u8; 5];
-        hdr[..4].copy_from_slice(&(payload.len() as u32).to_le_bytes());
-        hdr[4] = msg_type;
-        self.inner.write_all(&hdr)?;
-        self.inner.write_all(payload)?;
-        Ok(())
+        write_frame(&mut self.inner, msg_type, payload)
     }
 
     pub fn flush(&mut self) -> Result<(), ProtoError> {
@@ -175,31 +487,35 @@ impl<W: std::io::Write> FrameWriter<W> {
 /// Reads length-prefixed frames from a stream.
 pub struct FrameReader<R> {
     inner: R,
+    state: FrameState,
 }
 
 impl<R: std::io::Read> FrameReader<R> {
     pub fn new(inner: R) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            state: FrameState::default(),
+        }
     }
 
-    /// Returns `None` on clean EOF between frames.
+    /// Blocking read of the next frame. Returns `None` on clean EOF.
     pub fn read(&mut self) -> Result<Option<(u8, Vec<u8>)>, ProtoError> {
-        let mut hdr = [0u8; 5];
-        match self.inner.read_exact(&mut hdr) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-            Err(e) => return Err(e.into()),
+        loop {
+            match self.state.read_from(&mut self.inner) {
+                Err(ProtoError::Io(e))
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    continue;
+                }
+                other => return other,
+            }
         }
-        let len = u32::from_le_bytes(hdr[..4].try_into().unwrap()) as usize;
-        if len == 0 {
-            return Err(ProtoError::EmptyFrame);
-        }
-        if len > 512 << 20 {
-            return Err(ProtoError::Truncated);
-        }
-        let mut payload = vec![0u8; len];
-        self.inner.read_exact(&mut payload)?;
-        Ok(Some((hdr[4], payload)))
+    }
+
+    /// One non-blocking attempt (state preserved on timeout).
+    pub fn try_read(&mut self) -> Result<Option<(u8, Vec<u8>)>, ProtoError> {
+        self.state.read_from(&mut self.inner)
     }
 
     pub fn into_inner(self) -> R {
@@ -250,5 +566,55 @@ mod tests {
         assert_eq!(g.t_event_ns, 111);
         assert_eq!(g.rects.len(), 1);
         assert_eq!(g.rects[0].data, vec![7, 8, 9]);
+    }
+
+    #[test]
+    fn message_roundtrip() {
+        let msgs = vec![
+            Message::WindowCreate {
+                id: 7,
+                x: -1,
+                y: 2,
+                w: 800,
+                h: 600,
+                title: "xterm — ü".to_string(),
+            },
+            Message::WindowDestroy { id: 7 },
+            Message::WindowGeometry {
+                id: 7,
+                w: 1024,
+                h: 768,
+            },
+            Message::InputKey {
+                sym: 0xff0d,
+                pressed: true,
+            },
+            Message::InputButton {
+                window: 7,
+                button: 1,
+                pressed: false,
+                x: 10,
+                y: 20,
+            },
+            Message::InputMotion {
+                window: 7,
+                x: -5,
+                y: 5,
+            },
+            Message::Resize {
+                id: 7,
+                w: 640,
+                h: 480,
+            },
+            Message::FullRequest { id: 7 },
+            Message::Ping { t: 123456789 },
+            Message::Pong { t: 123456789 },
+            Message::Bye,
+        ];
+        for m in msgs {
+            let bytes = m.encode();
+            let back = Message::decode(m.msg_type(), &bytes).unwrap();
+            assert_eq!(m, back);
+        }
     }
 }

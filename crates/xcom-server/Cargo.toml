@@ -16,4 +16,5 @@ libc = { workspace = true }
 x11rb = { workspace = true }
 xcom-codec = { path = "../xcom-codec" }
 xcom-proto = { path = "../xcom-proto" }
+xcom-transport = { path = "../xcom-transport" }
 xcom-x11 = { path = "../xcom-x11" }

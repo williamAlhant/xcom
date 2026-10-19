@@ -39,7 +39,8 @@ impl Xvfb {
             .args([
                 display.as_str(),
                 "-screen",
-                &format!("0 {width}x{height}x24"),
+                "0",
+                &format!("{width}x{height}x24"),
                 "-ac",
                 "-nolisten",
                 "tcp",

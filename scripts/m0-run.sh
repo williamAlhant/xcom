@@ -16,6 +16,11 @@ PORT=${PORT:-$((7800 + RANDOM % 200))}
 
 OUT=/tmp/opencode/m0
 mkdir -p "$OUT"
+
+if ! DISPLAY="$DISPLAY_NUM" xdpyinfo >/dev/null 2>&1; then
+    echo "error: X display $DISPLAY_NUM is not reachable (start Xvfb first)" >&2
+    exit 1
+fi
 SINK_LOG="$OUT/sink-$MODE-$DAMAGE.log"
 SRC_LOG="$OUT/src-$MODE.log"
 CAP_LOG="$OUT/cap-$MODE-$DAMAGE.log"

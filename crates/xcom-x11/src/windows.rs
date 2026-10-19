@@ -17,9 +17,14 @@ pub struct TopLevel {
 
 /// Children of `root` that look like application top-levels.
 ///
-/// Override-redirect windows (menus, tooltips, drags) are excluded here: they
-/// are mapped independently later, since they must follow their parent.
-pub fn list_top_levels<C: Connection>(conn: &C, root: Window) -> Result<Vec<TopLevel>> {
+/// Override-redirect windows (menus, tooltips, drags) are excluded unless
+/// `include_override_redirect` is set: the capture session wants everything,
+/// while window selection UIs usually don't.
+pub fn list_top_levels<C: Connection>(
+    conn: &C,
+    root: Window,
+    include_override_redirect: bool,
+) -> Result<Vec<TopLevel>> {
     let tree = conn.query_tree(root)?.reply()?;
     let mut out = Vec::new();
     for win in tree.children {
@@ -27,7 +32,7 @@ pub fn list_top_levels<C: Connection>(conn: &C, root: Window) -> Result<Vec<TopL
             Ok(a) => a,
             Err(_) => continue,
         };
-        if attrs.override_redirect {
+        if attrs.override_redirect && !include_override_redirect {
             continue;
         }
         let geom = match conn.get_geometry(win)?.reply() {
@@ -82,7 +87,7 @@ pub fn find_by_name<C: Connection>(
     needle: &str,
 ) -> Result<Option<TopLevel>> {
     let needle = needle.to_lowercase();
-    let tops = list_top_levels(conn, root)?;
+    let tops = list_top_levels(conn, root, false)?;
     Ok(tops
         .into_iter()
         .find(|t| t.mapped && t.name.to_lowercase().contains(&needle)))
