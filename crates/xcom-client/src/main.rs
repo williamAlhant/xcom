@@ -248,7 +248,7 @@ fn main() -> Result<()> {
         let delay = args.type_delay;
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_secs(delay));
-            eprintln!("[xcom] typing {text:?}");
+            eprintln!("[xcom] typing {text:?} t_ns={}", xcom_proto::now_ns());
             for c in text.chars() {
                 let sym = c as u32;
                 for pressed in [true, false] {

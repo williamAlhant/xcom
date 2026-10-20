@@ -316,6 +316,7 @@ fn control_loop(
                 }
                 _ => {}
             },
+
             Ok(None) => {
                 eprintln!("[serve] client left (control channel closed)");
                 shutdown.store(true, Ordering::SeqCst);

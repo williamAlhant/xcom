@@ -101,6 +101,24 @@ if [ "${CHECK_KEYS:-0}" = 1 ]; then
     else
         PASS=0
     fi
+    # Latency: keys must not sit in a user-space buffer until unrelated
+    # traffic flushes them (that made typing feel late and bursty).
+    TT=$(grep '\[xcom\] typing' "$OUT/client-ssh.log" | grep -o 't_ns=[0-9]*' | head -1 | cut -d= -f2 || true)
+    FIRST=$(grep -o 't_ns=[0-9]*' <<< "$PODLOG" | head -1 | cut -d= -f2 || true)
+    LAST=$(grep -o 't_ns=[0-9]*' <<< "$PODLOG" | tail -1 | cut -d= -f2 || true)
+    if [ -n "$TT" ] && [ -n "$FIRST" ] && [ -n "$LAST" ]; then
+        LAT_MS=$(( (FIRST - TT) / 1000000 ))
+        SPREAD_MS=$(( (LAST - FIRST) / 1000000 ))
+        echo "check-keys: first key after ${LAT_MS}ms, key spread ${SPREAD_MS}ms"
+        if [ "$LAT_MS" -lt 0 ] || [ "$LAT_MS" -gt 300 ]; then
+            echo "check-keys: FAIL - input latency ${LAT_MS}ms (buffer not flushed?)"
+            PASS=0
+        fi
+        if [ "$SPREAD_MS" -gt 500 ]; then
+            echo "check-keys: FAIL - bursty delivery (${SPREAD_MS}ms spread for 5 keys 30ms apart)"
+            PASS=0
+        fi
+    fi
 fi
 
 if [ "$PASS" = 1 ]; then

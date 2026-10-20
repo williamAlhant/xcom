@@ -33,6 +33,10 @@ impl<'c, C: Connection> Injector<'c, C> {
         self.conn
             .xtest_fake_input(type_, detail, Timestamp::from(0u32), self.root, x, y, 0)
             .map_err(|e| anyhow::anyhow!(e))?;
+        // x11rb buffers requests: without an explicit flush the XTest event
+        // sits in userspace until unrelated traffic happens to flush it, so
+        // keystrokes arrive late and in bursts. Flush per event.
+        self.conn.flush().map_err(|e| anyhow::anyhow!(e))?;
         Ok(())
     }
 
