@@ -68,6 +68,16 @@ impl Rect {
         Rect::new(x, y, (r - x as u32) as u16, (b - y as u32) as u16)
     }
 
+    /// Grow by `n` pixels on every side (saturating; clamp afterwards).
+    pub const fn padded(self, n: u16) -> Rect {
+        Rect::new(
+            self.x.saturating_sub(n),
+            self.y.saturating_sub(n),
+            self.w.saturating_add(n.saturating_mul(2)),
+            self.h.saturating_add(n.saturating_mul(2)),
+        )
+    }
+
     /// Clamp to a `w`x`h` drawable; returns an empty rect when fully outside.
     pub const fn clamped(self, w: u16, h: u16) -> Rect {
         let x = if self.x > w { w } else { self.x };

@@ -57,6 +57,8 @@ pub enum UserEvent {
     ConnectionLost,
     /// Test aid: resize the first local window (stress for the resize loop).
     ResizeLocal { w: u16, h: u16 },
+    /// Test aid: dump the store now (transient artifacts included).
+    Dump,
 }
 
 type Target = softbuffer::Surface<Arc<Window>, Arc<Window>>;
@@ -198,9 +200,18 @@ impl App {
             "[ui] presents={}, present_errors={}",
             self.presents, self.present_errors
         );
-        let Some(path) = &self.dump else {
+        self.dump("");
+    }
+
+    /// Write the largest window's pixel store as a PPM (test aid).
+    fn dump(&mut self, suffix: &str) {
+        let Some(base) = self.dump.clone() else {
             return;
         };
+        let mut path = base.clone();
+        if !suffix.is_empty() {
+            path = base.with_extension(format!("{suffix}ppm"));
+        }
         // Largest window: dump the pixel store, then read the *actual* window
         // contents back (X11) and compare — this is what catches presentation
         // bugs that frame counts and store dumps cannot.
@@ -223,7 +234,7 @@ impl App {
         alphas.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
         eprintln!("[ui] store alpha histogram: {:#04x?}", &alphas[..alphas.len().min(6)]);
         let store = ppm_bytes(pix.w, pix.h, &pix.buf);
-        match std::fs::write(path, &store) {
+        match std::fs::write(&path, &store) {
             Ok(()) => eprintln!("[ui] dumped store {}x{} to {}", pix.w, pix.h, path.display()),
             Err(e) => eprintln!("[ui] cannot dump {}: {e}", path.display()),
         }
@@ -393,6 +404,14 @@ impl App {
 
     fn blit_frame(&mut self, frame: &DamageFrame) {
         let id = frame.window;
+        if xcom_proto::debug() {
+            eprintln!(
+                "[ui] frame {id:#x} {}x{} rects={:?}",
+                frame.win_w,
+                frame.win_h,
+                frame.rects.iter().map(|r| (r.x, r.y, r.w, r.h)).collect::<Vec<_>>()
+            );
+        }
         // Never drop a frame: create the store if this is the first sign of the
         // window (its WindowCreate may still be in flight on the control channel).
         let pix = self
@@ -471,6 +490,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.send(Message::Bye);
                 el.exit();
             }
+            UserEvent::Dump => self.dump("mid."),
             UserEvent::ResizeLocal { w, h } => {
                 if let Some((id, att)) = self.attached.iter_mut().next() {
                     eprintln!("[ui] test resize {id:#x} -> {w}x{h}");
@@ -597,6 +617,19 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.repeat {
+                    return;
+                }
+                // Local hotkey: dump the store exactly when the user sees the
+                // artifact (not forwarded to the remote app).
+                if matches!(event.logical_key, winit::keyboard::Key::Named(
+                    winit::keyboard::NamedKey::F12
+                )) && event.state == ElementState::Pressed
+                {
+                    eprintln!("[ui] F12: dumping store and requesting full refresh");
+                    self.dump("mid.");
+                    if let Some(&id) = self.attached.keys().next() {
+                        self.send(Message::FullRequest { id });
+                    }
                     return;
                 }
                 let sym = keysym_for(&event.logical_key);

@@ -78,6 +78,9 @@ struct ConnectArgs {
     resize_to: Option<String>,
     #[arg(long, default_value_t = 2)]
     resize_after: u64,
+    /// Test aid: dump the store N seconds after start (mid-session).
+    #[arg(long, default_value_t = 0)]
+    dump_after: u64,
 }
 
 struct Handshake {
@@ -250,7 +253,13 @@ fn main() -> Result<()> {
             std::thread::sleep(Duration::from_secs(delay));
             eprintln!("[xcom] typing {text:?} t_ns={}", xcom_proto::now_ns());
             for c in text.chars() {
-                let sym = c as u32;
+                // Control characters map to their X keysyms, not their codes.
+                let sym = match c {
+                    '\u{8}' => 0xff08, // BackSpace
+                    '\n' => 0xff0d,    // Return
+                    '\t' => 0xff09,    // Tab
+                    _ => c as u32,
+                };
                 for pressed in [true, false] {
                     tx.send(Message::InputKey { sym, pressed }).ok();
                 }
@@ -271,6 +280,15 @@ fn main() -> Result<()> {
                 proxy_timer.send_event(UserEvent::ResizeLocal { w, h }).ok();
             });
         }
+    }
+
+    if args.dump_after > 0 {
+        let proxy_timer = proxy.clone();
+        let after = args.dump_after;
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(after));
+            proxy_timer.send_event(UserEvent::Dump).ok();
+        });
     }
 
     if args.seconds > 0 {

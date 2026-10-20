@@ -396,6 +396,13 @@ impl CaptureSession {
             !r.is_empty()
         });
         coalesce(&mut rects, self.cfg.max_rects);
+        // Toolkits (XRender glyph boxes in particular) can report damage a
+        // pixel narrower than the pixels that actually changed, leaving thin
+        // vertical slivers of erased text behind. One pixel of margin is
+        // nearly free and covers the rounding.
+        for r in &mut rects {
+            *r = r.padded(1).clamped(w, h);
+        }
         if rects.is_empty() {
             return Ok(());
         }

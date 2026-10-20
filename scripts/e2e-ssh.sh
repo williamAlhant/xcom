@@ -47,6 +47,9 @@ RESIZE_ARGS=""
 if [ -n "${RESIZE_TO:-}" ]; then
     RESIZE_ARGS="--resize-to $RESIZE_TO --resize-after ${RESIZE_AFTER:-2}"
 fi
+if [ -n "${DUMP_AFTER:-}" ] && [ "${DUMP_AFTER}" != 0 ]; then
+    RESIZE_ARGS="$RESIZE_ARGS --dump-after $DUMP_AFTER"
+fi
 
 DISPLAY=${CLIENT_DISPLAY:-:0} XCOM_DEBUG=${XCOM_DEBUG:-0} "$XCOM" connect --ssh xcom@127.0.0.1 \
     --ssh-args "$SSH_ARGS" --exec "$APP" \

@@ -252,7 +252,10 @@ fn control_loop(
                     if xcom_proto::debug() {
                         eprintln!("[serve] recv key sym={sym:#x} pressed={pressed}");
                     }
-                    injector.key(sym, pressed)?;
+                    if let Err(e) = injector.key(sym, pressed) {
+                        // A single unresolvable keysym must not end the session.
+                        eprintln!("[serve] key {sym:#x} dropped: {e}");
+                    }
                 }
                 Message::Focus { window } => {
                     if xcom_proto::debug() {
@@ -468,6 +471,15 @@ fn serve_loop(
 
         match session.pump(Some(Instant::now() + Duration::from_millis(200)))? {
             Some(PumpEvent::Frame { frame, stats, .. }) => {
+                if xcom_proto::debug() {
+                    eprintln!(
+                        "[serve] frame {:#x} {}x{} rects={:?}",
+                        frame.window,
+                        frame.win_w,
+                        frame.win_h,
+                        frame.rects.iter().map(|r| (r.x, r.y, r.w, r.h)).collect::<Vec<_>>()
+                    );
+                }
                 let payload = frame.encode();
                 if bulk.send(MSG_DAMAGE, &payload).is_err() {
                     eprintln!("[serve] bulk channel closed");

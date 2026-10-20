@@ -43,6 +43,8 @@ pub enum Cmd {
     Sink(SinkArgs),
     /// Inject keystrokes and verify+time what the app actually receives.
     InputTest(InputTestArgs),
+    /// Draw/erase a small cell through the real capture path and check pixels.
+    Selftest(SelftestArgs),
 }
 
 pub fn run(args: Args) -> Result<()> {
@@ -51,6 +53,7 @@ pub fn run(args: Args) -> Result<()> {
         Cmd::Capture(a) => capture(a),
         Cmd::Sink(a) => sink(a),
         Cmd::InputTest(a) => input_test(a),
+        Cmd::Selftest(a) => selftest(a),
     }
 }
 
@@ -642,8 +645,174 @@ fn print_interval(
 }
 
 // ---------------------------------------------------------------------------
+// selftest: small-rect capture correctness (the backspace-artifact class)
+// ---------------------------------------------------------------------------
+
+fn selftest(args: SelftestArgs) -> Result<()> {
+    use xcom_codec::decompress;
+    use xcom_x11::capture::{CaptureConfig, CaptureSession};
+
+    let spawned;
+    let display = if args.display.is_empty() {
+        spawned = Some(xcom_x11::xvfb::Xvfb::spawn(320, 240)?);
+        spawned.as_ref().unwrap().display.clone()
+    } else {
+        args.display.clone()
+    };
+    let (conn, screen_num) = x11rb::connect(Some(display.as_str()))?;
+    let root = conn.setup().roots[screen_num].root;
+
+    let win: Window = conn.generate_id()?.into();
+    conn.create_window(
+        0,
+        win,
+        root,
+        0,
+        0,
+        200,
+        100,
+        0,
+        WindowClass::INPUT_OUTPUT,
+        x11rb::COPY_FROM_PARENT,
+        &CreateWindowAux::new().background_pixel(0),
+    )?;
+    conn.map_window(win)?;
+    conn.flush()?;
+    std::thread::sleep(Duration::from_millis(100));
+
+    let mut session = CaptureSession::from_connection(conn, screen_num, CaptureConfig::default())?;
+    let draw_conn = session.connection();
+    session.add_window(win)?;
+
+    let (w, h) = session
+        .window_geometry(win)
+        .map(|(_, _, w, h)| (w, h))
+        .context("geometry")?;
+    let mut store = vec![0u32; w as usize * h as usize];
+
+    let apply = |store: &mut Vec<u32>,
+                 w: u16,
+                 frame: &xcom_proto::DamageFrame,
+                 buf: &mut Vec<u8>| {
+        for r in &frame.rects {
+            let _ = decompress(buf, r.codec, &r.data, r.raw_len as usize);
+            for row in 0..r.h as usize {
+                let dy = r.y as usize + row;
+                if dy >= store.len() / w as usize {
+                    break;
+                }
+                for col in 0..r.w as usize {
+                    let off = (row * r.w as usize + col) * 4;
+                    if off + 4 > buf.len() {
+                        break;
+                    }
+                    let px = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
+                    store[dy * w as usize + r.x as usize + col] = px;
+                }
+            }
+        }
+    };
+    let pixel = |store: &[u32], x: u16, y: u16, w: u16| store[y as usize * w as usize + x as usize] & 0x00ff_ffff;
+    let mut buf = Vec::new();
+
+    // Baseline: the whole window is black.
+    let (frame, _) = session.capture_full(win)?.context("initial full capture")?;
+    apply(&mut store, w, &frame, &mut buf);
+    if pixel(&store, 10, 10, w) != 0 {
+        bail!("selftest: baseline is not black");
+    }
+
+    // Draw one small white cell (like a character) and wait for damage.
+    draw_conn.poly_fill_rectangle(win, gc_of(&draw_conn, win, 0x00ff_ffff)?, &[Rectangle { x: 50, y: 20, width: 8, height: 16 }])?;
+    draw_conn.flush()?;
+    let (frame, _) = wait_frame(&mut session, Duration::from_secs(2))?
+        .context("no damage frame after drawing the cell")?;
+    let covered = frame
+        .rects
+        .iter()
+        .any(|r| r.x <= 50 && r.y <= 20 && r.x as u32 + r.w as u32 >= 58 && r.y as u32 + r.h as u32 >= 36);
+    apply(&mut store, w, &frame, &mut buf);
+    if !covered {
+        bail!("selftest: damage rect does not cover the drawn cell: {:?}", frame.rects.iter().map(|r| (r.x, r.y, r.w, r.h)).collect::<Vec<_>>());
+    }
+    if pixel(&store, 52, 25, w) != 0xffffff {
+        bail!("selftest: drawn cell is not white after incremental capture");
+    }
+
+    // Erase it again (the backspace case): the cell must become black.
+    draw_conn.poly_fill_rectangle(win, gc_of(&draw_conn, win, 0)?, &[Rectangle { x: 50, y: 20, width: 8, height: 16 }])?;
+    draw_conn.flush()?;
+    let (frame, _) = wait_frame(&mut session, Duration::from_secs(2))?
+        .context("no damage frame after erasing the cell")?;
+    apply(&mut store, w, &frame, &mut buf);
+    if pixel(&store, 52, 25, w) != 0 {
+        bail!(
+            "selftest: erased cell still shows content ({:#08x}); damage rects: {:?}",
+            pixel(&store, 52, 25, w),
+            frame.rects.iter().map(|r| (r.x, r.y, r.w, r.h)).collect::<Vec<_>>()
+        );
+    }
+
+    // The automated version of the F12 test: what the incremental damage path
+    // produced must equal a full capture of the same window. Any difference is
+    // a lost or undersized damage rect (thin slivers of erased text).
+    let mut full_store = vec![0u32; w as usize * h as usize];
+    let (full, _) = session.capture_full(win)?.context("final full capture")?;
+    apply(&mut full_store, w, &full, &mut buf);
+    let mut diff = 0usize;
+    let mut bbox = (w, h, 0u16, 0u16);
+    for y in 0..h {
+        for x in 0..w {
+            let i = y as usize * w as usize + x as usize;
+            if store[i] & 0x00ff_ffff != full_store[i] & 0x00ff_ffff {
+                diff += 1;
+                bbox = (bbox.0.min(x), bbox.1.min(y), bbox.2.max(x), bbox.3.max(y));
+            }
+        }
+    }
+    if diff > 0 {
+        bail!(
+            "selftest: incremental store differs from full capture in {diff} pixels, bbox {:?} (lost damage)",
+            bbox
+        );
+    }
+
+    println!("SELFTEST PASS: small draw+erase captured correctly ({}x{}), incremental == full", w, h);
+    Ok(())
+}
+
+fn gc_of(conn: &x11rb::rust_connection::RustConnection, win: Window, fg: u32) -> Result<Gcontext> {
+    let gc: Gcontext = conn.generate_id()?.into();
+    conn.create_gc(gc, win, &CreateGCAux::new().foreground(fg).graphics_exposures(0u32))?;
+    conn.flush()?;
+    Ok(gc)
+}
+
+fn wait_frame(
+    session: &mut xcom_x11::capture::CaptureSession,
+    timeout: Duration,
+) -> Result<Option<(xcom_proto::DamageFrame, xcom_x11::capture::FrameStats)>> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Some(PumpEvent::Frame { frame, stats, .. }) =
+            session.pump(Some(deadline))?
+        {
+            return Ok(Some((frame, stats)));
+        }
+    }
+    Ok(None)
+}
+
+// ---------------------------------------------------------------------------
 // input-test
 // ---------------------------------------------------------------------------
+
+#[derive(clap::Args)]
+pub struct SelftestArgs {
+    /// Existing display; default: spawn a private 320x240 one.
+    #[arg(long, default_value = "")]
+    pub display: String,
+}
 
 #[derive(clap::Args)]
 pub struct InputTestArgs {
