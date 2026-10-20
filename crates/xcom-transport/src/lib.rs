@@ -629,6 +629,41 @@ mod tests {
     }
 
     #[test]
+    fn peer_allowlist_admits_the_expected_peer() {
+        let (id, fp, ctrl, bulk) = identity_and_tokens();
+        let expected = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        let acceptor =
+            ChannelAcceptor::bind("127.0.0.1:0", &id, ctrl, bulk, Some(expected)).unwrap();
+        let addr = acceptor.local_addr().unwrap().to_string();
+        let server = std::thread::spawn(move || acceptor.accept(Role::Control, Duration::from_secs(3)));
+
+        let channel = connect(&addr, Role::Control, &fp, &ctrl, Duration::from_secs(2));
+        assert!(channel.is_ok(), "allowlisted peer rejected: {:?}", channel.err());
+        assert!(server.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn peer_allowlist_drops_other_addresses() {
+        let (id, fp, ctrl, bulk) = identity_and_tokens();
+        // TEST-NET-1: never the loopback address these tests connect from.
+        let other: std::net::IpAddr = "192.0.2.1".parse().unwrap();
+        let acceptor =
+            ChannelAcceptor::bind("127.0.0.1:0", &id, ctrl, bulk, Some(other)).unwrap();
+        let addr = acceptor.local_addr().unwrap().to_string();
+        let server = std::thread::spawn(move || acceptor.accept(Role::Control, Duration::from_secs(1)));
+
+        let channel = connect(&addr, Role::Control, &fp, &ctrl, Duration::from_secs(1));
+        assert!(
+            channel.is_err(),
+            "a peer outside the allowlist completed a handshake"
+        );
+        assert!(matches!(
+            server.join().unwrap(),
+            Err(TransportError::Timeout)
+        ));
+    }
+
+    #[test]
     fn tokens_are_single_use() {
         let (id, fp, ctrl, bulk) = identity_and_tokens();
         let acceptor = ChannelAcceptor::bind("127.0.0.1:0", &id, ctrl, bulk, None).unwrap();
