@@ -66,7 +66,7 @@ fn parse_size(s: &str) -> Result<(u16, u16)> {
 
 fn parse_window(s: &str) -> Option<Window> {
     let s = s.strip_prefix("0x").unwrap_or(s);
-    u32::from_str_radix(s, 16).ok().map(Window::from)
+    u32::from_str_radix(s, 16).ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -112,7 +112,7 @@ fn anim(args: AnimArgs) -> Result<()> {
     let screen = &conn.setup().roots[screen_num];
     let root = screen.root;
 
-    let win: Window = conn.generate_id()?.into();
+    let win: Window = conn.generate_id()?;
     conn.create_window(
         0, // depth = CopyFromParent
         win,
@@ -143,7 +143,7 @@ fn anim(args: AnimArgs) -> Result<()> {
     )?;
     conn.map_window(win)?;
 
-    let gc_bg: Gcontext = conn.generate_id()?.into();
+    let gc_bg: Gcontext = conn.generate_id()?;
     conn.create_gc(
         gc_bg,
         win,
@@ -151,7 +151,7 @@ fn anim(args: AnimArgs) -> Result<()> {
             .foreground(screen.black_pixel)
             .graphics_exposures(0u32),
     )?;
-    let gc_fg: Gcontext = conn.generate_id()?.into();
+    let gc_fg: Gcontext = conn.generate_id()?;
     conn.create_gc(
         gc_fg,
         win,
@@ -277,7 +277,7 @@ fn handle_anim_event(
     match ev {
         Event::KeyPress(e) => {
             let mods = u16::from(e.state);
-            let sym = keymap.keysym_for(u8::from(e.detail), mods).unwrap_or(0);
+            let sym = keymap.keysym_for(e.detail, mods).unwrap_or(0);
             if sym == XK_ESCAPE {
                 *quit = true;
             }
@@ -285,19 +285,17 @@ fn handle_anim_event(
                 writeln!(
                     log,
                     "recv sym={sym:#x} code={} state={mods:#x} t_ns={}",
-                    u8::from(e.detail),
+                    e.detail,
                     now_ns()
                 )?;
                 log.flush()?;
             }
         }
-        Event::ConfigureNotify(e) => {
-            if e.window == win {
-                println!("RESIZED {}x{}", e.width, e.height);
-                size.0 = e.width;
-                size.1 = e.height;
-                *redraw = true;
-            }
+        Event::ConfigureNotify(e) if e.window == win => {
+            println!("RESIZED {}x{}", e.width, e.height);
+            size.0 = e.width;
+            size.1 = e.height;
+            *redraw = true;
         }
         Event::Expose(_) => *redraw = true,
         _ => {}
@@ -558,12 +556,11 @@ fn sink(args: SinkArgs) -> Result<()> {
             }
         };
         match ty {
-            MSG_HELLO => {
-                if payload.len() >= 6 {
-                    let ver = u16::from_le_bytes(payload[..2].try_into().unwrap());
-                    eprintln!("[sink] hello: proto v{ver}");
-                }
+            MSG_HELLO if payload.len() >= 6 => {
+                let ver = u16::from_le_bytes(payload[..2].try_into().unwrap());
+                eprintln!("[sink] hello: proto v{ver}");
             }
+            MSG_HELLO => {}
             MSG_DAMAGE => {
                 let t_arrival = now_ns();
                 let frame = DamageFrame::decode(&payload)?;
@@ -612,6 +609,7 @@ fn sink(args: SinkArgs) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)] // flat report table, not a call site
 fn print_interval(
     frames: u64,
     rects: u64,
@@ -662,7 +660,7 @@ fn selftest(args: SelftestArgs) -> Result<()> {
     let (conn, screen_num) = x11rb::connect(Some(display.as_str()))?;
     let root = conn.setup().roots[screen_num].root;
 
-    let win: Window = conn.generate_id()?.into();
+    let win: Window = conn.generate_id()?;
     conn.create_window(
         0,
         win,
@@ -782,7 +780,7 @@ fn selftest(args: SelftestArgs) -> Result<()> {
 }
 
 fn gc_of(conn: &x11rb::rust_connection::RustConnection, win: Window, fg: u32) -> Result<Gcontext> {
-    let gc: Gcontext = conn.generate_id()?.into();
+    let gc: Gcontext = conn.generate_id()?;
     conn.create_gc(gc, win, &CreateGCAux::new().foreground(fg).graphics_exposures(0u32))?;
     conn.flush()?;
     Ok(gc)

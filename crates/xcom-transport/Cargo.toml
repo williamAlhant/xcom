@@ -10,5 +10,6 @@ getrandom = "0.3"
 rcgen = "0.13"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 sha2 = "0.10"
+socket2 = { workspace = true }
 thiserror = "2"
 xcom-proto = { path = "../xcom-proto" }

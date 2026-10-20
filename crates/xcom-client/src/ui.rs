@@ -30,7 +30,7 @@ use winit::window::{Window, WindowId};
 use xcom_codec::decompress;
 use xcom_proto::{DamageFrame, Message};
 
-use crate::keys::keysym_for;
+use crate::keys::{keysym_for, keysym_for_physical};
 
 /// Events from the network threads to the UI thread.
 pub enum UserEvent {
@@ -173,6 +173,8 @@ pub struct App {
     dump: Option<PathBuf>,
     dump_seq: u32,
     fullscreen: bool,
+    /// Test aids (F12 store dump) are opt-in: F12 belongs to the app otherwise.
+    debug_tools: bool,
 }
 
 /// Local and remote sizes within this many pixels are "the same size": window
@@ -190,6 +192,7 @@ impl App {
         input_tx: Sender<Message>,
         dump: Option<PathBuf>,
         fullscreen: bool,
+        debug_tools: bool,
     ) -> App {
         App {
             input_tx,
@@ -204,6 +207,7 @@ impl App {
             dump,
             dump_seq: 0,
             fullscreen,
+            debug_tools,
         }
     }
 
@@ -593,8 +597,14 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
-                let x = position.x.round() as i16;
-                let y = position.y.round() as i16;
+                // The presented image is 1:1 at (0,0); anything beyond the
+                // remote window is letterbox. Clamp, or a click in the band
+                // lands outside the app on the remote root.
+                let Some(pix) = self.pixels.get(&remote) else {
+                    return;
+                };
+                let x = (position.x.round() as i32).clamp(0, pix.w.max(1) as i32 - 1) as i16;
+                let y = (position.y.round() as i32).clamp(0, pix.h.max(1) as i32 - 1) as i16;
                 if xcom_proto::debug() {
                     eprintln!("[ui] motion ({x},{y}) local={:?}", {
                         let a = self.attached.get(&remote);
@@ -665,14 +675,15 @@ impl ApplicationHandler<UserEvent> for App {
                 self.send(Message::Focus { window: remote });
             }
             WindowEvent::KeyboardInput { event, .. } => {
-                if event.repeat {
-                    return;
-                }
-                // Local hotkey: dump the store exactly when the user sees the
-                // artifact (not forwarded to the remote app).
-                if matches!(event.logical_key, winit::keyboard::Key::Named(
-                    winit::keyboard::NamedKey::F12
-                )) && event.state == ElementState::Pressed
+                // Local hotkey (test aid): dump the store exactly when the user
+                // sees the artifact (not forwarded to the remote app). Opt-in,
+                // and never on auto-repeat.
+                if self.debug_tools
+                    && !event.repeat
+                    && matches!(event.logical_key, winit::keyboard::Key::Named(
+                        winit::keyboard::NamedKey::F12
+                    ))
+                    && event.state == ElementState::Pressed
                 {
                     eprintln!("[ui] F12: dumping store and requesting full refresh");
                     self.dump("mid.");
@@ -681,8 +692,13 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     return;
                 }
-                let sym = keysym_for(&event.logical_key);
-                if xcom_proto::debug() {
+                let sym = keysym_for(&event.logical_key).or_else(|| {
+                    match event.physical_key {
+                        winit::keyboard::PhysicalKey::Code(code) => keysym_for_physical(code),
+                        _ => None,
+                    }
+                });
+                if xcom_proto::debug_keys() {
                     eprintln!(
                         "[ui] key {:?} -> sym={} pressed={} text={:?}",
                         event.logical_key,

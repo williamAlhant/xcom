@@ -19,6 +19,7 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"
 lz4_flex = "0.11"
+socket2 = "0.5"
 x11rb = { version = "0.13", features = ["composite", "damage", "shm", "xfixes", "xtest"] }
 
 [profile.release]

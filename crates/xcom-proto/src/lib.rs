@@ -772,6 +772,55 @@ mod tests {
     }
 
     #[test]
+    fn frames_resume_across_would_block() {
+        struct Choppy {
+            data: Vec<u8>,
+            pos: usize,
+            stall: bool,
+        }
+        impl std::io::Read for Choppy {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.stall = !self.stall;
+                if self.stall {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        "stall",
+                    ));
+                }
+                if self.pos >= self.data.len() {
+                    return Ok(0);
+                }
+                // One byte at a time: every read is a partial frame.
+                let n = buf.len().min(1).min(self.data.len() - self.pos);
+                buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+                self.pos += n;
+                Ok(n)
+            }
+        }
+
+        let mut data = Vec::new();
+        data.extend_from_slice(&3u32.to_le_bytes());
+        data.push(MSG_PING);
+        data.extend_from_slice(&[1, 2, 3]);
+        let mut r = Choppy {
+            data,
+            pos: 0,
+            stall: false,
+        };
+        let mut state = FrameState::default();
+        let frame = loop {
+            match state.read_from(&mut r) {
+                Ok(Some((t, p))) => break (t, p),
+                Ok(None) => panic!("unexpected EOF"),
+                Err(ProtoError::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                Err(e) => panic!("{e}"),
+            }
+        };
+        assert_eq!(frame.0, MSG_PING);
+        assert_eq!(frame.1, vec![1, 2, 3]);
+    }
+
+    #[test]
     fn trailing_bytes_are_rejected() {
         let mut bytes = Message::WindowDestroy { id: 7 }.encode();
         bytes.push(0);

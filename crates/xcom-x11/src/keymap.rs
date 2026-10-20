@@ -62,12 +62,12 @@ pub struct Keymap {
 impl Keymap {
     /// Read the whole keymap (core protocol keycodes 8..=255).
     pub fn query<C: Connection>(conn: &C) -> Result<Keymap> {
-        let reply = conn.get_keyboard_mapping(8u8.into(), 248)?.reply()?;
+        let reply = conn.get_keyboard_mapping(8u8, 248)?.reply()?;
         let per = reply.keysyms_per_keycode;
         let mut columns: HashMap<u8, Vec<u32>> = HashMap::new();
         for (i, sym) in reply.keysyms.iter().enumerate() {
             let keycode = 8 + (i / per.max(1) as usize) as u8;
-            columns.entry(keycode).or_default().push((*sym).into());
+            columns.entry(keycode).or_default().push(*sym);
         }
 
         // Find the modifier that acts as level-3 select (AltGr / Mode_switch).
@@ -76,7 +76,7 @@ impl Keymap {
             let kpm = modmap.keycodes_per_modifier().max(1) as usize;
             'outer: for (index, chunk) in modmap.keycodes.chunks(kpm).enumerate() {
                 for kc in chunk {
-                    let syms = columns.get(&u8::from(*kc)).cloned().unwrap_or_default();
+                    let syms = columns.get(kc).cloned().unwrap_or_default();
                     for s in syms {
                         if s == XK_ISO_LEVEL3_SHIFT || s == XK_MODE_SWITCH || s == XK_ALT_R {
                             level3_mask = 1 << index;
@@ -148,13 +148,14 @@ impl Keymap {
         })
     }
 
-    /// Keysym for a char (Latin-1 direct mapping, ASCII included).
+    /// Keysym for a char: Latin-1 maps to its code point, everything else to
+    /// the X11 Unicode keysym (0x01000000 + code point).
     pub fn sym_for_char(c: char) -> Option<u32> {
-        let c = c as u32;
-        if (0x20..0x100).contains(&c) {
-            Some(c)
-        } else {
-            None
+        let cp = c as u32;
+        match cp {
+            0x20..=0xff => Some(cp),
+            0x100..=0x10ffff => Some(0x0100_0000 + cp),
+            _ => None,
         }
     }
 }

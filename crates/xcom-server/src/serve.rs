@@ -228,8 +228,8 @@ pub fn run(args: ServeArgs) -> Result<()> {
     let shutdown_ctrl = Arc::clone(&shutdown);
     let geo: GeometryMap = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     for win in session.windows() {
-        if let Some((x, y, _, _)) = session.window_geometry(win) {
-            geo.lock().unwrap().insert(win, (x, y));
+        if let Some((x, y, w, h)) = session.window_geometry(win) {
+            geo.lock().unwrap().insert(win, (x, y, w, h));
         }
     }
     let geo_ctrl = Arc::clone(&geo);
@@ -259,7 +259,7 @@ pub fn run(args: ServeArgs) -> Result<()> {
         };
         let title =
             windows::window_name(session.connection().as_ref(), win).unwrap_or_default();
-        geo.lock().unwrap().insert(win, (x, y));
+        geo.lock().unwrap().insert(win, (x, y, w, h));
         let msg = Message::WindowCreate {
             id: win,
             x,
@@ -315,6 +315,7 @@ impl Drop for ShutdownGuard {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // thread entry point, one owner per parameter
 fn control_loop(
     mut control: Channel,
     conn: Arc<x11rb::rust_connection::RustConnection>,
@@ -327,6 +328,7 @@ fn control_loop(
 ) -> Result<()> {
     let _guard = ShutdownGuard(Arc::clone(&shutdown));
     let injector = Injector::new(&*conn, root, keymap);
+    let mut last_rx = Instant::now();
     loop {
         if shutdown.load(Ordering::SeqCst) {
             return Ok(());
@@ -342,9 +344,11 @@ fn control_loop(
         // is safe mid-message.
         control.set_read_timeout(Some(Duration::from_millis(5)))?;
         match control.recv() {
-            Ok(Some((ty, payload))) => match Message::decode(ty, &payload)? {
+            Ok(Some((ty, payload))) => {
+                last_rx = Instant::now();
+                match Message::decode(ty, &payload)? {
                 Message::InputKey { sym, pressed } => {
-                    if xcom_proto::debug() {
+                    if xcom_proto::debug_keys() {
                         logln!("[serve] recv key sym={sym:#x} pressed={pressed}");
                     }
                     if let Err(e) = injector.key(sym, pressed) {
@@ -366,7 +370,10 @@ fn control_loop(
                     x,
                     y,
                 } => {
-                    let (rx, ry) = root_coords(&geo, window, x, y);
+                    let Some((rx, ry)) = root_coords(&geo, window, x, y) else {
+                        logln!("[serve] button for untracked window {window:#x}");
+                        continue;
+                    };
                     if xcom_proto::debug() {
                         logln!(
                             "[serve] recv button {button} {pressed} {window:#x} rel=({x},{y}) -> root=({rx},{ry})"
@@ -381,7 +388,10 @@ fn control_loop(
                     }
                 }
                 Message::InputMotion { window, x, y } => {
-                    let (rx, ry) = root_coords(&geo, window, x, y);
+                    let Some((rx, ry)) = root_coords(&geo, window, x, y) else {
+                        logln!("[serve] motion for untracked window {window:#x}");
+                        continue;
+                    };
                     if xcom_proto::debug() {
                         logln!(
                             "[serve] recv motion {window:#x} rel=({x},{y}) -> root=({rx},{ry}) geo={:?}",
@@ -433,14 +443,21 @@ fn control_loop(
                     return Ok(());
                 }
                 _ => {}
-            },
+                }
+            }
 
             Ok(None) => {
                 logln!("[serve] client left (control channel closed)");
                 shutdown.store(true, Ordering::SeqCst);
                 return Ok(());
             }
-            Err(e) if is_timeout(&e) => continue,
+            Err(e) if is_timeout(&e) => {
+                if last_rx.elapsed() > Duration::from_secs(30) {
+                    logln!("[serve] no input from the client for 30 s; assuming it is gone");
+                    return Ok(());
+                }
+                continue;
+            }
             Err(e) if is_eof(&e) => {
                 logln!("[serve] client left (EOF)");
                 shutdown.store(true, Ordering::SeqCst);
@@ -455,19 +472,18 @@ fn control_loop(
     }
 }
 
-/// Window geometry (root coords) shared between the capture loop and the
-/// input path: XTEST injects in root space, so pointer events sent relative to
-/// a window must be translated with the window's current position.
-type GeometryMap = Arc<std::sync::Mutex<std::collections::HashMap<Window, (i16, i16)>>>;
+/// Window geometry (root x/y plus size) shared between the capture loop and
+/// the input path: XTEST injects in root space, so pointer events sent relative
+/// to a window are translated with its current position and clamped to its
+/// current size.
+type GeometryMap = Arc<std::sync::Mutex<std::collections::HashMap<Window, (i16, i16, u16, u16)>>>;
 
-fn root_coords(geo: &GeometryMap, window: Window, x: i16, y: i16) -> (i16, i16) {
-    let (wx, wy) = geo
-        .lock()
-        .unwrap()
-        .get(&window)
-        .copied()
-        .unwrap_or((0, 0));
-    (wx.saturating_add(x), wy.saturating_add(y))
+fn root_coords(geo: &GeometryMap, window: Window, x: i16, y: i16) -> Option<(i16, i16)> {
+    let map = geo.lock().unwrap();
+    let (wx, wy, w, h) = *map.get(&window)?;
+    let cx = (x.max(0) as i32).min(w.max(1) as i32 - 1) as i16;
+    let cy = (y.max(0) as i32).min(h.max(1) as i32 - 1) as i16;
+    Some((wx.saturating_add(cx), wy.saturating_add(cy)))
 }
 
 /// Peer closed the connection (possibly without TLS close_notify).
@@ -510,6 +526,7 @@ struct SyncState {
     attempts: u8,
 }
 
+#[allow(clippy::too_many_arguments)] // main loop state, one owner per parameter
 fn serve_loop(
     session: &mut CaptureSession,
     mut bulk: Channel,
@@ -541,6 +558,7 @@ fn serve_loop(
     let mut stats_raw = 0u64;
     let mut stats_comp = 0u64;
     let mut last_report = Instant::now();
+    let mut last_frame = Instant::now() - Duration::from_secs(1);
 
     loop {
         if shutdown.load(Ordering::SeqCst) {
@@ -593,6 +611,13 @@ fn serve_loop(
             }
         }
 
+        // Latest-wins pacing: cap captures at ~120 fps. Damage keeps
+        // coalescing in the X server while we sleep, so nothing is lost.
+        const MIN_FRAME_INTERVAL: Duration = Duration::from_millis(8);
+        if let Some(rest) = MIN_FRAME_INTERVAL.checked_sub(last_frame.elapsed()) {
+            std::thread::sleep(rest);
+        }
+
         match session.pump(Some(Instant::now() + Duration::from_millis(200)))? {
             Some(PumpEvent::Frame { frame, stats, .. }) => {
                 if xcom_proto::debug() {
@@ -613,6 +638,7 @@ fn serve_loop(
                 stats_frames += 1;
                 stats_raw += stats.raw_bytes as u64;
                 stats_comp += stats.comp_bytes as u64;
+                last_frame = Instant::now();
             }
             Some(PumpEvent::Mapped(win)) => {
                 if let Some((x, y, w, h)) = session.window_geometry(win) {
@@ -627,7 +653,7 @@ fn serve_loop(
                         )
                         .map_err(|e| anyhow::anyhow!("set_input_focus: {e}"))?;
                     session.connection().flush().ok();
-                    geo.lock().unwrap().insert(win, (x, y));
+                    geo.lock().unwrap().insert(win, (x, y, w, h));
                     if announced.insert(win) {
                         let title = windows::window_name(
                             session.connection().as_ref(),
@@ -687,7 +713,7 @@ fn serve_loop(
             }
             Some(PumpEvent::Resized { window, w, h }) => {
                 let (x, y) = if let Some((x, y, _, _)) = session.window_geometry(window) {
-                    geo.lock().unwrap().insert(window, (x, y));
+                    geo.lock().unwrap().insert(window, (x, y, w, h));
                     (x, y)
                 } else {
                     (0, 0)

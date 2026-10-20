@@ -296,6 +296,28 @@ impl Channel {
         tcp.set_nodelay(on)?;
         Ok(())
     }
+
+    /// Kernel keepalive as a backstop for the application-level pings.
+    pub fn set_keepalive(&self, idle: Option<Duration>) -> Result<(), TransportError> {
+        let tcp = match &self.stream {
+            TlsStream::Client(s) => &s.sock,
+            TlsStream::Server(s) => &s.sock,
+        };
+        let sock = socket2::SockRef::from(tcp);
+        match idle {
+            Some(d) => {
+                let mut ka = socket2::TcpKeepalive::new().with_time(d);
+                #[cfg(not(target_os = "windows"))]
+                {
+                    ka = ka.with_interval(Duration::from_secs(5));
+                }
+                sock.set_tcp_keepalive(&ka)?;
+                sock.set_keepalive(true)?;
+            }
+            None => sock.set_keepalive(false)?,
+        }
+        Ok(())
+    }
 }
 
 /// Server side of the channel.
@@ -410,7 +432,7 @@ impl ChannelAcceptor {
             role,
         };
         let token = self.tokens[role_index(role)];
-        if let Err(e) = channel.auth_server(&token, role) {
+        if let Err(e) = channel.auth_hello(&token, role) {
             let _ = channel.send(xcom_proto::MSG_AUTH_REJECTED, &[]);
             return Err(e);
         }
@@ -423,10 +445,13 @@ impl ChannelAcceptor {
             }
             *slot = true;
         }
+        channel.send(xcom_proto::MSG_AUTH_OK, &PROTO_VERSION.to_le_bytes())?;
         // Idle timeouts here would look like EOF to the bulk reader (it blocks
         // between frames). Liveness is the keepalive's job, not the socket's.
         channel.set_read_timeout(None)?;
         channel.set_write_timeout(None)?;
+        // Backstop when the app-level ping cannot be sent (sleep/wake, NAT).
+        channel.set_keepalive(Some(Duration::from_secs(30)))?;
         channel.state.set_max_len(role_max_frame(role));
         Ok(channel)
     }
@@ -447,8 +472,10 @@ fn role_max_frame(role: Role) -> usize {
 }
 
 impl Channel {
-    /// Server side of the auth exchange: expect `MSG_HELLO` with the token.
-    fn auth_server(&mut self, token: &[u8; 32], role: Role) -> Result<(), TransportError> {
+    /// Server side of the auth exchange: validate `MSG_HELLO` and its token.
+    /// Does not reply — the caller sends AUTH_OK only after burning the token,
+    /// so a replay can never see AUTH_OK.
+    fn auth_hello(&mut self, token: &[u8; 32], role: Role) -> Result<(), TransportError> {
         match self.recv()? {
             Some((xcom_proto::MSG_HELLO, payload)) => {
                 if payload.len() != 2 + 1 + 32 {
@@ -469,7 +496,6 @@ impl Channel {
                 if !constant_time_eq(&payload[3..], token) {
                     return Err(TransportError::AuthRejected);
                 }
-                self.send(xcom_proto::MSG_AUTH_OK, &PROTO_VERSION.to_le_bytes())?;
                 Ok(())
             }
             _ => Err(TransportError::Proto("expected hello".into())),
@@ -528,6 +554,7 @@ pub fn connect(
             // frames and a socket timeout must not look like a dead peer.
             channel.set_read_timeout(None)?;
             channel.set_write_timeout(None)?;
+            channel.set_keepalive(Some(Duration::from_secs(30)))?;
             channel.state.set_max_len(role_max_frame(role));
             Ok(channel)
         }
@@ -552,4 +579,81 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         diff |= x ^ y;
     }
     diff == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn identity_and_tokens() -> (Identity, String, [u8; 32], [u8; 32]) {
+        let id = Identity::generate().unwrap();
+        let fp = id.fingerprint().to_string();
+        (id, fp, random_token(), random_token())
+    }
+
+    #[test]
+    fn constant_time_compare() {
+        assert!(constant_time_eq(b"abcdef", b"abcdef"));
+        assert!(!constant_time_eq(b"abcdef", b"abcdeg"));
+        assert!(!constant_time_eq(b"abcdef", b"abcde"));
+        assert!(constant_time_eq(&[], &[]));
+    }
+
+    #[test]
+    fn wrong_pin_wrong_token_then_success() {
+        let (id, fp, ctrl, bulk) = identity_and_tokens();
+        // No ssh: no peer allowlist (tests connect from loopback).
+        let acceptor = ChannelAcceptor::bind("127.0.0.1:0", &id, ctrl, bulk, None).unwrap();
+        let addr = acceptor.local_addr().unwrap().to_string();
+        let server = std::thread::spawn(move || acceptor.accept(Role::Control, Duration::from_secs(5)));
+
+        // Wrong certificate pin: rejected before the token is sent.
+        let bad_pin = "00".repeat(32);
+        assert!(
+            connect(&addr, Role::Control, &bad_pin, &ctrl, Duration::from_secs(2)).is_err()
+        );
+
+        // Right pin, wrong token.
+        let e = connect(&addr, Role::Control, &fp, &[7u8; 32], Duration::from_secs(2));
+        assert!(matches!(e, Err(TransportError::AuthRejected)), "got {:?}", e.err());
+
+        // Wrong role token (the bulk token cannot open control).
+        let e = connect(&addr, Role::Control, &fp, &bulk, Duration::from_secs(2));
+        assert!(matches!(e, Err(TransportError::AuthRejected)), "got {:?}", e.err());
+
+        // The real client still gets in: failures must not consume the accept.
+        let channel = connect(&addr, Role::Control, &fp, &ctrl, Duration::from_secs(2));
+        assert!(channel.is_ok(), "real client rejected: {:?}", channel.err());
+        drop(channel);
+        assert!(matches!(
+            server.join().unwrap(),
+            Ok(_)
+        ));
+    }
+
+    #[test]
+    fn tokens_are_single_use() {
+        let (id, fp, ctrl, bulk) = identity_and_tokens();
+        let acceptor = ChannelAcceptor::bind("127.0.0.1:0", &id, ctrl, bulk, None).unwrap();
+        let addr = acceptor.local_addr().unwrap().to_string();
+        let server = std::thread::spawn(move || {
+            let first = acceptor.accept(Role::Control, Duration::from_secs(5));
+            assert!(first.is_ok(), "first control auth failed: {:?}", first.as_ref().err());
+            // The same token must not open a second control channel.
+            acceptor.accept(Role::Control, Duration::from_secs(1))
+        });
+
+        let first = connect(&addr, Role::Control, &fp, &ctrl, Duration::from_secs(3));
+        assert!(first.is_ok(), "first auth failed: {:?}", first.as_ref().err());
+
+        let replay = connect(&addr, Role::Control, &fp, &ctrl, Duration::from_secs(3));
+        assert!(
+            matches!(replay, Err(TransportError::AuthRejected)),
+            "replay was not rejected: {:?}", replay.as_ref().err()
+        );
+
+        // The replay never authenticates, so the waiter times out.
+        assert!(matches!(server.join().unwrap(), Err(TransportError::Timeout)));
+        drop(first);
+    }
 }

@@ -22,8 +22,9 @@
 //! and the client always converges on the latest state ("latest wins").
 
 use std::collections::{HashMap, VecDeque};
+use std::os::fd::AsRawFd;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use x11rb::connection::Connection;
@@ -225,17 +226,17 @@ impl CaptureSession {
             .reply()
             .context("window does not exist")?;
 
-        let pixmap: xproto::Pixmap = self.conn.generate_id()?.into();
+        let pixmap: xproto::Pixmap = self.conn.generate_id()?;
         self.conn.composite_name_window_pixmap(win, pixmap)?;
 
-        let damage_id: damage::Damage = self.conn.generate_id()?.into();
+        let damage_id: damage::Damage = self.conn.generate_id()?;
         let level = match self.cfg.mode {
             DamageMode::Raw => damage::ReportLevel::RAW_RECTANGLES,
             DamageMode::NonEmpty => damage::ReportLevel::NON_EMPTY,
         };
         self.conn.damage_create(damage_id, win, level)?;
 
-        let parts: xfixes::Region = self.conn.generate_id()?.into();
+        let parts: xfixes::Region = self.conn.generate_id()?;
         self.conn.xfixes_create_region(parts, &[])?;
 
         // Ensure we hear about this window's own destruction/resize even if it
@@ -292,27 +293,41 @@ impl CaptureSession {
 
     /// Wait for the next display event (bounded by `deadline`, if any).
     ///
-    /// x11rb has no timed event wait, so idle waiting polls with a small
-    /// adaptive sleep (50..250us); this is what keeps the loop interruptible
-    /// and bounds added latency by the sleep quantum.
+    /// Blocks in `poll(2)` on the X connection instead of the old 50–250 µs
+    /// sleep loop: an idle session now costs no CPU. The wait is capped at
+    /// 50 ms so the caller's shutdown/timeout checks still run.
     pub fn pump(&mut self, deadline: Option<Instant>) -> Result<Option<PumpEvent>> {
         if let Some(ev) = self.queue.pop_front() {
             return Ok(Some(ev));
         }
 
-        let mut sleep_us = 50u64;
+        let fd = self.conn.stream().as_raw_fd();
         let first = loop {
+            // Drain anything x11rb has already buffered before sleeping.
+            if let Some(ev) = self.conn.poll_for_event().context("X event stream")? {
+                break ev;
+            }
+            let now = Instant::now();
             if let Some(d) = deadline {
-                if Instant::now() >= d {
+                if now >= d {
                     return Ok(None);
                 }
             }
-            match self.conn.poll_for_event().context("X event stream")? {
-                Some(ev) => break ev,
-                None => {
-                    std::thread::sleep(Duration::from_micros(sleep_us));
-                    sleep_us = (sleep_us * 2).min(250);
+            let wait_ms = deadline
+                .map(|d| d.saturating_duration_since(now).as_millis().clamp(1, 50) as i32)
+                .unwrap_or(50);
+            let mut pfd = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let rc = unsafe { libc::poll(&mut pfd, 1, wait_ms) };
+            if rc < 0 {
+                let e = std::io::Error::last_os_error();
+                if e.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
                 }
+                return Err(anyhow::anyhow!("poll on X connection: {e}"));
             }
         };
         self.handle_event(first)?;
@@ -401,11 +416,9 @@ impl CaptureSession {
                     self.queue.push_back(PumpEvent::Unmapped(e.window));
                 }
             }
-            Event::DestroyNotify(e) => {
-                if self.windows.contains_key(&e.window) {
-                    self.remove_window(e.window);
-                    self.queue.push_back(PumpEvent::Destroyed(e.window));
-                }
+            Event::DestroyNotify(e) if self.windows.contains_key(&e.window) => {
+                self.remove_window(e.window);
+                self.queue.push_back(PumpEvent::Destroyed(e.window));
             }
             _ => {}
         }
@@ -488,7 +501,7 @@ impl CaptureSession {
         // The named pixmap keeps the size it had when named: re-name it.
         if let Some(state) = self.windows.get_mut(&win) {
             self.conn.free_pixmap(state.pixmap)?;
-            let pixmap: xproto::Pixmap = self.conn.generate_id()?.into();
+            let pixmap: xproto::Pixmap = self.conn.generate_id()?;
             self.conn.composite_name_window_pixmap(win, pixmap)?;
             state.pixmap = pixmap;
             state.w = w;
@@ -536,7 +549,7 @@ impl CaptureSession {
         // from inside the batch loop).
         let max_need = rects
             .iter()
-            .map(|r| r.area() as usize * 4)
+            .map(|r| r.area() * 4)
             .max()
             .unwrap_or(0);
         if max_need > self.shm.len {
@@ -576,7 +589,7 @@ impl CaptureSession {
             let mut cookies = Vec::with_capacity(batch.len());
             for (r, off) in &batch {
                 let cookie = self.conn.shm_get_image(
-                    state.pixmap.into(),
+                    state.pixmap,
                     r.x as i16,
                     r.y as i16,
                     r.w,
@@ -651,7 +664,7 @@ fn attach_shm(conn: &RustConnection, len: usize) -> Result<Shm> {
             bail!("shmget({len}) failed");
         }
         let addr = libc::shmat(shmid, std::ptr::null(), 0);
-        if addr == libc::MAP_FAILED as *mut libc::c_void {
+        if std::ptr::eq(addr, libc::MAP_FAILED) {
             libc::shmctl(shmid, libc::IPC_RMID, std::ptr::null_mut());
             bail!("shmat failed");
         }
