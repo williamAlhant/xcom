@@ -157,6 +157,7 @@ pub struct App {
     presents: u64,
     present_errors: u64,
     dump: Option<PathBuf>,
+    dump_seq: u32,
     fullscreen: bool,
 }
 
@@ -186,6 +187,7 @@ impl App {
             presents: 0,
             present_errors: 0,
             dump,
+            dump_seq: 0,
             fullscreen,
         }
     }
@@ -210,7 +212,8 @@ impl App {
         };
         let mut path = base.clone();
         if !suffix.is_empty() {
-            path = base.with_extension(format!("{suffix}ppm"));
+            self.dump_seq += 1;
+            path = base.with_extension(format!("{suffix}{}ppm", self.dump_seq));
         }
         // Largest window: dump the pixel store, then read the *actual* window
         // contents back (X11) and compare — this is what catches presentation
