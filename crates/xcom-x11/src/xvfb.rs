@@ -2,7 +2,14 @@
 //!
 //! Xvfb is the one external dependency of the server half (see the M0 report
 //! for the vendored-server upgrade path). Everything else is pure Rust.
+//!
+//! The display number is picked by Xvfb itself (`-displayfd`): scanning
+//! /tmp/.X11-unix for free numbers races between concurrent sessions, and the
+//! loser ends up attached to the winner's X server — which then dies with the
+//! winner's daemon (seen as `shm_get_image: Broken pipe` mid-capture).
 
+use std::io::Read;
+use std::os::unix::io::FromRawFd;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -16,28 +23,24 @@ pub struct Xvfb {
 }
 
 impl Xvfb {
-    /// Spawn on the first free display number in 20..200.
+    /// Spawn on a free display number chosen by the X server itself.
     pub fn spawn(width: u16, height: u16) -> Result<Xvfb> {
-        for n in 20..200 {
-            let socket = format!("/tmp/.X11-unix/X{n}");
-            let lock = format!("/tmp/.X{n}-lock");
-            if !std::path::Path::new(&socket).exists() && !std::path::Path::new(&lock).exists() {
-                return Xvfb::spawn_at(n, width, height);
-            }
-        }
-        bail!("no free display number in 20..200")
-    }
-
-    pub fn spawn_at(num: u32, width: u16, height: u16) -> Result<Xvfb> {
         let binary = std::env::var("XCOM_XVFB").unwrap_or_else(|_| "Xvfb".into());
-        let display = format!(":{num}");
-        let log = std::env::temp_dir().join(format!("xcom-xvfb-{num}.log"));
-        let log_file = std::fs::File::create(&log)
-            .with_context(|| format!("creating log {}", log.display()))?;
+        let log = std::env::temp_dir().join(format!("xcom-xvfb-{}.log", std::process::id()));
+        let log_file =
+            std::fs::File::create(&log).with_context(|| format!("creating {}", log.display()))?;
+
+        // Pipe for the display number: the server writes it once it is ready.
+        let mut fds = [0i32; 2];
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+            bail!("pipe() failed");
+        }
+        let (read_fd, write_fd) = (fds[0], fds[1]);
 
         let mut child = Command::new(&binary)
+            .arg("-displayfd")
+            .arg(write_fd.to_string())
             .args([
-                display.as_str(),
                 "-screen",
                 "0",
                 &format!("{width}x{height}x24"),
@@ -58,9 +61,15 @@ impl Xvfb {
             .stdout(Stdio::from(log_file.try_clone()?))
             .stderr(Stdio::from(log_file))
             .spawn()
-            .with_context(|| format!("spawning {binary} (install xorg-server-xvfb or set XCOM_XVFB)"))?;
+            .with_context(|| {
+                format!("spawning {binary} (install xorg-server-xvfb or set XCOM_XVFB)")
+            })?;
 
-        // Wait for the server to accept connections.
+        // The write end only matters in the child.
+        unsafe { libc::close(write_fd) };
+
+        let mut file = unsafe { std::fs::File::from_raw_fd(read_fd) };
+        let mut num = String::new();
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             if let Some(status) = child.try_wait()? {
@@ -69,6 +78,26 @@ impl Xvfb {
                     log.display()
                 );
             }
+            match file.read_to_string(&mut num) {
+                Ok(_) if !num.trim().is_empty() => break,
+                Ok(_) | Err(_) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20));
+                    continue;
+                }
+                _ => {
+                    let _ = child.kill();
+                    bail!(
+                        "{binary} did not report a display number; log: {}",
+                        log.display()
+                    );
+                }
+            }
+        }
+
+        let display = format!(":{}", num.trim());
+        // Wait until it actually accepts connections.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
             if x11rb::connect(Some(display.as_str())).is_ok() {
                 return Ok(Xvfb {
                     display,
@@ -93,10 +122,6 @@ impl Drop for Xvfb {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        // Best effort: clear the lock file if the server left one behind.
-        let num = self.display.trim_start_matches(':');
-        let _ = std::fs::remove_file(format!("/tmp/.X{num}-lock"));
-        let _ = std::fs::remove_file(format!("/tmp/.X11-unix/X{num}"));
     }
 }
 

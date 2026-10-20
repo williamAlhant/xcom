@@ -33,6 +33,14 @@ pub const MSG_RESIZE: u8 = 23;
 pub const MSG_FULL_REQUEST: u8 = 24;
 pub const MSG_BYE: u8 = 25;
 
+/// `XCOM_DEBUG=1` enables protocol/input tracing (test and diagnosis aid).
+pub fn debug() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("XCOM_DEBUG").is_some_and(|v| v != "0" && !v.is_empty())
+    })
+}
+
 /// Monotonic nanoseconds, comparable between processes on the same host.
 pub fn now_ns() -> u64 {
     unsafe {

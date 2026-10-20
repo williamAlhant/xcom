@@ -25,9 +25,15 @@ case "${1:-up}" in
         cp "$KEY.pub" "$BUILDCTX/authorized_keys"
         cp "$REPO/deploy/testvm/Dockerfile" "$BUILDCTX/Dockerfile"
 
-        # Always rebuild: the container runs the static artifact, and a stale
-        # one silently invalidates the whole test.
-        "$REPO/scripts/build-static.sh" xcomd
+        # Rebuild when sources changed: the container runs the static artifact
+        # and a stale one silently invalidates the test (that bug already bit
+        # us once), but a rebuild per run is needless waiting.
+        NEWER=$(find "$REPO/crates" "$REPO/Cargo.toml" "$REPO/Cargo.lock" -newer "$REPO/dist/xcomd-linux-x86_64" -name '*.rs' -o -newer "$REPO/dist/xcomd-linux-x86_64" -name 'Cargo.*' 2>/dev/null | head -1)
+        if [ ! -x "$REPO/dist/xcomd-linux-x86_64" ] || [ -n "$NEWER" ]; then
+            "$REPO/scripts/build-static.sh" xcomd
+        else
+            echo "static xcomd up to date"
+        fi
 
         podman build -t xcom-testvm "$BUILDCTX"
         podman rm -f "$NAME" >/dev/null 2>&1 || true

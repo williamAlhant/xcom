@@ -55,6 +55,8 @@ pub enum UserEvent {
     Quit,
     /// The channel died: never leave stale windows showing old content.
     ConnectionLost,
+    /// Test aid: resize the first local window (stress for the resize loop).
+    ResizeLocal { w: u16, h: u16 },
 }
 
 type Target = softbuffer::Surface<Arc<Window>, Arc<Window>>;
@@ -84,9 +86,20 @@ impl Pixels {
 
     fn resize(&mut self, w: u16, h: u16) {
         if (self.w, self.h) != (w, h) {
+            // Keep the overlapping content: a resize clears nothing in the
+            // remote window either, and wiping here made text vanish during
+            // resize storms (the store was rebuilt from partial repaints).
+            let mut buf = vec![0xff00_0000; w as usize * h as usize];
+            let cw = (self.w.min(w)) as usize;
+            let ch = (self.h.min(h)) as usize;
+            for row in 0..ch {
+                let dst = row * w as usize;
+                let src = row * self.w as usize;
+                buf[dst..dst + cw].copy_from_slice(&self.buf[src..src + cw]);
+            }
             self.w = w;
             self.h = h;
-            self.buf = vec![0; w as usize * h as usize];
+            self.buf = buf;
         }
     }
 
@@ -143,6 +156,15 @@ pub struct App {
     present_errors: u64,
     dump: Option<PathBuf>,
     fullscreen: bool,
+}
+
+/// Local and remote sizes within this many pixels are "the same size": window
+/// managers round, toolkits snap to their character grid, and forwarding those
+/// few pixels back as resizes starts an endless resize ping-pong.
+const SIZE_TOLERANCE: u16 = 8;
+
+fn size_close(a: (u16, u16), b: (u16, u16)) -> bool {
+    a.0.abs_diff(b.0) <= SIZE_TOLERANCE && a.1.abs_diff(b.1) <= SIZE_TOLERANCE
 }
 
 impl App {
@@ -413,14 +435,21 @@ impl ApplicationHandler<UserEvent> for App {
                 self.open_window(el, id);
             }
             UserEvent::Geometry { id, w, h } => {
+                if xcom_proto::debug() {
+                    eprintln!("[ui] geometry {id:#x} -> {w}x{h}");
+                }
                 if let Some(pix) = self.pixels.get_mut(&id) {
                     pix.resize(w, h);
                 }
                 if let Some(att) = self.attached.get_mut(&id) {
                     att.remote = (w, h);
-                    let _ = att
-                        .window
-                        .request_inner_size(PhysicalSize::new(w.max(64), h.max(64)));
+                    // Follow the app's size, but only when it really differs:
+                    // asking the WM to round-trip a 1px change loops forever.
+                    if !size_close(att.local, att.remote) {
+                        let _ = att
+                            .window
+                            .request_inner_size(PhysicalSize::new(w.max(64), h.max(64)));
+                    }
                 }
                 self.present(id);
             }
@@ -442,6 +471,12 @@ impl ApplicationHandler<UserEvent> for App {
                 self.send(Message::Bye);
                 el.exit();
             }
+            UserEvent::ResizeLocal { w, h } => {
+                if let Some((id, att)) = self.attached.iter_mut().next() {
+                    eprintln!("[ui] test resize {id:#x} -> {w}x{h}");
+                    let _ = att.window.request_inner_size(PhysicalSize::new(w, h));
+                }
+            }
             UserEvent::ConnectionLost => {
                 eprintln!("[ui] connection lost, closing {} window(s)", self.attached.len());
                 self.report();
@@ -462,6 +497,9 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::RedrawRequested => self.present(remote),
             WindowEvent::Resized(size) => {
+                if xcom_proto::debug() {
+                    eprintln!("[ui] resized {:?} (win {remote:#x})", size);
+                }
                 let mut reflow = None;
                 if let Some(att) = self.attached.get_mut(&remote) {
                     att.local = (size.width as u16, size.height as u16);
@@ -469,8 +507,9 @@ impl ApplicationHandler<UserEvent> for App {
                         NonZeroU32::new(size.width.max(1)).unwrap(),
                         NonZeroU32::new(size.height.max(1)).unwrap(),
                     );
-                    if att.local != att.remote {
-                        // The user resized us: ask the app to reflow.
+                    if !size_close(att.local, att.remote) {
+                        // The user resized us: ask the app to reflow. Small
+                        // deltas are WM/toolkit rounding, not user actions.
                         att.remote = att.local;
                         reflow = Some(Message::Resize {
                             id: remote,
@@ -487,6 +526,12 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::CursorMoved { position, .. } => {
                 let x = position.x.round() as i16;
                 let y = position.y.round() as i16;
+                if xcom_proto::debug() {
+                    eprintln!("[ui] motion ({x},{y}) local={:?}", {
+                        let a = self.attached.get(&remote);
+                        a.map(|a| a.local)
+                    });
+                }
                 if let Some(att) = self.attached.get_mut(&remote) {
                     att.cursor = (x, y);
                 }
@@ -502,6 +547,9 @@ impl ApplicationHandler<UserEvent> for App {
                     .get(&remote)
                     .map(|a| a.cursor)
                     .unwrap_or((0, 0));
+                if xcom_proto::debug() {
+                    eprintln!("[ui] button {button:?} {state:?} at ({x},{y})");
+                }
                 self.send(Message::InputButton {
                     window: remote,
                     button: x11_button(button),
@@ -535,7 +583,13 @@ impl ApplicationHandler<UserEvent> for App {
                     });
                 }
             }
-            WindowEvent::Focused(true) => {
+            WindowEvent::Focused(focused) => {
+                if xcom_proto::debug() {
+                    eprintln!("[ui] focused={focused} (win {remote:#x})");
+                }
+                if !focused {
+                    return;
+                }
                 // Keyboard focus follows OS window focus: without a WM on the
                 // remote display, XTEST keystrokes would go to whatever the
                 // remote pointer happens to be over.
@@ -545,7 +599,18 @@ impl ApplicationHandler<UserEvent> for App {
                 if event.repeat {
                     return;
                 }
-                if let Some(sym) = keysym_for(&event.logical_key) {
+                let sym = keysym_for(&event.logical_key);
+                if xcom_proto::debug() {
+                    eprintln!(
+                        "[ui] key {:?} -> sym={} pressed={} text={:?}",
+                        event.logical_key,
+                        sym.map(|s| format!("{s:#x}"))
+                            .unwrap_or_else(|| "NONE".into()),
+                        event.state == ElementState::Pressed,
+                        event.text
+                    );
+                }
+                if let Some(sym) = sym {
                     self.send(Message::InputKey {
                         sym,
                         pressed: event.state == ElementState::Pressed,
@@ -578,4 +643,38 @@ fn ppm_bytes(w: u16, h: u16, buf: &[u32]) -> Vec<u8> {
         out.extend_from_slice(&[(px >> 16) as u8, (px >> 8) as u8, *px as u8]);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resize_preserves_content() {
+        let mut p = Pixels::new(4, 3);
+        for (i, px) in p.buf.iter_mut().enumerate() {
+            *px = 0xff00_0000 + i as u32;
+        }
+        p.resize(6, 5);
+        // grown: old content kept at its positions, new area opaque black
+        assert_eq!(p.buf[0], 0xff00_0000);
+        assert_eq!(p.buf[3], 0xff00_0000 + 3);
+        assert_eq!(p.buf[6], 0xff00_0000 + 4); // row 1 shifted to new stride
+        assert_eq!(p.buf[7], 0xff00_0000 + 5);
+        assert_eq!(p.buf[4], 0xff00_0000); // new column area
+        p.resize(2, 2);
+        assert_eq!(p.buf[0], 0xff00_0000);
+        assert_eq!(p.buf[1], 0xff00_0000 + 1);
+        assert_eq!(p.buf[2], 0xff00_0000 + 4); // row 1 of the old content
+        assert_eq!(p.buf[3], 0xff00_0000 + 5);
+    }
+
+    #[test]
+    fn rounding_is_not_a_user_resize() {
+        // WM/toolkit rounding and character-grid snapping must not be
+        // forwarded as resizes (that started the ping-pong).
+        assert!(size_close((484, 316), (484, 316)));
+        assert!(size_close((492, 320), (493, 322)));
+        assert!(!size_close((484, 316), (520, 340)));
+    }
 }

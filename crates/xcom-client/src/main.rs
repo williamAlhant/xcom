@@ -73,6 +73,11 @@ struct ConnectArgs {
     /// Seconds to wait before typing (lets windows open and take focus).
     #[arg(long, default_value_t = 3)]
     type_delay: u64,
+    /// Test aid: resize the window to WxH after --resize-after seconds.
+    #[arg(long)]
+    resize_to: Option<String>,
+    #[arg(long, default_value_t = 2)]
+    resize_after: u64,
 }
 
 struct Handshake {
@@ -117,9 +122,15 @@ fn bootstrap_ssh(
     ssh_args: Option<&str>,
     exec: Option<&str>,
 ) -> Result<Handshake> {
+    // Let XCOM_DEBUG follow the session so the daemon traces too.
+    let dbg = if xcom_proto::debug() {
+        "XCOM_DEBUG=1 "
+    } else {
+        ""
+    };
     let remote = match exec {
-        Some(cmd) => format!("xcomd serve --json --exec {}", shell_quote(cmd)),
-        None => "xcomd serve --json".to_string(),
+        Some(cmd) => format!("{dbg}xcomd serve --json --exec {}", shell_quote(cmd)),
+        None => format!("{dbg}xcomd serve --json"),
     };
     let mut cmd = Command::new("ssh");
     cmd.arg("-o").arg("BatchMode=yes");
@@ -246,6 +257,20 @@ fn main() -> Result<()> {
                 std::thread::sleep(Duration::from_millis(30));
             }
         });
+    }
+
+    if let Some(spec) = args.resize_to.clone() {
+        if let Some((w, h)) = spec
+            .split_once('x')
+            .and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?)))
+        {
+            let proxy_timer = proxy.clone();
+            let after = args.resize_after;
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_secs(after));
+                proxy_timer.send_event(UserEvent::ResizeLocal { w, h }).ok();
+            });
+        }
     }
 
     if args.seconds > 0 {

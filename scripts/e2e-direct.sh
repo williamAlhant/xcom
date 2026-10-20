@@ -11,9 +11,9 @@ set -euo pipefail
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 XCOMD=${XCOMD:-$REPO/target/release/xcomd}
 XCOM=${XCOM:-$REPO/target/release/xcom}
-SECS=${1:-8}
-OUT=/tmp/opencode/e2e
-mkdir -p "$OUT"
+SECS=${1:-3}
+OUT=/tmp/opencode/e2e/$$
+mkdir -p "$OUT"   # per-run: parallel runs must not share handshake files
 
 # Xvfb: PATH first, then the user-local install used on this dev box.
 if [ -z "${XCOM_XVFB:-}" ]; then
@@ -22,7 +22,7 @@ fi
 export XCOM_XVFB
 
 "$XCOMD" serve --json --spawn 800x600 --listen 127.0.0.1:0 \
-    --exec "$XCOMD m0 anim --mode box --fps 60 --seconds $((SECS + 20))" \
+    --exec "$XCOMD m0 anim --mode box --fps 60 --seconds $((SECS + 8))" \
     > "$OUT/handshake.json" 2> "$OUT/serve.log" &
 SERVE_PID=$!
 trap 'kill "$SERVE_PID" 2>/dev/null || true' EXIT

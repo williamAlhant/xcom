@@ -59,6 +59,20 @@ def main() -> None:
     elif mode == "content":
         if len(colors) < 2:
             fail("image is a single color (no real content)")
+    elif mode == "xterm":
+        # A terminal with text: white background with black glyph rows. Empty
+        # or wiped content shows as an all-white window.
+        glyph_rows = 0
+        for y in range(h):
+            row = y * w * 3
+            n = sum(
+                1 for x in range(w) if pixels[row + x * 3 : row + x * 3 + 3] == b"\x00\x00\x00"
+            )
+            if n >= 3:
+                glyph_rows += 1
+        if glyph_rows < 3:
+            fail(f"no text rows found ({glyph_rows}) - window content is empty/wiped")
+        print(f"check-ppm: text rows={glyph_rows}")
     else:
         fail(f"unknown mode {mode!r}")
 

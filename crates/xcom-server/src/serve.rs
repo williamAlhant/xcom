@@ -249,9 +249,15 @@ fn control_loop(
         match control.recv() {
             Ok(Some((ty, payload))) => match Message::decode(ty, &payload)? {
                 Message::InputKey { sym, pressed } => {
+                    if xcom_proto::debug() {
+                        eprintln!("[serve] recv key sym={sym:#x} pressed={pressed}");
+                    }
                     injector.key(sym, pressed)?;
                 }
                 Message::Focus { window } => {
+                    if xcom_proto::debug() {
+                        eprintln!("[serve] recv focus {window:#x}");
+                    }
                     injector.focus(window)?;
                 }
                 Message::InputButton {
@@ -262,6 +268,11 @@ fn control_loop(
                     y,
                 } => {
                     let (rx, ry) = root_coords(&geo, window, x, y);
+                    if xcom_proto::debug() {
+                        eprintln!(
+                            "[serve] recv button {button} {pressed} {window:#x} rel=({x},{y}) -> root=({rx},{ry})"
+                        );
+                    }
                     injector.motion(rx, ry)?;
                     injector.button(button, pressed)?;
                     if pressed && button == 1 {
@@ -272,9 +283,18 @@ fn control_loop(
                 }
                 Message::InputMotion { window, x, y } => {
                     let (rx, ry) = root_coords(&geo, window, x, y);
+                    if xcom_proto::debug() {
+                        eprintln!(
+                            "[serve] recv motion {window:#x} rel=({x},{y}) -> root=({rx},{ry}) geo={:?}",
+                            geo.lock().unwrap().get(&window)
+                        );
+                    }
                     injector.motion(rx, ry)?;
                 }
                 Message::Resize { id, w, h } => {
+                    if xcom_proto::debug() {
+                        eprintln!("[serve] recv resize {id:#x} -> {w}x{h}");
+                    }
                     conn.configure_window(
                         id,
                         &xproto::ConfigureWindowAux::new()
