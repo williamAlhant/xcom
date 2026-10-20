@@ -32,6 +32,7 @@ pub struct ServeArgs {
     #[arg(long)]
     pub json: bool,
     /// Attach to an existing display (e.g. :9) instead of spawning one.
+    /// Diagnostic: capture assumes it owns the display (manual compositing).
     #[arg(long)]
     pub display: Option<String>,
     /// Size of the spawned virtual display, e.g. 1600x1200.

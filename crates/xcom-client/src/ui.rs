@@ -70,6 +70,8 @@ pub enum UserEvent {
     ResizeLocal { w: u16, h: u16 },
     /// Test aid: dump the store now (transient artifacts included).
     Dump,
+    /// Test aid: close one attached window (per-window close semantics).
+    CloseOne,
 }
 
 type Target = softbuffer::Surface<Arc<Window>, Arc<Window>>;
@@ -98,6 +100,9 @@ impl Pixels {
     }
 
     fn resize(&mut self, w: u16, h: u16) {
+        if !sane_size(w, h) {
+            return;
+        }
         if (self.w, self.h) != (w, h) {
             // Keep the overlapping content: a resize clears nothing in the
             // remote window either, and wiping here made text vanish during
@@ -175,6 +180,14 @@ pub struct App {
     fullscreen: bool,
     /// Test aids (F12 store dump) are opt-in: F12 belongs to the app otherwise.
     debug_tools: bool,
+}
+
+/// Refuse absurd window sizes from the wire: the store is `w*h*4` bytes, and
+/// `u16` allows a 17 GB allocation from a malicious or buggy server.
+const MAX_WINDOW_DIM: u16 = 8192;
+
+fn sane_size(w: u16, h: u16) -> bool {
+    w > 0 && h > 0 && w <= MAX_WINDOW_DIM && h <= MAX_WINDOW_DIM
 }
 
 /// Local and remote sizes within this many pixels are "the same size": window
@@ -426,6 +439,13 @@ impl App {
 
     fn blit_frame(&mut self, frame: &DamageFrame) {
         let id = frame.window;
+        if !sane_size(frame.win_w, frame.win_h) {
+            eprintln!(
+                "[ui] frame {id:#x} rejected: implausible window size {}x{}",
+                frame.win_w, frame.win_h
+            );
+            return;
+        }
         if xcom_proto::debug() {
             eprintln!(
                 "[ui] frame {id:#x} {}x{} rects={:?}",
@@ -467,6 +487,10 @@ impl ApplicationHandler<UserEvent> for App {
                 h,
                 title,
             } => {
+                if !sane_size(w, h) {
+                    eprintln!("[ui] window {id:#x} rejected: implausible size {w}x{h}");
+                    return;
+                }
                 self.ever_had_windows = true;
                 let pix = self.pixels.entry(id).or_insert_with(|| Pixels::new(w, h));
                 pix.x = x;
@@ -492,7 +516,9 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Some(pix) = self.pixels.get_mut(&id) {
                     pix.x = x;
                     pix.y = y;
-                    pix.resize(w, h);
+                    if sane_size(w, h) {
+                        pix.resize(w, h);
+                    }
                 }
                 if let Some(att) = self.attached.get_mut(&id) {
                     att.remote = (w, h);
@@ -543,6 +569,12 @@ impl ApplicationHandler<UserEvent> for App {
                 el.exit();
             }
             UserEvent::Dump => self.dump("mid."),
+            UserEvent::CloseOne => {
+                if let Some((&id, _)) = self.attached.iter().next() {
+                    eprintln!("[ui] test aid: closing window {id:#x}");
+                    self.send(Message::WindowClose { id });
+                }
+            }
             UserEvent::ResizeLocal { w, h } => {
                 if let Some((id, att)) = self.attached.iter_mut().next() {
                     eprintln!("[ui] test resize {id:#x} -> {w}x{h}");
@@ -765,6 +797,15 @@ mod tests {
         assert_eq!(p.buf[1], 0xff00_0000 + 1);
         assert_eq!(p.buf[2], 0xff00_0000 + 4); // row 1 of the old content
         assert_eq!(p.buf[3], 0xff00_0000 + 5);
+    }
+
+    #[test]
+    fn implausible_sizes_are_rejected() {
+        assert!(sane_size(800, 600));
+        assert!(!sane_size(0, 600));
+        assert!(!sane_size(800, 0));
+        assert!(!sane_size(65535, 65535));
+        assert!(!sane_size(8193, 100));
     }
 
     #[test]

@@ -6,9 +6,10 @@
 //! extra copy. Control messages will move to `postcard` when they grow past
 //! hello/ping.
 //!
-//! Timestamps are monotonic nanoseconds from a process-wide origin. They are
-//! only compared within one process (the M0 harness captures and receives on
-//! the same side), which keeps the clock portable to Windows.
+//! Timestamps use a monotonic clock in nanoseconds. On Unix that is
+//! `CLOCK_MONOTONIC`, which is comparable across processes on the same host
+//! (the M0 harness and the e2e key-latency check rely on that); other targets
+//! fall back to the system clock so this crate still builds for Windows.
 
 pub const PROTO_VERSION: u16 = 2;
 
@@ -74,18 +75,28 @@ macro_rules! logln {
     }};
 }
 
-/// Monotonic nanoseconds since the first call in this process.
-///
-/// `Instant` is monotonic on every platform we target (including Windows) and
-/// avoids an un-gated `libc` dependency in this crate, which is what kept the
-/// Windows client from compiling.
+/// Monotonic nanoseconds (cross-process comparable on Unix).
+#[cfg(unix)]
 pub fn now_ns() -> u64 {
-    use std::sync::OnceLock;
-    use std::time::Instant;
+    unsafe {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
+        ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+    }
+}
 
-    static ORIGIN: OnceLock<Instant> = OnceLock::new();
-    let origin = ORIGIN.get_or_init(Instant::now);
-    origin.elapsed().as_nanos() as u64
+/// Windows has no `libc::clock_gettime`; timestamps are only used for local
+/// logging and ping round-trips there (client and server are different hosts).
+#[cfg(not(unix))]
+pub fn now_ns() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
 }
 
 /// One damaged rectangle's pixels on the wire.

@@ -14,6 +14,9 @@
 #   CHECK_BOX=1  assert the frame is the anim's box pattern
 #   CHECK_KEYS=1 type into the anim and assert the app received the keysyms
 #   CHECK_RESIZE=1  assert one user resize does not start a resize ping-pong
+#   CHECK_CLOSE=1   close one of two windows; the session must keep the other
+#   CHECK_TEARDOWN=0  skip the no-zombie check after the client exits
+#   CLOSE_AFTER=N   seconds after start to close one window (test aid)
 #   XCOM_DEBUG=1 protocol/input tracing (client and daemon)
 set -euo pipefail
 
@@ -54,6 +57,7 @@ fi
 DISPLAY=${CLIENT_DISPLAY:-:0} XCOM_DEBUG=${XCOM_DEBUG:-0} "$XCOM" connect --ssh xcom@127.0.0.1 \
     --ssh-args "$SSH_ARGS" --exec "$APP" \
     --seconds "$SECS" --dump-ppm "$OUT/frame-ssh.ppm" $TYPE_ARGS $RESIZE_ARGS \
+    ${CLOSE_AFTER:+--close-after "$CLOSE_AFTER"} \
     > "$OUT/client-ssh.log" 2>&1 || true
 
 echo "--- client (app: $APP) ---"
@@ -84,6 +88,32 @@ if [ "${CHECK_RESIZE:-0}" = 1 ]; then
         echo "check-resize: OK (no ping-pong)"
     fi
     python3 "$REPO/scripts/check-ppm.py" "$OUT/frame-ssh.ppm" xterm || PASS=0
+fi
+
+if [ "${CHECK_CLOSE:-0}" = 1 ]; then
+    echo "--- per-window close check ---"
+    grep -q 'test aid: closing window' "$OUT/client-ssh.log" || PASS=0
+    grep -q 'window .* closed' "$OUT/client-ssh.log" || PASS=0
+    if grep -q '1 window(s) open' "$OUT/client-ssh.log"; then
+        echo "check-close: OK (one window closed, the other stayed up)"
+    else
+        echo "check-close: FAIL (the session did not survive the close)"
+        PASS=0
+    fi
+fi
+
+if [ "${CHECK_TEARDOWN:-1}" = 1 ]; then
+    echo "--- teardown check ---"
+    sleep 1
+    LEFT_DAEMON=$(podman exec xcom-testvm sh -c "pgrep -x xcomd || true" | tr -d '\r')
+    LEFT_XVFB=$(podman exec xcom-testvm sh -c "pgrep -x Xvfb || true" | tr -d '\r')
+    if [ -n "$LEFT_DAEMON$LEFT_XVFB" ]; then
+        echo "check-teardown: FAIL (daemon='$LEFT_DAEMON' xvfb='$LEFT_XVFB' left behind)"
+        podman exec xcom-testvm sh -c "ps -o pid,etime,stat,args -p $LEFT_DAEMON 2>/dev/null || true"
+        PASS=0
+    else
+        echo "check-teardown: OK (daemon and Xvfb exited with the client)"
+    fi
 fi
 
 if [ "${CHECK_KEYS:-0}" = 1 ]; then

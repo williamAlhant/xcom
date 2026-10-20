@@ -775,8 +775,50 @@ fn selftest(args: SelftestArgs) -> Result<()> {
         );
     }
 
-    println!("SELFTEST PASS: small draw+erase captured correctly ({}x{}), incremental == full", w, h);
+    // H2: unmap is not destroy. The window must be reported hidden, produce no
+    // frames while hidden, and be re-announced (and capturable) after remap.
+    draw_conn.unmap_window(win)?;
+    draw_conn.flush()?;
+    if !wait_pump(&mut session, Duration::from_secs(2), |e| {
+        matches!(e, PumpEvent::Unmapped(w) if *w == win)
+    })? {
+        bail!("selftest: unmap was not reported");
+    }
+    if session.capture_full(win)?.is_some() {
+        bail!("selftest: an unmapped window produced a full frame");
+    }
+    draw_conn.map_window(win)?;
+    draw_conn.flush()?;
+    if !wait_pump(&mut session, Duration::from_secs(2), |e| {
+        matches!(e, PumpEvent::Mapped(w) if *w == win)
+    })? {
+        bail!("selftest: remap was not re-announced");
+    }
+    session
+        .capture_full(win)?
+        .context("capture_full after remap")?;
+
+    println!(
+        "SELFTEST PASS: small draw+erase captured correctly ({}x{}), incremental == full, unmap/remap kept the window",
+        w, h
+    );
     Ok(())
+}
+
+/// Pump until an event matches or the timeout expires.
+fn wait_pump<F>(session: &mut CaptureSession, timeout: Duration, pred: F) -> Result<bool>
+where
+    F: Fn(&PumpEvent) -> bool,
+{
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Some(ev) = session.pump(Some(deadline))? {
+            if pred(&ev) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 fn gc_of(conn: &x11rb::rust_connection::RustConnection, win: Window, fg: u32) -> Result<Gcontext> {

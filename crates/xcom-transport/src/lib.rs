@@ -625,10 +625,7 @@ mod tests {
         let channel = connect(&addr, Role::Control, &fp, &ctrl, Duration::from_secs(2));
         assert!(channel.is_ok(), "real client rejected: {:?}", channel.err());
         drop(channel);
-        assert!(matches!(
-            server.join().unwrap(),
-            Ok(_)
-        ));
+        assert!(server.join().unwrap().is_ok());
     }
 
     #[test]

@@ -88,6 +88,9 @@ struct ConnectArgs {
     /// Test aid: dump the store N seconds after start (mid-session).
     #[arg(long, default_value_t = 0)]
     dump_after: u64,
+    /// Test aid: close one window N seconds after start (session must survive).
+    #[arg(long, default_value_t = 0)]
+    close_after: u64,
 }
 
 struct Handshake {
@@ -329,6 +332,15 @@ fn main() -> Result<()> {
                 proxy_timer.send_event(UserEvent::ResizeLocal { w, h }).ok();
             });
         }
+    }
+
+    if args.close_after > 0 {
+        let proxy_timer = proxy.clone();
+        let after = args.close_after;
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(after));
+            proxy_timer.send_event(UserEvent::CloseOne).ok();
+        });
     }
 
     if args.dump_after > 0 {

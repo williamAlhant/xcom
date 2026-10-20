@@ -362,12 +362,23 @@ impl CaptureSession {
                 self.capture_if_ready(win)?;
             }
             Event::ConfigureNotify(e) => {
+                // ConfigureNotify coordinates are parent-relative. Under a WM
+                // the top-level is reparented into a frame, so translating to
+                // the root is what keeps input injection and the client's
+                // geometry correct (M6). No WM: the translation is a no-op.
+                let (root_x, root_y) = self
+                    .conn
+                    .translate_coordinates(e.window, self.root, 0, 0)
+                    .ok()
+                    .and_then(|c| c.reply().ok())
+                    .map(|r| (r.dst_x, r.dst_y))
+                    .unwrap_or((e.x, e.y));
                 let resized = {
                     let Some(state) = self.windows.get_mut(&e.window) else {
                         return Ok(());
                     };
-                    state.x = e.x;
-                    state.y = e.y;
+                    state.x = root_x;
+                    state.y = root_y;
                     e.width != state.w || e.height != state.h
                 };
                 if resized {
