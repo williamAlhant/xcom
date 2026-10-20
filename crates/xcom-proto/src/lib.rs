@@ -6,9 +6,9 @@
 //! extra copy. Control messages will move to `postcard` when they grow past
 //! hello/ping.
 //!
-//! Timestamps use `CLOCK_MONOTONIC` nanoseconds, which on Linux is comparable
-//! across processes on the same host — that lets the M0 spike measure true
-//! one-way latency between the capture process and the sink.
+//! Timestamps are monotonic nanoseconds from a process-wide origin. They are
+//! only compared within one process (the M0 harness captures and receives on
+//! the same side), which keeps the clock portable to Windows.
 
 pub const PROTO_VERSION: u16 = 1;
 
@@ -41,16 +41,18 @@ pub fn debug() -> bool {
     })
 }
 
-/// Monotonic nanoseconds, comparable between processes on the same host.
+/// Monotonic nanoseconds since the first call in this process.
+///
+/// `Instant` is monotonic on every platform we target (including Windows) and
+/// avoids an un-gated `libc` dependency in this crate, which is what kept the
+/// Windows client from compiling.
 pub fn now_ns() -> u64 {
-    unsafe {
-        let mut ts = libc::timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
-        };
-        libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
-        ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
-    }
+    use std::sync::OnceLock;
+    use std::time::Instant;
+
+    static ORIGIN: OnceLock<Instant> = OnceLock::new();
+    let origin = ORIGIN.get_or_init(Instant::now);
+    origin.elapsed().as_nanos() as u64
 }
 
 /// One damaged rectangle's pixels on the wire.
