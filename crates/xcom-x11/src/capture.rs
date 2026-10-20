@@ -98,6 +98,9 @@ struct WinState {
     y: i16,
     w: u16,
     h: u16,
+    /// Visible right now. Unmapped windows stay tracked (their apps may map
+    /// them again) but produce no frames and are re-synced on remap.
+    mapped: bool,
     pending: Vec<Rect>,
     need_fetch: bool,
     t_first_event_ns: u64,
@@ -254,6 +257,7 @@ impl CaptureSession {
                 y: geom.y,
                 w: geom.width,
                 h: geom.height,
+                mapped: true,
                 pending: Vec::new(),
                 need_fetch: false,
                 t_first_event_ns: 0,
@@ -277,6 +281,9 @@ impl CaptureSession {
         let Some(state) = self.windows.get(&win) else {
             return Ok(None);
         };
+        if !state.mapped {
+            return Ok(None);
+        }
         let full = Rect::new(0, 0, state.w, state.h);
         let t = now_ns();
         let (frame, stats) = self.capture_frame(win, vec![full], t)?;
@@ -353,16 +360,44 @@ impl CaptureSession {
                 }
             }
             Event::MapNotify(e) => {
-                if e.event == self.root && !self.windows.contains_key(&e.window) {
-                    if let Ok((_, _, w, h)) = self.add_window(e.window) {
-                        if w > 0 && h > 0 {
-                            self.queue.push_back(PumpEvent::Mapped(e.window));
+                if e.event != self.root {
+                    return Ok(());
+                }
+                let remapped = match self.windows.get_mut(&e.window) {
+                    Some(state) => {
+                        let remapped = !state.mapped;
+                        state.mapped = true;
+                        Some(remapped)
+                    }
+                    None => None,
+                };
+                match remapped {
+                    // Already tracked: the window was hidden, announce it again.
+                    Some(true) => self.queue.push_back(PumpEvent::Mapped(e.window)),
+                    Some(false) => {}
+                    None => {
+                        if let Ok((_, _, w, h)) = self.add_window(e.window) {
+                            if w > 0 && h > 0 {
+                                self.queue.push_back(PumpEvent::Mapped(e.window));
+                            }
                         }
                     }
                 }
             }
             Event::UnmapNotify(e) => {
-                if e.event == self.root && self.windows.contains_key(&e.window) {
+                if e.event != self.root {
+                    return Ok(());
+                }
+                let newly_hidden = match self.windows.get_mut(&e.window) {
+                    Some(state) if state.mapped => {
+                        state.mapped = false;
+                        true
+                    }
+                    _ => false,
+                };
+                if newly_hidden {
+                    // Unmap is not destroy: keep the window and its store, and
+                    // re-sync whenever the app maps it again.
                     self.queue.push_back(PumpEvent::Unmapped(e.window));
                 }
             }
@@ -379,17 +414,29 @@ impl CaptureSession {
 
     /// Turn pending damage into one captured frame and queue it.
     fn capture_if_ready(&mut self, win: Window) -> Result<()> {
-        let (t_event_ns, mut rects, need_fetch, w, h) = {
+        let (t_event_ns, mut rects, need_fetch, w, h, mapped) = {
             let Some(state) = self.windows.get_mut(&win) else {
                 return Ok(());
             };
             let t = state.t_first_event_ns;
             state.t_first_event_ns = 0;
             let need = std::mem::take(&mut state.need_fetch);
-            (t, std::mem::take(&mut state.pending), need, state.w, state.h)
+            (
+                t,
+                std::mem::take(&mut state.pending),
+                need,
+                state.w,
+                state.h,
+                state.mapped,
+            )
         };
         if need_fetch {
+            // Clear the server-side damage even when hidden, so a remap does
+            // not replay a burst of stale rectangles.
             self.fetch_damage(win, &mut rects)?;
+        }
+        if !mapped {
+            return Ok(());
         }
         rects.retain_mut(|r| {
             *r = r.clamped(w, h);
@@ -458,8 +505,21 @@ impl CaptureSession {
         if need <= self.shm.len {
             return Ok(());
         }
-        let shm = attach_shm(&self.conn, need)?;
-        self.shm = shm;
+        self.replace_shm(need)
+    }
+
+    /// Swap in a bigger segment and detach the old one from the *server* too.
+    ///
+    /// The SysV segment is IPC_RMID'd, so it only dies when both sides have
+    /// detached; skipping the server-side detach pinned kernel memory inside
+    /// Xvfb until the connection closed.
+    fn replace_shm(&mut self, need: usize) -> Result<()> {
+        let new = attach_shm(&self.conn, need)?;
+        let old = std::mem::replace(&mut self.shm, new);
+        if let Ok(cookie) = self.conn.shm_detach(old.seg) {
+            let _ = cookie.check();
+        }
+        self.conn.flush()?;
         Ok(())
     }
 
@@ -469,6 +529,19 @@ impl CaptureSession {
         rects: Vec<Rect>,
         t_event_ns: u64,
     ) -> Result<(DamageFrame, FrameStats)> {
+        if !self.windows.contains_key(&win) {
+            bail!("window {win:#x} vanished mid-capture");
+        }
+        // Grow once for the largest rect (borrowing `state` blocks doing it
+        // from inside the batch loop).
+        let max_need = rects
+            .iter()
+            .map(|r| r.area() as usize * 4)
+            .max()
+            .unwrap_or(0);
+        if max_need > self.shm.len {
+            self.replace_shm(max_need)?;
+        }
         let Some(state) = self.windows.get_mut(&win) else {
             bail!("window {win:#x} vanished mid-capture");
         };
@@ -489,10 +562,6 @@ impl CaptureSession {
             while idx < rects.len() {
                 let r = rects[idx];
                 let need = (r.area() * 4) as u32;
-                if need as usize > self.shm.len {
-                    // Disjoint field borrows: `state` and `self.conn` are fine.
-                    self.shm = attach_shm(&self.conn, need as usize)?;
-                }
                 if !batch.is_empty() && offset + need > self.shm.len as u32 {
                     break;
                 }
@@ -562,6 +631,15 @@ impl CaptureSession {
             rects: wire,
         };
         Ok((frame, stats))
+    }
+}
+
+impl Drop for CaptureSession {
+    fn drop(&mut self) {
+        if let Ok(cookie) = self.conn.shm_detach(self.shm.seg) {
+            let _ = cookie.check();
+        }
+        let _ = self.conn.flush();
     }
 }
 

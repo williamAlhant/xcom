@@ -252,6 +252,7 @@ pub fn run(args: ServeArgs) -> Result<()> {
     // (also covers the "static windows produce no damage" case found in M0:
     // the client always starts from one full frame per window.)
     let existing: Vec<Window> = session.windows().collect();
+    let mut announced = std::collections::HashSet::new();
     for win in existing {
         let Some((x, y, w, h)) = session.window_geometry(win) else {
             continue;
@@ -270,6 +271,7 @@ pub fn run(args: ServeArgs) -> Result<()> {
         if ctrl_tx.send(msg).is_err() {
             break;
         }
+        announced.insert(win);
         match session.capture_full(win)? {
             Some((frame, _)) => {
                 logln!("[serve] sync: full frame {win:#x} ({} rects)", frame.rects.len());
@@ -291,6 +293,7 @@ pub fn run(args: ServeArgs) -> Result<()> {
         &shutdown,
         &geo,
         &ctrl_thread,
+        announced,
     );
 
     shutdown.store(true, Ordering::SeqCst);
@@ -350,8 +353,9 @@ fn control_loop(
                     }
                 }
                 Message::Focus { window } => {
-                    if xcom_proto::debug() {
-                        logln!("[serve] recv focus {window:#x}");
+                    if !geo.lock().unwrap().contains_key(&window) {
+                        logln!("[serve] focus {window:#x}: not a tracked window");
+                        continue;
                     }
                     injector.focus(window)?;
                 }
@@ -387,6 +391,14 @@ fn control_loop(
                     injector.motion(rx, ry)?;
                 }
                 Message::Resize { id, w, h } => {
+                    if w == 0 || h == 0 || w > 16384 || h > 16384 {
+                        logln!("[serve] resize {id:#x} rejected: {w}x{h}");
+                        continue;
+                    }
+                    if !geo.lock().unwrap().contains_key(&id) {
+                        logln!("[serve] resize {id:#x}: not a tracked window");
+                        continue;
+                    }
                     if xcom_proto::debug() {
                         logln!("[serve] recv resize {id:#x} -> {w}x{h}");
                     }
@@ -397,6 +409,17 @@ fn control_loop(
                             .height(h as u32),
                     )?;
                     conn.flush()?;
+                }
+                Message::WindowClose { id } => {
+                    if !geo.lock().unwrap().contains_key(&id) {
+                        logln!("[serve] close {id:#x}: not a tracked window");
+                        continue;
+                    }
+                    match windows::request_close(&*conn, id) {
+                        Ok(true) => logln!("[serve] close {id:#x}: WM_DELETE_WINDOW"),
+                        Ok(false) => logln!("[serve] close {id:#x}: destroyed (no WM_DELETE_WINDOW)"),
+                        Err(e) => logln!("[serve] close {id:#x} failed: {e}"),
+                    }
                 }
                 Message::FullRequest { id } => {
                     full_requests.send(id).ok();
@@ -495,6 +518,7 @@ fn serve_loop(
     shutdown: &AtomicBool,
     geo: &GeometryMap,
     ctrl_thread: &std::thread::JoinHandle<()>,
+    mut announced: std::collections::HashSet<Window>,
 ) -> Result<()> {
     // A window's first full frame can be captured before the app has painted
     // (and a freshly named pixmap may hold recycled memory). Static apps never
@@ -603,22 +627,32 @@ fn serve_loop(
                         )
                         .map_err(|e| anyhow::anyhow!("set_input_focus: {e}"))?;
                     session.connection().flush().ok();
-                    let title = windows::window_name(session.connection().as_ref(), win)
-                        .unwrap_or_default();
                     geo.lock().unwrap().insert(win, (x, y));
-                    ctrl_tx
-                        .send(Message::WindowCreate {
-                            id: win,
-                            x,
-                            y,
-                            w,
-                            h,
-                            title,
-                        })
-                        .ok();
+                    if announced.insert(win) {
+                        let title = windows::window_name(
+                            session.connection().as_ref(),
+                            win,
+                        )
+                        .unwrap_or_default();
+                        ctrl_tx
+                            .send(Message::WindowCreate {
+                                id: win,
+                                x,
+                                y,
+                                w,
+                                h,
+                                title,
+                            })
+                            .ok();
+                    } else {
+                        // Unmapped then mapped again: the client still has the
+                        // window and its store, it only needs to show it.
+                        ctrl_tx.send(Message::WindowMapped { id: win }).ok();
+                    }
                     // A freshly mapped window has no damage history: send one
                     // full frame so static windows (xterm idle, dialogs) show
-                    // up immediately.
+                    // up immediately. On remap this also repairs everything
+                    // drawn while the window was hidden.
                     sync.insert(
                         win,
                         SyncState {
@@ -639,15 +673,34 @@ fn serve_loop(
                     }
                 }
             }
-            Some(PumpEvent::Unmapped(win)) | Some(PumpEvent::Destroyed(win)) => {
+            Some(PumpEvent::Unmapped(win)) => {
+                // Not a destroy: the app may map the window again. Keep the
+                // geometry (it still exists) but stop scheduled re-syncs.
+                sync.remove(&win);
+                ctrl_tx.send(Message::WindowUnmapped { id: win }).ok();
+            }
+            Some(PumpEvent::Destroyed(win)) => {
                 geo.lock().unwrap().remove(&win);
+                sync.remove(&win);
+                announced.remove(&win);
                 ctrl_tx.send(Message::WindowDestroy { id: win }).ok();
             }
             Some(PumpEvent::Resized { window, w, h }) => {
-                if let Some((x, y, _, _)) = session.window_geometry(window) {
+                let (x, y) = if let Some((x, y, _, _)) = session.window_geometry(window) {
                     geo.lock().unwrap().insert(window, (x, y));
-                }
-                ctrl_tx.send(Message::WindowGeometry { id: window, w, h }).ok();
+                    (x, y)
+                } else {
+                    (0, 0)
+                };
+                ctrl_tx
+                    .send(Message::WindowGeometry {
+                        id: window,
+                        x,
+                        y,
+                        w,
+                        h,
+                    })
+                    .ok();
                 // Newly exposed regions are undefined until the app repaints:
                 // schedule post-paint re-syncs like on map.
                 sync.insert(

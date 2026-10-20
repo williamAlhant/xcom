@@ -2,7 +2,9 @@
 
 use anyhow::Result;
 use x11rb::connection::Connection;
-use x11rb::protocol::xproto::{Atom, AtomEnum, ConnectionExt, MapState, Window};
+use x11rb::protocol::xproto::{
+    Atom, AtomEnum, ClientMessageEvent, ConnectionExt, EventMask, MapState, Window,
+};
 
 #[derive(Debug, Clone)]
 pub struct TopLevel {
@@ -78,6 +80,29 @@ fn text_prop<C: Connection>(conn: &C, win: Window, prop: Atom) -> Option<String>
         return None;
     }
     Some(String::from_utf8_lossy(&reply.value).into_owned())
+}
+
+/// Ask a window to close: ICCCM `WM_DELETE_WINDOW` when the client supports it,
+/// otherwise destroy the window (there is no window manager to mediate).
+///
+/// Returns `true` when the polite path was used.
+pub fn request_close<C: Connection>(conn: &C, win: Window) -> Result<bool> {
+    let protocols = conn.intern_atom(false, b"WM_PROTOCOLS")?.reply()?.atom;
+    let delete = conn.intern_atom(false, b"WM_DELETE_WINDOW")?.reply()?.atom;
+    let supported = conn
+        .get_property(false, win, protocols, AtomEnum::ATOM, 0, 64)
+        .ok()
+        .and_then(|c| c.reply().ok())
+        .and_then(|r| r.value32().map(|mut it| it.any(|a| a == delete)))
+        .unwrap_or(false);
+    if supported {
+        let ev = ClientMessageEvent::new(32, win, protocols, [delete, 0, 0, 0, 0]);
+        conn.send_event(false, win, EventMask::NO_EVENT, ev)?;
+    } else {
+        conn.destroy_window(win)?;
+    }
+    conn.flush()?;
+    Ok(supported)
 }
 
 /// Find a mapped top-level whose name contains `needle` (case-insensitive).

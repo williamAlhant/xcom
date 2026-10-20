@@ -30,6 +30,8 @@ pub const MSG_AUTH_REJECTED: u8 = 6;
 pub const MSG_WINDOW_CREATE: u8 = 10;
 pub const MSG_WINDOW_DESTROY: u8 = 11;
 pub const MSG_WINDOW_GEOMETRY: u8 = 12;
+pub const MSG_WINDOW_UNMAP: u8 = 13;
+pub const MSG_WINDOW_MAP: u8 = 14;
 
 // Input and control (client -> server).
 pub const MSG_FOCUS: u8 = 19;
@@ -39,6 +41,8 @@ pub const MSG_INPUT_MOTION: u8 = 22;
 pub const MSG_RESIZE: u8 = 23;
 pub const MSG_FULL_REQUEST: u8 = 24;
 pub const MSG_BYE: u8 = 25;
+/// Close one remote window (not the whole session).
+pub const MSG_WINDOW_CLOSE: u8 = 26;
 
 /// `XCOM_DEBUG=1` enables protocol/input tracing (test and diagnosis aid).
 pub fn debug() -> bool {
@@ -235,10 +239,26 @@ pub enum Message {
     WindowDestroy {
         id: u32,
     },
+    /// The remote window was unmapped (hidden) but still exists: hide the
+    /// native window, keep its store, and wait for [`Message::WindowMapped`].
+    WindowUnmapped {
+        id: u32,
+    },
+    /// The window is visible again after an unmap: show it and re-sync.
+    WindowMapped {
+        id: u32,
+    },
     WindowGeometry {
         id: u32,
+        x: i16,
+        y: i16,
         w: u16,
         h: u16,
+    },
+    /// Client request: close this remote window (WM_DELETE semantics), not the
+    /// whole session.
+    WindowClose {
+        id: u32,
     },
     /// Keyboard focus moved to this remote window (client -> server).
     Focus {
@@ -329,7 +349,10 @@ impl Message {
         match self {
             Message::WindowCreate { .. } => MSG_WINDOW_CREATE,
             Message::WindowDestroy { .. } => MSG_WINDOW_DESTROY,
+            Message::WindowUnmapped { .. } => MSG_WINDOW_UNMAP,
+            Message::WindowMapped { .. } => MSG_WINDOW_MAP,
             Message::WindowGeometry { .. } => MSG_WINDOW_GEOMETRY,
+            Message::WindowClose { .. } => MSG_WINDOW_CLOSE,
             Message::Focus { .. } => MSG_FOCUS,
             Message::InputKey { .. } => MSG_INPUT_KEY,
             Message::InputButton { .. } => MSG_INPUT_BUTTON,
@@ -362,8 +385,13 @@ impl Message {
                 out.extend_from_slice(title.as_bytes());
             }
             Message::WindowDestroy { id } => put_u32(&mut out, *id),
-            Message::WindowGeometry { id, w, h } => {
+            Message::WindowUnmapped { id } | Message::WindowMapped { id } | Message::WindowClose { id } => {
+                put_u32(&mut out, *id)
+            }
+            Message::WindowGeometry { id, x, y, w, h } => {
                 put_u32(&mut out, *id);
+                put_i16(&mut out, *x);
+                put_i16(&mut out, *y);
                 put_u16(&mut out, *w);
                 put_u16(&mut out, *h);
             }
@@ -416,8 +444,19 @@ impl Message {
             MSG_WINDOW_DESTROY => Message::WindowDestroy {
                 id: take_u32(&mut p)?,
             },
+            MSG_WINDOW_UNMAP => Message::WindowUnmapped {
+                id: take_u32(&mut p)?,
+            },
+            MSG_WINDOW_MAP => Message::WindowMapped {
+                id: take_u32(&mut p)?,
+            },
+            MSG_WINDOW_CLOSE => Message::WindowClose {
+                id: take_u32(&mut p)?,
+            },
             MSG_WINDOW_GEOMETRY => Message::WindowGeometry {
                 id: take_u32(&mut p)?,
+                x: take_i16(&mut p)?,
+                y: take_i16(&mut p)?,
                 w: take_u16(&mut p)?,
                 h: take_u16(&mut p)?,
             },
@@ -688,8 +727,13 @@ mod tests {
                 title: "xterm — ü".to_string(),
             },
             Message::WindowDestroy { id: 7 },
+            Message::WindowUnmapped { id: 7 },
+            Message::WindowMapped { id: 7 },
+            Message::WindowClose { id: 7 },
             Message::WindowGeometry {
                 id: 7,
+                x: -3,
+                y: 4,
                 w: 1024,
                 h: 768,
             },
@@ -725,5 +769,66 @@ mod tests {
             let back = Message::decode(m.msg_type(), &bytes).unwrap();
             assert_eq!(m, back);
         }
+    }
+
+    #[test]
+    fn trailing_bytes_are_rejected() {
+        let mut bytes = Message::WindowDestroy { id: 7 }.encode();
+        bytes.push(0);
+        assert!(Message::decode(MSG_WINDOW_DESTROY, &bytes).is_err());
+    }
+
+    #[test]
+    fn frame_limit_is_enforced_before_allocating() {
+        // Advertise 128 MiB with no payload: must fail on the limit, not try
+        // to allocate.
+        let mut data = Vec::new();
+        data.extend_from_slice(&(128u32 << 20).to_le_bytes());
+        data.push(MSG_DAMAGE);
+        let mut src = &data[..];
+        let mut r = FrameReader {
+            inner: &mut src,
+            state: FrameState::with_max_len(1024),
+        };
+        match r.read() {
+            Err(ProtoError::FrameTooLarge(n)) => assert_eq!(n, 128 << 20),
+            other => panic!("expected FrameTooLarge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn damage_rejects_inconsistent_raw_len() {
+        let f = DamageFrame {
+            window: 1,
+            win_w: 10,
+            win_h: 10,
+            t_event_ns: 0,
+            t_capture_ns: 0,
+            rects: vec![WireRect {
+                x: 0,
+                y: 0,
+                w: 2,
+                h: 2,
+                codec: 0,
+                raw_len: 4, // should be 16
+                data: vec![0; 16],
+            }],
+        };
+        assert!(DamageFrame::decode(&f.encode()).is_err());
+    }
+
+    #[test]
+    fn damage_rejects_trailing_bytes() {
+        let f = DamageFrame {
+            window: 1,
+            win_w: 10,
+            win_h: 10,
+            t_event_ns: 0,
+            t_capture_ns: 0,
+            rects: vec![],
+        };
+        let mut bytes = f.encode();
+        bytes.push(0);
+        assert!(DamageFrame::decode(&bytes).is_err());
     }
 }

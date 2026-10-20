@@ -386,7 +386,11 @@ fn control_loop(
                         h,
                         title,
                     }),
-                    Message::WindowGeometry { id, w, h } => Some(UserEvent::Geometry { id, w, h }),
+                    Message::WindowGeometry { id, x, y, w, h } => {
+                        Some(UserEvent::Geometry { id, x, y, w, h })
+                    }
+                    Message::WindowUnmapped { id } => Some(UserEvent::Unmap { id }),
+                    Message::WindowMapped { id } => Some(UserEvent::Map { id }),
                     Message::WindowDestroy { id } => Some(UserEvent::Close { id }),
                     _ => None,
                 };

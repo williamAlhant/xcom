@@ -44,9 +44,20 @@ pub enum UserEvent {
     },
     Geometry {
         id: u32,
+        x: i16,
+        y: i16,
         w: u16,
         h: u16,
     },
+    /// Hidden remotely (unmapped): hide the native window, keep its store.
+    Unmap {
+        id: u32,
+    },
+    /// Visible again after an unmap: show and re-sync.
+    Map {
+        id: u32,
+    },
+    /// Destroyed remotely: drop the window and its store.
     Close {
         id: u32,
     },
@@ -156,6 +167,9 @@ pub struct App {
     frames_blitted: u64,
     presents: u64,
     present_errors: u64,
+    /// A window has been opened at least once: used to distinguish "the last
+    /// window was closed" from "nothing has arrived yet".
+    ever_had_windows: bool,
     dump: Option<PathBuf>,
     dump_seq: u32,
     fullscreen: bool,
@@ -186,6 +200,7 @@ impl App {
             frames_blitted: 0,
             presents: 0,
             present_errors: 0,
+            ever_had_windows: false,
             dump,
             dump_seq: 0,
             fullscreen,
@@ -448,19 +463,31 @@ impl ApplicationHandler<UserEvent> for App {
                 h,
                 title,
             } => {
+                self.ever_had_windows = true;
                 let pix = self.pixels.entry(id).or_insert_with(|| Pixels::new(w, h));
                 pix.x = x;
                 pix.y = y;
                 pix.title = title;
                 // If the size came from a frame first, trust the create message.
                 pix.resize(w, h);
-                self.open_window(el, id);
+                if self.attached.contains_key(&id) {
+                    // Re-announced window (unmap/remap raced with create).
+                    if let Some(att) = self.attached.get(&id) {
+                        att.window.set_visible(true);
+                    }
+                    self.present(id);
+                    self.send(Message::FullRequest { id });
+                } else {
+                    self.open_window(el, id);
+                }
             }
-            UserEvent::Geometry { id, w, h } => {
+            UserEvent::Geometry { id, x, y, w, h } => {
                 if xcom_proto::debug() {
-                    eprintln!("[ui] geometry {id:#x} -> {w}x{h}");
+                    eprintln!("[ui] geometry {id:#x} -> {w}x{h} at ({x},{y})");
                 }
                 if let Some(pix) = self.pixels.get_mut(&id) {
+                    pix.x = x;
+                    pix.y = y;
                     pix.resize(w, h);
                 }
                 if let Some(att) = self.attached.get_mut(&id) {
@@ -475,13 +502,31 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 self.present(id);
             }
+            UserEvent::Unmap { id } => {
+                if let Some(att) = self.attached.get(&id) {
+                    eprintln!("[ui] window {id:#x} unmapped (hidden, store kept)");
+                    att.window.set_visible(false);
+                }
+            }
+            UserEvent::Map { id } => {
+                if let Some(att) = self.attached.get(&id) {
+                    eprintln!("[ui] window {id:#x} mapped again");
+                    att.window.set_visible(true);
+                    self.present(id);
+                    self.send(Message::FullRequest { id });
+                } else if self.pixels.contains_key(&id) {
+                    self.open_window(el, id);
+                }
+            }
             UserEvent::Close { id } => {
                 self.pixels.remove(&id);
                 if let Some(att) = self.attached.remove(&id) {
                     self.by_winit.remove(&att.window.id());
                     eprintln!("[ui] window {id:#x} closed");
                 }
-                if self.attached.is_empty() {
+                if self.ever_had_windows && self.attached.is_empty() {
+                    // The last remote window is gone: the session has nothing
+                    // left to show.
                     self.report();
                     self.send(Message::Bye);
                     el.exit();
@@ -508,15 +553,16 @@ impl ApplicationHandler<UserEvent> for App {
         }
     }
 
-    fn window_event(&mut self, el: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+    fn window_event(&mut self, _el: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
         let Some(remote) = self.remote_id(id) else {
             return;
         };
         match event {
             WindowEvent::CloseRequested => {
-                self.report();
-                self.send(Message::Bye);
-                el.exit();
+                // Close just this remote window (WM_DELETE_REQUEST); the
+                // session ends when the last one is destroyed.
+                eprintln!("[ui] close requested for win {remote:#x}");
+                self.send(Message::WindowClose { id: remote });
             }
             WindowEvent::RedrawRequested => self.present(remote),
             WindowEvent::Resized(size) => {
