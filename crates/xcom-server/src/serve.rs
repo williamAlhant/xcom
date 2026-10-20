@@ -7,6 +7,7 @@
 //! bypasses SSH from that point on.
 
 use std::io::Write;
+use std::net::{IpAddr, UdpSocket};
 use std::process::{Command, Stdio};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,7 +18,7 @@ use anyhow::{Context, Result};
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{self, ConnectionExt as _, Window};
 
-use xcom_proto::{Message, MSG_DAMAGE};
+use xcom_proto::{logln, Message, MSG_DAMAGE};
 use xcom_transport::{random_token, Channel, ChannelAcceptor, Identity, Role};
 use xcom_x11::capture::{CaptureConfig, CaptureSession, PumpEvent};
 use xcom_x11::input::Injector;
@@ -36,9 +37,15 @@ pub struct ServeArgs {
     /// Size of the spawned virtual display, e.g. 1600x1200.
     #[arg(long, default_value = "1600x1200")]
     pub spawn: String,
-    /// Listen address for the dedicated channel (port 0 = pick one).
-    #[arg(long, default_value = "0.0.0.0:0")]
+    /// Listen address for the dedicated channel. `auto` = all interfaces when
+    /// bootstrapped over ssh (peer-allowlisted), loopback otherwise.
+    #[arg(long, default_value = "auto")]
     pub listen: String,
+    /// Accept the TLS channel from any peer, not just the ssh client address.
+    /// Only for setups where the client's TLS source address differs (jump
+    /// hosts, NAT); it widens the pre-auth exposure.
+    #[arg(long)]
+    pub allow_any_peer: bool,
     /// Host the client connects to (default: SSH client address, else loopback).
     #[arg(long)]
     pub connect: Option<String>,
@@ -57,13 +64,50 @@ fn parse_size(s: &str) -> Result<(u16, u16)> {
     Ok((w.parse()?, h.parse()?))
 }
 
-/// Best guess at the address the client should dial back to: the peer address
-/// of our own ssh session (containers/NAT may need `xcom connect --connect`).
-fn ssh_peer_host() -> Option<String> {
+/// Address of the ssh client, when this process was started by sshd.
+///
+/// `SSH_CONNECTION` is `<client ip> <client port> <server ip> <server port>`.
+/// The first field is both the peer we expect on the TLS channel and the
+/// address the server should advertise for it to dial back to.
+fn ssh_client_ip() -> Option<IpAddr> {
     std::env::var("SSH_CONNECTION")
         .ok()
-        .and_then(|s| s.split_whitespace().next().map(str::to_string))
+        .and_then(|s| s.split_whitespace().next().and_then(|ip| ip.parse().ok()))
 }
+
+/// Best guess at a local address the peer can reach, without sending packets.
+fn local_ip_towards(peer: IpAddr) -> Option<IpAddr> {
+    let bind = if peer.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
+    let sock = UdpSocket::bind(bind).ok()?;
+    sock.connect((peer, 9)).ok()?;
+    let ip = sock.local_addr().ok()?.ip();
+    (!ip.is_unspecified()).then_some(ip)
+}
+
+/// Format `host:port`, bracketing IPv6 literals.
+fn host_port(host: &str, port: u16) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+/// Set `PR_SET_PDEATHSIG` so the child dies even if this process is SIGKILLed
+/// (a normal `Drop` cannot run then, and an orphaned Xvfb/app would leak).
+#[cfg(target_os = "linux")]
+fn die_with_parent(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn die_with_parent(_cmd: &mut Command) {}
 
 pub fn run(args: ServeArgs) -> Result<()> {
     // --- display ---------------------------------------------------------
@@ -80,16 +124,19 @@ pub fn run(args: ServeArgs) -> Result<()> {
     // --- optional app ----------------------------------------------------
     // The app's stdout must never touch ours: stdout is the handshake channel.
     let mut app = match &args.exec {
-        Some(cmd) => Some(
-            Command::new("sh")
-                .arg("-c")
+        Some(cmd) => {
+            let mut c = Command::new("sh");
+            c.arg("-c")
                 .arg(cmd)
                 .env("DISPLAY", &display)
                 .stdout(Stdio::null())
-                .stderr(Stdio::inherit())
-                .spawn()
-                .with_context(|| format!("launching {cmd:?}"))?,
-        ),
+                .stderr(Stdio::inherit());
+            die_with_parent(&mut c);
+            Some(
+                c.spawn()
+                    .with_context(|| format!("launching {cmd:?}"))?,
+            )
+        }
         None => None,
     };
 
@@ -104,34 +151,56 @@ pub fn run(args: ServeArgs) -> Result<()> {
 
     let keymap = Keymap::query(session.connection().as_ref())?;
 
-    // --- identity, token, listener ---------------------------------------
+    // --- identity, tokens, listener --------------------------------------
     let identity = Identity::generate()?;
-    let token = random_token();
-    let acceptor = ChannelAcceptor::bind(&args.listen, &identity, token)?;
+    // One single-use token per role: burning the control token cannot make the
+    // bulk channel replayable, and a stolen token cannot displace either role.
+    let control_token = random_token();
+    let bulk_token = random_token();
+    let ssh_client = ssh_client_ip();
+
+    let listen = match args.listen.as_str() {
+        "auto" => match ssh_client {
+            Some(ip) if ip.is_ipv6() => "[::]:0".to_string(),
+            Some(_) => "0.0.0.0:0".to_string(),
+            None => "127.0.0.1:0".to_string(),
+        },
+        other => other.to_string(),
+    };
+    // Bootstrapped over ssh: only the ssh client may complete a handshake.
+    let allow_peer = if args.allow_any_peer { None } else { ssh_client };
+    let acceptor =
+        ChannelAcceptor::bind(&listen, &identity, control_token, bulk_token, allow_peer)?;
     let port = acceptor.local_addr()?.port();
+
     let host = args
         .connect
         .clone()
-        .or_else(ssh_peer_host)
+        .or_else(|| ssh_client.and_then(local_ip_towards).map(|ip| ip.to_string()))
         .unwrap_or_else(|| "127.0.0.1".to_string());
+    let addr = host_port(&host, port);
 
-    let session_id: u64 = u64::from_le_bytes(token[..8].try_into().unwrap());
+    // Not derived from token bytes: session ids end up in logs.
+    let session_id: u64 = u64::from_le_bytes(random_token()[..8].try_into().unwrap());
 
     // The single handshake line: everything the client needs to authenticate
-    // us (fingerprint) and itself (token), plus where to dial.
+    // us (fingerprint) and itself (one token per role), plus where to dial.
     let line = format!(
-        "{{\"proto\":1,\"session\":\"{session_id:016x}\",\"display\":\"{display}\",\
-         \"connect\":\"{host}:{port}\",\"token\":\"{}\",\"cert_sha256\":\"{}\"}}",
-        xcom_transport::hex(&token),
+        "{{\"proto\":2,\"session\":\"{session_id:016x}\",\"display\":\"{display}\",\
+         \"connect\":\"{addr}\",\"token_control\":\"{}\",\"token_bulk\":\"{}\",\
+         \"cert_sha256\":\"{}\"}}",
+        xcom_transport::hex(&control_token),
+        xcom_transport::hex(&bulk_token),
         identity.fingerprint(),
     );
     if args.json {
-        println!("{line}");
+        // Never panic on a broken stdout: that is the bootstrap channel.
+        let mut out = std::io::stdout().lock();
+        writeln!(out, "{line}").context("writing the handshake line")?;
+        out.flush().context("flushing the handshake line")?;
     } else {
-        eprintln!("[serve] {line}");
+        logln!("[serve] {line}");
     }
-    std::io::stdout().flush()?;
-    std::io::stderr().flush()?;
 
     let timeout = Duration::from_secs(if args.accept_timeout == 0 {
         u64::MAX / 2
@@ -139,14 +208,16 @@ pub fn run(args: ServeArgs) -> Result<()> {
         args.accept_timeout
     });
 
-    eprintln!("[serve] waiting for client on {host}:{port} (display {display})");
+    logln!("[serve] waiting for client on {addr} (display {display})");
     let control = acceptor
         .accept(Role::Control, timeout)
         .context("accepting control channel")?;
     let mut bulk = acceptor
         .accept(Role::Bulk, timeout)
         .context("accepting bulk channel")?;
-    eprintln!("[serve] client connected");
+    // Both roles are bound to their tokens; no further connections are needed.
+    drop(acceptor);
+    logln!("[serve] client connected");
 
     let shutdown = Arc::new(AtomicBool::new(false));
 
@@ -163,7 +234,7 @@ pub fn run(args: ServeArgs) -> Result<()> {
     }
     let geo_ctrl = Arc::clone(&geo);
     let ctrl_thread = std::thread::spawn(move || {
-        control_loop(
+        if let Err(e) = control_loop(
             control,
             conn_for_input,
             root,
@@ -172,7 +243,9 @@ pub fn run(args: ServeArgs) -> Result<()> {
             full_tx,
             shutdown_ctrl,
             geo_ctrl,
-        )
+        ) {
+            logln!("[serve] control loop ended with error: {e:#}");
+        }
     });
 
     // --- initial sync: windows that predate the connection ---------------
@@ -199,18 +272,26 @@ pub fn run(args: ServeArgs) -> Result<()> {
         }
         match session.capture_full(win)? {
             Some((frame, _)) => {
-                eprintln!("[serve] sync: full frame {win:#x} ({} rects)", frame.rects.len());
+                logln!("[serve] sync: full frame {win:#x} ({} rects)", frame.rects.len());
                 let payload = frame.encode();
                 if bulk.send(MSG_DAMAGE, &payload).is_err() {
                     break;
                 }
             }
-            None => eprintln!("[serve] sync: capture_full({win:#x}) returned None"),
+            None => logln!("[serve] sync: capture_full({win:#x}) returned None"),
         }
     }
 
     // --- main loop: capture -> bulk channel ------------------------------
-    let result = serve_loop(&mut session, bulk, &ctrl_tx, &full_rx, &shutdown, &geo);
+    let result = serve_loop(
+        &mut session,
+        bulk,
+        &ctrl_tx,
+        &full_rx,
+        &shutdown,
+        &geo,
+        &ctrl_thread,
+    );
 
     shutdown.store(true, Ordering::SeqCst);
     if let Some(mut app) = app.take() {
@@ -219,6 +300,16 @@ pub fn run(args: ServeArgs) -> Result<()> {
     }
     let _ = ctrl_thread.join();
     result
+}
+
+/// Sets the session shutdown flag on *every* exit path, including early `?`
+/// returns and panics inside the control thread.
+struct ShutdownGuard(Arc<AtomicBool>);
+
+impl Drop for ShutdownGuard {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
 }
 
 fn control_loop(
@@ -231,6 +322,7 @@ fn control_loop(
     shutdown: Arc<AtomicBool>,
     geo: GeometryMap,
 ) -> Result<()> {
+    let _guard = ShutdownGuard(Arc::clone(&shutdown));
     let injector = Injector::new(&*conn, root, keymap);
     loop {
         if shutdown.load(Ordering::SeqCst) {
@@ -250,16 +342,16 @@ fn control_loop(
             Ok(Some((ty, payload))) => match Message::decode(ty, &payload)? {
                 Message::InputKey { sym, pressed } => {
                     if xcom_proto::debug() {
-                        eprintln!("[serve] recv key sym={sym:#x} pressed={pressed}");
+                        logln!("[serve] recv key sym={sym:#x} pressed={pressed}");
                     }
                     if let Err(e) = injector.key(sym, pressed) {
                         // A single unresolvable keysym must not end the session.
-                        eprintln!("[serve] key {sym:#x} dropped: {e}");
+                        logln!("[serve] key {sym:#x} dropped: {e}");
                     }
                 }
                 Message::Focus { window } => {
                     if xcom_proto::debug() {
-                        eprintln!("[serve] recv focus {window:#x}");
+                        logln!("[serve] recv focus {window:#x}");
                     }
                     injector.focus(window)?;
                 }
@@ -272,7 +364,7 @@ fn control_loop(
                 } => {
                     let (rx, ry) = root_coords(&geo, window, x, y);
                     if xcom_proto::debug() {
-                        eprintln!(
+                        logln!(
                             "[serve] recv button {button} {pressed} {window:#x} rel=({x},{y}) -> root=({rx},{ry})"
                         );
                     }
@@ -287,7 +379,7 @@ fn control_loop(
                 Message::InputMotion { window, x, y } => {
                     let (rx, ry) = root_coords(&geo, window, x, y);
                     if xcom_proto::debug() {
-                        eprintln!(
+                        logln!(
                             "[serve] recv motion {window:#x} rel=({x},{y}) -> root=({rx},{ry}) geo={:?}",
                             geo.lock().unwrap().get(&window)
                         );
@@ -296,7 +388,7 @@ fn control_loop(
                 }
                 Message::Resize { id, w, h } => {
                     if xcom_proto::debug() {
-                        eprintln!("[serve] recv resize {id:#x} -> {w}x{h}");
+                        logln!("[serve] recv resize {id:#x} -> {w}x{h}");
                     }
                     conn.configure_window(
                         id,
@@ -321,18 +413,18 @@ fn control_loop(
             },
 
             Ok(None) => {
-                eprintln!("[serve] client left (control channel closed)");
+                logln!("[serve] client left (control channel closed)");
                 shutdown.store(true, Ordering::SeqCst);
                 return Ok(());
             }
             Err(e) if is_timeout(&e) => continue,
             Err(e) if is_eof(&e) => {
-                eprintln!("[serve] client left (EOF)");
+                logln!("[serve] client left (EOF)");
                 shutdown.store(true, Ordering::SeqCst);
                 return Ok(());
             }
             Err(e) => {
-                eprintln!("[serve] control channel error: {e}");
+                logln!("[serve] control channel error: {e}");
                 shutdown.store(true, Ordering::SeqCst);
                 return Ok(());
             }
@@ -402,6 +494,7 @@ fn serve_loop(
     full_rx: &mpsc::Receiver<Window>,
     shutdown: &AtomicBool,
     geo: &GeometryMap,
+    ctrl_thread: &std::thread::JoinHandle<()>,
 ) -> Result<()> {
     // A window's first full frame can be captured before the app has painted
     // (and a freshly named pixmap may hold recycled memory). Static apps never
@@ -427,6 +520,13 @@ fn serve_loop(
 
     loop {
         if shutdown.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        // The control thread owns input and lifecycle; if it is gone the
+        // session is dead even if the bulk socket still looks writable.
+        if ctrl_thread.is_finished() {
+            logln!("[serve] control thread exited; ending the session");
+            shutdown.store(true, Ordering::SeqCst);
             return Ok(());
         }
 
@@ -472,7 +572,7 @@ fn serve_loop(
         match session.pump(Some(Instant::now() + Duration::from_millis(200)))? {
             Some(PumpEvent::Frame { frame, stats, .. }) => {
                 if xcom_proto::debug() {
-                    eprintln!(
+                    logln!(
                         "[serve] frame {:#x} {}x{} rects={:?}",
                         frame.window,
                         frame.win_w,
@@ -482,7 +582,7 @@ fn serve_loop(
                 }
                 let payload = frame.encode();
                 if bulk.send(MSG_DAMAGE, &payload).is_err() {
-                    eprintln!("[serve] bulk channel closed");
+                    logln!("[serve] bulk channel closed");
                     shutdown.store(true, Ordering::SeqCst);
                     return Ok(());
                 }
@@ -528,14 +628,14 @@ fn serve_loop(
                     );
                     match session.capture_full(win)? {
                         Some((frame, _)) => {
-                            eprintln!("[serve] mapped: full frame {win:#x} ({} rects)", frame.rects.len());
+                            logln!("[serve] mapped: full frame {win:#x} ({} rects)", frame.rects.len());
                             let payload = frame.encode();
                             if bulk.send(MSG_DAMAGE, &payload).is_err() {
                                 shutdown.store(true, Ordering::SeqCst);
                                 return Ok(());
                             }
                         }
-                        None => eprintln!("[serve] mapped: capture_full({win:#x}) returned None"),
+                        None => logln!("[serve] mapped: capture_full({win:#x}) returned None"),
                     }
                 }
             }
@@ -562,7 +662,7 @@ fn serve_loop(
         }
 
         if last_report.elapsed() >= Duration::from_secs(5) && stats_frames > 0 {
-            eprintln!(
+            logln!(
                 "[serve] frames={stats_frames} raw={:.0}MB comp={:.1}MB ratio={:.1}x",
                 stats_raw as f64 / 1e6,
                 stats_comp as f64 / 1e6,

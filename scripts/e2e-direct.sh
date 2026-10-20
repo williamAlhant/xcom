@@ -41,10 +41,12 @@ fi
 echo "handshake: $LINE"
 
 ADDR=$(sed -n 's/.*"connect":"\([^"]*\)".*/\1/p' <<< "$LINE")
-TOKEN=$(sed -n 's/.*"token":"\([^"]*\)".*/\1/p' <<< "$LINE")
+TOKEN_CONTROL=$(sed -n 's/.*"token_control":"\([^"]*\)".*/\1/p' <<< "$LINE")
+TOKEN_BULK=$(sed -n 's/.*"token_bulk":"\([^"]*\)".*/\1/p' <<< "$LINE")
 FP=$(sed -n 's/.*"cert_sha256":"\([^"]*\)".*/\1/p' <<< "$LINE")
 
-DISPLAY=${CLIENT_DISPLAY:-:0} "$XCOM" connect --direct "$ADDR" --token "$TOKEN" \
+DISPLAY=${CLIENT_DISPLAY:-:0} "$XCOM" connect --direct "$ADDR" \
+    --token-control "$TOKEN_CONTROL" --token-bulk "$TOKEN_BULK" \
     --fingerprint "$FP" --seconds "$SECS" --dump-ppm "$OUT/frame.ppm" \
     > "$OUT/client.log" 2>&1 || true
 

@@ -20,7 +20,7 @@
 //!   in the X server.
 
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -30,7 +30,11 @@ use rustls::{ClientConfig, ClientConnection, DigitallySignedStruct};
 use rustls::{ServerConfig, ServerConnection, StreamOwned};
 use sha2::{Digest, Sha256};
 
-pub const PROTO_VERSION: u16 = 1;
+pub const PROTO_VERSION: u16 = 2;
+
+/// Per-attempt budget for TLS + hello. A stalled peer costs at most this much
+/// before the accept loop moves on; peers not on the allowlist never get here.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Which half of the channel a connection carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -295,25 +299,35 @@ impl Channel {
 }
 
 /// Server side of the channel.
+///
+/// Holds one single-use token per role. A connection that fails TLS or auth is
+/// dropped and the loop continues: an unauthenticated peer must never be able
+/// to end the session (a connect+close used to propagate out of `accept` and
+/// kill the daemon before the real client arrived).
 pub struct ChannelAcceptor {
     listener: std::net::TcpListener,
     tls: Arc<ServerConfig>,
-    token: [u8; 32],
-    token_used: std::sync::Mutex<bool>,
+    tokens: [[u8; 32]; 2],
+    used: std::sync::Mutex<[bool; 2]>,
+    allow_peer: Option<IpAddr>,
 }
 
 impl ChannelAcceptor {
     pub fn bind(
         addr: &str,
         identity: &Identity,
-        token: [u8; 32],
+        control_token: [u8; 32],
+        bulk_token: [u8; 32],
+        allow_peer: Option<IpAddr>,
     ) -> Result<ChannelAcceptor, TransportError> {
         let listener = std::net::TcpListener::bind(addr)?;
+        listener.set_nonblocking(true)?;
         Ok(ChannelAcceptor {
             listener,
             tls: identity.server_config()?,
-            token,
-            token_used: std::sync::Mutex::new(false),
+            tokens: [control_token, bulk_token],
+            used: std::sync::Mutex::new([false, false]),
+            allow_peer,
         })
     }
 
@@ -321,56 +335,114 @@ impl ChannelAcceptor {
         Ok(self.listener.local_addr()?)
     }
 
-    /// Accept one connection, complete TLS, verify the token.
+    pub fn token(&self, role: Role) -> [u8; 32] {
+        self.tokens[role_index(role)]
+    }
+
+    pub fn token_used(&self, role: Role) -> bool {
+        self.used.lock().unwrap()[role_index(role)]
+    }
+
+    /// Accept one authenticated connection for `role`.
     ///
-    /// The token is single-use per channel role: control authenticates first
-    /// and burns it, the bulk channel re-authenticates with the same token
-    /// within [`TOKEN_GRACE`] of the control channel.
-    pub fn accept(
-        &self,
-        role: Role,
-        timeout: Duration,
-    ) -> Result<Channel, TransportError> {
+    /// Unauthenticated peers (wrong token, replay, bad TLS, not on the
+    /// allowlist) are dropped; the loop keeps waiting for the real client
+    /// until the overall deadline.
+    pub fn accept(&self, role: Role, timeout: Duration) -> Result<Channel, TransportError> {
         let deadline = Instant::now() + timeout;
-        let (tcp, _peer) = loop {
-            self.listener.set_nonblocking(true)?;
-            match self.listener.accept() {
-                Ok(conn) => break conn,
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    if Instant::now() >= deadline {
-                        return Err(TransportError::Timeout);
-                    }
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                Err(e) => return Err(e.into()),
+        let mut last_log = Instant::now() - Duration::from_secs(10);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(TransportError::Timeout);
             }
-        };
-        tcp.set_nodelay(true)?;
+            let (tcp, peer) = match self.listener.accept() {
+                Ok(conn) => conn,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e.into()),
+            };
+            if let Some(expected) = self.allow_peer {
+                if peer.ip() != expected {
+                    if last_log.elapsed() >= Duration::from_secs(1) {
+                        xcom_proto::logln!(
+                            "[transport] ignoring {peer} (expected {expected}); --allow-any-peer disables this"
+                        );
+                        last_log = Instant::now();
+                    }
+                    continue;
+                }
+            }
+            let budget = remaining.min(HANDSHAKE_TIMEOUT);
+            match self.authenticate(tcp, role, budget) {
+                Ok(channel) => return Ok(channel),
+                Err(e) => {
+                    if last_log.elapsed() >= Duration::from_secs(1) {
+                        xcom_proto::logln!("[transport] {role:?} connection rejected: {e}");
+                        last_log = Instant::now();
+                    }
+                    continue;
+                }
+            }
+        }
+    }
+
+    fn authenticate(
+        &self,
+        tcp: TcpStream,
+        role: Role,
+        budget: Duration,
+    ) -> Result<Channel, TransportError> {
         tcp.set_nonblocking(false)?;
+        tcp.set_nodelay(true)?;
+        tcp.set_read_timeout(Some(budget))?;
+        tcp.set_write_timeout(Some(budget))?;
         let conn = ServerConnection::new(self.tls.clone())?;
         let stream = StreamOwned::new(conn, tcp);
-        // Handshake + auth with a bounded lifetime.
-        stream.sock.set_read_timeout(Some(timeout))?;
-        stream.sock.set_write_timeout(Some(timeout))?;
         let mut channel = Channel {
             stream: TlsStream::Server(stream),
-            state: xcom_proto::FrameState::default(),
+            // Pre-auth frames are tiny: the 512 MiB allocation a peer could
+            // trigger by advertising a huge length is gone.
+            state: xcom_proto::FrameState::with_max_len(xcom_proto::MAX_HELLO_LEN),
             role,
         };
-        channel.auth_server(&self.token, role)?;
+        let token = self.tokens[role_index(role)];
+        if let Err(e) = channel.auth_server(&token, role) {
+            let _ = channel.send(xcom_proto::MSG_AUTH_REJECTED, &[]);
+            return Err(e);
+        }
+        {
+            let mut used = self.used.lock().unwrap();
+            let slot = &mut used[role_index(role)];
+            if *slot {
+                let _ = channel.send(xcom_proto::MSG_AUTH_REJECTED, &[]);
+                return Err(TransportError::AuthRejected);
+            }
+            *slot = true;
+        }
+        // Idle timeouts here would look like EOF to the bulk reader (it blocks
+        // between frames). Liveness is the keepalive's job, not the socket's.
+        channel.set_read_timeout(None)?;
+        channel.set_write_timeout(None)?;
+        channel.state.set_max_len(role_max_frame(role));
         Ok(channel)
     }
+}
 
-    pub fn token(&self) -> [u8; 32] {
-        self.token
+fn role_index(role: Role) -> usize {
+    match role {
+        Role::Control => 0,
+        Role::Bulk => 1,
     }
+}
 
-    pub fn mark_token_used(&self) {
-        *self.token_used.lock().unwrap() = true;
-    }
-
-    pub fn token_used(&self) -> bool {
-        *self.token_used.lock().unwrap()
+fn role_max_frame(role: Role) -> usize {
+    match role {
+        Role::Control => xcom_proto::CONTROL_MAX_FRAME,
+        Role::Bulk => xcom_proto::BULK_MAX_FRAME,
     }
 }
 
@@ -439,7 +511,7 @@ pub fn connect(
 
     let mut channel = Channel {
         stream: TlsStream::Client(stream),
-        state: xcom_proto::FrameState::default(),
+        state: xcom_proto::FrameState::with_max_len(xcom_proto::MAX_HELLO_LEN),
         role,
     };
 
@@ -451,7 +523,14 @@ pub fn connect(
     channel.send(xcom_proto::MSG_HELLO, &payload)?;
 
     match channel.recv()? {
-        Some((xcom_proto::MSG_AUTH_OK, p)) if p.len() >= 2 => Ok(channel),
+        Some((xcom_proto::MSG_AUTH_OK, p)) if p.len() >= 2 => {
+            // Blocking reads from here on: the bulk channel idles between
+            // frames and a socket timeout must not look like a dead peer.
+            channel.set_read_timeout(None)?;
+            channel.set_write_timeout(None)?;
+            channel.state.set_max_len(role_max_frame(role));
+            Ok(channel)
+        }
         Some((xcom_proto::MSG_AUTH_REJECTED, _)) => Err(TransportError::AuthRejected),
         _ => Err(TransportError::Proto("expected auth-ok".into())),
     }

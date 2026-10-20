@@ -46,9 +46,12 @@ struct ConnectArgs {
     /// Direct address of a running daemon (skips the ssh bootstrap).
     #[arg(long)]
     direct: Option<String>,
-    /// Session token, hex (with --direct).
+    /// Control-channel token, hex (with --direct; visible in `ps`).
     #[arg(long)]
-    token: Option<String>,
+    token_control: Option<String>,
+    /// Bulk-channel token, hex (with --direct; visible in `ps`).
+    #[arg(long)]
+    token_bulk: Option<String>,
     /// Certificate fingerprint, hex (with --direct).
     #[arg(long)]
     fingerprint: Option<String>,
@@ -85,7 +88,8 @@ struct ConnectArgs {
 
 struct Handshake {
     addr: String,
-    token: [u8; 32],
+    control_token: [u8; 32],
+    bulk_token: [u8; 32],
     fingerprint: String,
     ssh: Option<Child>,
 }
@@ -157,13 +161,18 @@ fn bootstrap_ssh(
             .context("reading handshake line")?;
         if line.starts_with('{') {
             let addr = json_field(&line, "connect").context("handshake line: connect")?;
-            let token = hex_decode(&json_field(&line, "token").context("handshake line: token")?)?;
+            let control = hex_decode(
+                &json_field(&line, "token_control").context("handshake line: token_control")?,
+            )?;
+            let bulk = hex_decode(
+                &json_field(&line, "token_bulk").context("handshake line: token_bulk")?,
+            )?;
             let fingerprint =
                 json_field(&line, "cert_sha256").context("handshake line: cert_sha256")?;
-            let token = token32(token)?;
             return Ok(Handshake {
                 addr,
-                token,
+                control_token: token32(control)?,
+                bulk_token: token32(bulk)?,
                 fingerprint,
                 ssh: Some(child),
             });
@@ -173,11 +182,16 @@ fn bootstrap_ssh(
     }
 }
 
-fn bootstrap_direct(addr: &str, token: &str, fingerprint: &str) -> Result<Handshake> {
-    let token = hex_decode(token)?;
+fn bootstrap_direct(
+    addr: &str,
+    control: &str,
+    bulk: &str,
+    fingerprint: &str,
+) -> Result<Handshake> {
     Ok(Handshake {
         addr: addr.to_string(),
-        token: token32(token)?,
+        control_token: token32(hex_decode(control)?)?,
+        bulk_token: token32(hex_decode(bulk)?)?,
         fingerprint: fingerprint.to_string(),
         ssh: None,
     })
@@ -191,13 +205,25 @@ fn main() -> Result<()> {
         (Some(target), _) => {
             bootstrap_ssh(target, args.ssh_args.as_deref(), args.exec.as_deref())?
         }
-        (None, Some(addr)) => bootstrap_direct(
-            addr,
-            args.token.as_deref().context("--direct needs --token")?,
-            args.fingerprint
-                .as_deref()
-                .context("--direct needs --fingerprint")?,
-        )?,
+        (None, Some(addr)) => {
+            if args.token_control.is_some() || args.token_bulk.is_some() {
+                eprintln!(
+                    "[xcom] warning: tokens on the command line are visible to local users (ps); use --ssh"
+                );
+            }
+            bootstrap_direct(
+                addr,
+                args.token_control
+                    .as_deref()
+                    .context("--direct needs --token-control")?,
+                args.token_bulk
+                    .as_deref()
+                    .context("--direct needs --token-bulk")?,
+                args.fingerprint
+                    .as_deref()
+                    .context("--direct needs --fingerprint")?,
+            )?
+        }
         (None, None) => bail!("either --ssh user@host or --direct addr is required"),
     };
     if let Some(override_addr) = &args.connect {
@@ -215,7 +241,7 @@ fn main() -> Result<()> {
         &handshake.addr,
         Role::Control,
         &handshake.fingerprint,
-        &handshake.token,
+        &handshake.control_token,
         timeout,
     )
     .context("control channel")?;
@@ -223,7 +249,7 @@ fn main() -> Result<()> {
         &handshake.addr,
         Role::Bulk,
         &handshake.fingerprint,
-        &handshake.token,
+        &handshake.bulk_token,
         timeout,
     )
     .context("bulk channel")?;

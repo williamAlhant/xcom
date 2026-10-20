@@ -10,7 +10,14 @@
 //! only compared within one process (the M0 harness captures and receives on
 //! the same side), which keeps the clock portable to Windows.
 
-pub const PROTO_VERSION: u16 = 1;
+pub const PROTO_VERSION: u16 = 2;
+
+/// Pre-authentication frames (the hello) are tiny; anything larger is hostile.
+pub const MAX_HELLO_LEN: usize = 64;
+/// Control messages are small (input, lifecycle, pings).
+pub const CONTROL_MAX_FRAME: usize = 64 * 1024;
+/// Bulk damage frames: a 4K full-window raw frame is ~33 MiB.
+pub const BULK_MAX_FRAME: usize = 64 * 1024 * 1024;
 
 pub const MSG_HELLO: u8 = 1;
 pub const MSG_DAMAGE: u8 = 2;
@@ -39,6 +46,28 @@ pub fn debug() -> bool {
     *ON.get_or_init(|| {
         std::env::var_os("XCOM_DEBUG").is_some_and(|v| v != "0" && !v.is_empty())
     })
+}
+
+/// `XCOM_DEBUG_KEYS=1` additionally traces keysyms. Kept separate from
+/// [`debug`] because that trace is a keylogger when pointed at a real session.
+pub fn debug_keys() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("XCOM_DEBUG_KEYS").is_some_and(|v| v != "0" && !v.is_empty())
+    })
+}
+
+/// `eprintln!` that cannot panic.
+///
+/// Rust ignores SIGPIPE, so writing to a closed stderr returns EPIPE and
+/// `eprintln!` panics — which killed the control thread *before* it could set
+/// the shutdown flag, leaking the daemon and its virtual display.
+#[macro_export]
+macro_rules! logln {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), $($arg)*);
+    }};
 }
 
 /// Monotonic nanoseconds since the first call in this process.
@@ -137,6 +166,12 @@ impl DamageFrame {
             let codec = take(1)?[0];
             let raw_len = u32::from_le_bytes(take(4)?.try_into().unwrap());
             let len = u32::from_le_bytes(take(4)?.try_into().unwrap()) as usize;
+            if w == 0 || h == 0 {
+                return Err(ProtoError::BadMessage("empty damage rect"));
+            }
+            if raw_len as u64 != w as u64 * h as u64 * 4 {
+                return Err(ProtoError::BadMessage("raw_len does not match rect"));
+            }
             let data = take(len)?.to_vec();
             rects.push(WireRect {
                 x,
@@ -147,6 +182,9 @@ impl DamageFrame {
                 raw_len,
                 data,
             });
+        }
+        if !p.is_empty() {
+            return Err(ProtoError::BadMessage("trailing bytes in damage frame"));
         }
         Ok(DamageFrame {
             window,
@@ -164,6 +202,7 @@ pub enum ProtoError {
     Truncated,
     Io(std::io::Error),
     EmptyFrame,
+    FrameTooLarge(usize),
     BadMessage(&'static str),
 }
 
@@ -173,6 +212,7 @@ impl std::fmt::Display for ProtoError {
             ProtoError::Truncated => write!(f, "truncated message"),
             ProtoError::Io(e) => write!(f, "io: {e}"),
             ProtoError::EmptyFrame => write!(f, "empty frame"),
+            ProtoError::FrameTooLarge(n) => write!(f, "frame too large: {n} bytes"),
             ProtoError::BadMessage(m) => write!(f, "bad message: {m}"),
         }
     }
@@ -364,7 +404,7 @@ impl Message {
 
     pub fn decode(msg_type: u8, payload: &[u8]) -> Result<Message, ProtoError> {
         let mut p = payload;
-        Ok(match msg_type {
+        let msg = match msg_type {
             MSG_WINDOW_CREATE => Message::WindowCreate {
                 id: take_u32(&mut p)?,
                 x: take_i16(&mut p)?,
@@ -412,7 +452,11 @@ impl Message {
             MSG_PONG => Message::Pong { t: take_u64(&mut p)? },
             MSG_BYE => Message::Bye,
             _ => return Err(ProtoError::BadMessage("unknown message type")),
-        })
+        };
+        if !p.is_empty() {
+            return Err(ProtoError::BadMessage("trailing bytes in message"));
+        }
+        Ok(msg)
     }
 
     /// Send on the channel and receive the decoded reply counterpart.
@@ -434,7 +478,9 @@ pub fn write_frame<W: std::io::Write>(
     payload: &[u8],
 ) -> Result<(), ProtoError> {
     let mut hdr = [0u8; 5];
-    hdr[..4].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+    let len = u32::try_from(payload.len())
+        .map_err(|_| ProtoError::BadMessage("payload exceeds u32 length prefix"))?;
+    hdr[..4].copy_from_slice(&len.to_le_bytes());
     hdr[4] = msg_type;
     w.write_all(&hdr)?;
     w.write_all(payload)?;
@@ -446,12 +492,38 @@ pub fn write_frame<W: std::io::Write>(
 /// Partial frames survive `WouldBlock`/`TimedOut`, which makes it safe to use
 /// on sockets with read timeouts — the control channel polls with a short
 /// timeout so it can interleave outbound writes.
-#[derive(Default)]
+///
+/// The payload length is accepted only up to `max_len`; the limit starts tiny
+/// (pre-auth) and is raised to the role's real bound only after the handshake,
+/// so an unauthenticated peer can never make us allocate a large buffer.
 pub struct FrameState {
     hdr: [u8; 5],
     hdr_have: usize,
     payload: Vec<u8>,
     payload_have: usize,
+    max_len: usize,
+}
+
+impl Default for FrameState {
+    fn default() -> Self {
+        Self::with_max_len(BULK_MAX_FRAME)
+    }
+}
+
+impl FrameState {
+    pub fn with_max_len(max_len: usize) -> Self {
+        Self {
+            hdr: [0; 5],
+            hdr_have: 0,
+            payload: Vec::new(),
+            payload_have: 0,
+            max_len,
+        }
+    }
+
+    pub fn set_max_len(&mut self, max_len: usize) {
+        self.max_len = max_len;
+    }
 }
 
 impl FrameState {
@@ -473,8 +545,8 @@ impl FrameState {
         }
         if self.payload.is_empty() && self.payload_have == 0 {
             let len = u32::from_le_bytes(self.hdr[..4].try_into().unwrap()) as usize;
-            if len > 512 << 20 {
-                return Err(ProtoError::Truncated);
+            if len > self.max_len {
+                return Err(ProtoError::FrameTooLarge(len));
             }
             self.payload.resize(len, 0);
         }
