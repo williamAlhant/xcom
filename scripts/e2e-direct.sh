@@ -12,6 +12,7 @@ REPO=$(cd "$(dirname "$0")/.." && pwd)
 XCOMD=${XCOMD:-$REPO/target/release/xcomd}
 XCOM=${XCOM:-$REPO/target/release/xcom}
 SECS=${1:-3}
+SIZE=${SIZE:-800x600}
 OUT=/tmp/opencode/e2e/$$
 mkdir -p "$OUT"   # per-run: parallel runs must not share handshake files
 
@@ -21,8 +22,8 @@ if [ -z "${XCOM_XVFB:-}" ]; then
 fi
 export XCOM_XVFB
 
-"$XCOMD" serve --json --spawn 800x600 --listen 127.0.0.1:0 \
-    --exec "$XCOMD m0 anim --mode box --fps 60 --seconds $((SECS + 8))" \
+"$XCOMD" serve --json --spawn "$SIZE" --listen 127.0.0.1:0 \
+    --exec "$XCOMD m0 anim --mode box --fps 60 --size $SIZE --seconds $((SECS + 8))" \
     > "$OUT/handshake.json" 2> "$OUT/serve.log" &
 SERVE_PID=$!
 trap 'kill "$SERVE_PID" 2>/dev/null || true' EXIT
@@ -53,6 +54,12 @@ echo "--- server ---"
 grep -vE '^\[serve\] (waiting|client)' "$OUT/serve.log" | tail -8
 
 PASS=1
+# A dropped capture (BadMatch) means a frame was lost: treat as failure.
+if grep -q 'shm_get_image failed' "$OUT/serve.log"; then
+    echo "capture error in server log:"
+    grep 'shm_get_image failed' "$OUT/serve.log"
+    PASS=0
+fi
 grep -qE '[1-9][0-9]* frames blitted' "$OUT/client.log" || PASS=0
 grep -q 'window .* opened' "$OUT/client.log" || PASS=0
 python3 "$REPO/scripts/check-ppm.py" "$OUT/frame.ppm" box || PASS=0

@@ -173,10 +173,26 @@ fn anim(args: AnimArgs) -> Result<()> {
     let mut quit = false;
     let mut px: i16 = 0;
     let mut py: i16 = 0;
+    let mut redraw = true;
     let box_w = 120u16;
     let box_h = 120u16;
+    let mut size = (w, h);
 
     while !quit {
+        if redraw {
+            // Like a real app: repaint everything on expose/resize.
+            conn.poly_fill_rectangle(
+                win,
+                gc_bg,
+                &[Rectangle {
+                    x: 0,
+                    y: 0,
+                    width: size.0,
+                    height: size.1,
+                }],
+            )?;
+            redraw = false;
+        }
         match args.mode {
             AnimMode::Box => {
                 conn.poly_fill_rectangle(
@@ -189,8 +205,9 @@ fn anim(args: AnimArgs) -> Result<()> {
                         height: box_h,
                     }],
                 )?;
-                px = ((frame as i16 * 13) % (w - box_w) as i16).abs();
-                py = ((frame as i16 * 7) % (h - box_h) as i16).abs();
+                let (w, h) = size;
+                px = ((frame as i16 * 13).rem_euclid(w.saturating_sub(box_w).max(1) as i16)).abs();
+                py = ((frame as i16 * 7).rem_euclid(h.saturating_sub(box_h).max(1) as i16)).abs();
                 conn.poly_fill_rectangle(
                     win,
                     gc_fg,
@@ -203,6 +220,7 @@ fn anim(args: AnimArgs) -> Result<()> {
                 )?;
             }
             AnimMode::Full => {
+                let (w, h) = size;
                 let mut buf = vec![0u8; w as usize * h as usize * 4];
                 let t = (frame * 5 % 256) as u8;
                 for y in 0..h as usize {
@@ -226,13 +244,13 @@ fn anim(args: AnimArgs) -> Result<()> {
         // should this measurement be.
         while Instant::now() < next {
             while let Some(ev) = conn.poll_for_event()? {
-                handle_anim_event(ev, &keymap, &mut log, &mut quit, win)?;
+                handle_anim_event(ev, &keymap, &mut log, &mut quit, win, &mut size, &mut redraw)?;
             }
             std::thread::sleep(Duration::from_micros(200));
         }
 
         while let Some(ev) = conn.poll_for_event()? {
-            handle_anim_event(ev, &keymap, &mut log, &mut quit, win)?;
+            handle_anim_event(ev, &keymap, &mut log, &mut quit, win, &mut size, &mut redraw)?;
         }
 
         if let Some(d) = deadline {
@@ -250,6 +268,8 @@ fn handle_anim_event(
     log: &mut Option<std::fs::File>,
     quit: &mut bool,
     win: Window,
+    size: &mut (u16, u16),
+    redraw: &mut bool,
 ) -> Result<()> {
     match ev {
         Event::KeyPress(e) => {
@@ -271,8 +291,12 @@ fn handle_anim_event(
         Event::ConfigureNotify(e) => {
             if e.window == win {
                 println!("RESIZED {}x{}", e.width, e.height);
+                size.0 = e.width;
+                size.1 = e.height;
+                *redraw = true;
             }
         }
+        Event::Expose(_) => *redraw = true,
         _ => {}
     }
     Ok(())

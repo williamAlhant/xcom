@@ -170,7 +170,8 @@ impl CaptureSession {
             &xproto::ChangeWindowAttributesAux::new().event_mask(EventMask::SUBSTRUCTURE_NOTIFY),
         )?;
 
-        let shm = attach_shm(&conn, 4 << 20)?;
+        // One full-screen 1080p window needs ~8 MB; growth is handled per rect.
+        let shm = attach_shm(&conn, 8 << 20)?;
         conn.flush()?;
 
         Ok(CaptureSession {
@@ -481,6 +482,10 @@ impl CaptureSession {
             while idx < rects.len() {
                 let r = rects[idx];
                 let need = (r.area() * 4) as u32;
+                if need as usize > self.shm.len {
+                    // Disjoint field borrows: `state` and `self.conn` are fine.
+                    self.shm = attach_shm(&self.conn, need as usize)?;
+                }
                 if !batch.is_empty() && offset + need > self.shm.len as u32 {
                     break;
                 }
@@ -489,6 +494,9 @@ impl CaptureSession {
                 idx += 1;
             }
 
+            // ShmGetImage fails with BadMatch when the image does not fit the
+            // segment, and the first rect of a batch was never checked: grow
+            // instead of dropping a frame (big/just-resized windows).
             let mut cookies = Vec::with_capacity(batch.len());
             for (r, off) in &batch {
                 let cookie = self.conn.shm_get_image(
@@ -508,7 +516,10 @@ impl CaptureSession {
             for (r, off, cookie) in cookies {
                 if let Err(e) = cookie.reply() {
                     // The window may have gone away mid-frame; skip the rect.
-                    eprintln!("capture: shm_get_image failed: {e}");
+                    eprintln!(
+                        "capture: shm_get_image failed for {win:#x} rect {}x{}+{}+{} offset={off} segment={} bytes: {e}",
+                        r.w, r.h, r.x, r.y, self.shm.len
+                    );
                     continue;
                 }
                 capture_ns = now_ns();
@@ -563,7 +574,8 @@ fn attach_shm(conn: &RustConnection, len: usize) -> Result<Shm> {
         libc::shmctl(shmid, libc::IPC_RMID, std::ptr::null_mut());
 
         let seg: shm::Seg = conn.generate_id()?;
-        conn.shm_attach(seg, shmid as u32, false)?;
+        // A failed attach would silently break all capture.
+        conn.shm_attach(seg, shmid as u32, false)?.check()?;
         Ok(Shm {
             seg,
             map: addr as *mut u8,
