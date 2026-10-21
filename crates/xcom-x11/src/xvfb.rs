@@ -26,11 +26,30 @@ pub struct Xvfb {
     pub log: PathBuf,
     auth: PathBuf,
     child: Child,
+    /// Keep the `-displayfd` pipe open: Xvfb writes again when it retries a
+    /// display, and a closed read end sends SIGPIPE (killing the server right
+    /// after it looked ready).
+    _displayfd: std::fs::File,
 }
 
 impl Xvfb {
     /// Spawn on a free display number chosen by the X server itself.
     pub fn spawn(width: u16, height: u16) -> Result<Xvfb> {
+        // SIGKILLed servers leave their unix socket behind; a dying server can
+        // still answer for a moment while the next Xvfb picks the same number
+        // and fails to bind. Clean up and retry on a fresh display.
+        let mut last = None;
+        for _ in 0..3 {
+            remove_stale_sockets();
+            match Self::spawn_once(width, height) {
+                Ok(server) => return Ok(server),
+                Err(e) => last = Some(e),
+            }
+        }
+        Err(last.unwrap_or_else(|| anyhow!("could not spawn a virtual display")))
+    }
+
+    fn spawn_once(width: u16, height: u16) -> Result<Xvfb> {
         let binary = std::env::var("XCOM_XVFB").unwrap_or_else(|_| "Xvfb".into());
         let log = std::env::temp_dir().join(format!("xcom-xvfb-{}.log", std::process::id()));
         let log_file =
@@ -76,6 +95,9 @@ impl Xvfb {
                 Ok(())
             });
         }
+        // Timestamp before the child exists: anything older than this belongs
+        // to a previous server. (50 ms covers filesystem timestamp rounding.)
+        let spawned_after = std::time::SystemTime::now() - Duration::from_millis(50);
         let mut child = cmd.spawn().with_context(|| {
             format!("spawning {binary} (install xorg-server-xvfb or set XCOM_XVFB)")
         })?;
@@ -89,25 +111,38 @@ impl Xvfb {
         if flags >= 0 {
             unsafe { libc::fcntl(read_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
         }
-        let mut file = unsafe { std::fs::File::from_raw_fd(read_fd) };
-        let num = read_display_number(&mut child, &mut file, &binary, &log)?;
+        let file = unsafe { std::fs::File::from_raw_fd(read_fd) };
+        let (num, displayfd) = read_display_number(file, &mut child, &binary, &log)?;
 
         let display = format!(":{num}");
         // Xvfb, the app and our own connection all use the cookie file.
         std::env::set_var("XAUTHORITY", &auth);
-        // Wait until it actually accepts connections.
+        // Wait until it actually accepts connections. A socket that predates
+        // the spawn belongs to another (possibly dying) server: a connect can
+        // succeed against it, so ownership is checked by the socket's mtime.
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
+            if let Ok(Some(status)) = child.try_wait() {
+                bail!(
+                    "{binary} exited with {status} during startup; log: {}",
+                    log.display()
+                );
+            }
             if x11rb::connect(Some(display.as_str())).is_ok() {
-                return Ok(Xvfb {
-                    display,
-                    log,
-                    auth,
-                    child,
-                });
+                if socket_is_fresh(&display, spawned_after) {
+                    return Ok(Xvfb {
+                        display,
+                        log,
+                        auth,
+                        child,
+                        _displayfd: displayfd,
+                    });
+                }
+                terminate(&mut child);
+                bail!("display {display} is served by another process (stale socket)");
             }
             if Instant::now() > deadline {
-                let _ = child.kill();
+                terminate(&mut child);
                 bail!("{binary} did not come up on {display}; log: {}", log.display());
             }
             std::thread::sleep(Duration::from_millis(50));
@@ -121,18 +156,88 @@ impl Xvfb {
 
 impl Drop for Xvfb {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        terminate(&mut self.child);
         let _ = std::fs::remove_file(&self.auth);
     }
 }
 
+/// Ask nicely first: Xvfb removes its lock file and unix socket on SIGTERM.
+/// SIGKILL (the old behaviour) left both behind and poisoned later displays.
+fn terminate(child: &mut Child) {
+    unsafe {
+        libc::kill(child.id() as i32, libc::SIGTERM);
+    }
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Err(_) => break,
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// True when the display's unix socket was created after `after`.
+///
+/// Xvfb selects a display by its lock file, not by the socket path, so a
+/// leftover socket can make it pick a number it cannot bind. A connect may
+/// still succeed against the old server for a moment; the socket mtime tells
+/// us whether the server we reached is the child we just started.
+fn socket_is_fresh(display: &str, after: std::time::SystemTime) -> bool {
+    let path = format!(
+        "/tmp/.X11-unix/X{}",
+        display.trim_start_matches(':')
+    );
+    match std::fs::metadata(&path).and_then(|m| m.modified()) {
+        Ok(mtime) => mtime >= after,
+        // No socket path visible: trust the successful connect.
+        Err(_) => true,
+    }
+}
+
+/// Remove unix sockets for displays that have no lock file and no listener.
+///
+/// Only sockets owned by this user are considered. A live server always has a
+/// lock file; a missing lock plus a refused connection is a crash leftover.
+fn remove_stale_sockets() {
+    use std::os::unix::fs::MetadataExt;
+
+    let dir = std::path::Path::new("/tmp/.X11-unix");
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let uid = unsafe { libc::getuid() };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(num) = name.to_str().and_then(|s| s.strip_prefix('X')) else {
+            continue;
+        };
+        if num.is_empty() || !num.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if meta.uid() != uid {
+            continue;
+        }
+        if std::path::Path::new(&format!("/tmp/.X{num}-lock")).exists() {
+            continue;
+        }
+        if x11rb::connect(Some(&format!(":{num}"))).is_err() {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 fn read_display_number(
+    mut file: std::fs::File,
     child: &mut Child,
-    file: &mut std::fs::File,
     binary: &str,
     log: &Path,
-) -> Result<String> {
+) -> Result<(String, std::fs::File)> {
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut buf = Vec::new();
     let mut tmp = [0u8; 64];
@@ -144,7 +249,7 @@ fn read_display_number(
             );
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
+            terminate(child);
             bail!(
                 "{binary} did not report a display number; log: {}",
                 log.display()
@@ -160,7 +265,7 @@ fn read_display_number(
                         .filter(|b| b.is_ascii_digit())
                         .map(|b| *b as char)
                         .collect();
-                    return Ok(num);
+                    return Ok((num, file));
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -168,7 +273,7 @@ fn read_display_number(
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(e) => {
-                let _ = child.kill();
+                terminate(child);
                 return Err(anyhow!("reading {binary} display pipe failed: {e}"));
             }
         }

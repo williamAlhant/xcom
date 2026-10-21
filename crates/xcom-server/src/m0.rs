@@ -657,7 +657,21 @@ fn selftest(args: SelftestArgs) -> Result<()> {
     } else {
         args.display.clone()
     };
-    let (conn, screen_num) = x11rb::connect(Some(display.as_str()))?;
+    let (conn, screen_num) = {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match x11rb::connect(Some(display.as_str())) {
+                Ok(c) => break c,
+                Err(e) if Instant::now() < deadline => {
+                    if xcom_proto::debug() {
+                        eprintln!("[selftest] retrying connect to {display}: {e}");
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(e) => return Err(e).with_context(|| format!("connecting to {display}")),
+            }
+        }
+    };
     let root = conn.setup().roots[screen_num].root;
 
     let win: Window = conn.generate_id()?;
@@ -798,8 +812,31 @@ fn selftest(args: SelftestArgs) -> Result<()> {
         .capture_full(win)?
         .context("capture_full after remap")?;
 
+    // Modifier ownership: with Shift held by the user, typing "A" must not
+    // release Shift (the old injector did, so every capital letter flipped the
+    // remote modifier state).
+    let keymap = Keymap::query(&*draw_conn)?;
+    let shift = keymap
+        .resolve(xcom_x11::keymap::XK_SHIFT_L)
+        .context("remote keymap has no Shift_L")?;
+    let injector = Injector::new(&*draw_conn, win, keymap);
+    let shift_down = |conn: &x11rb::rust_connection::RustConnection| -> Result<bool> {
+        let reply = conn.query_keymap()?.reply()?;
+        Ok(reply.keys[shift.keycode as usize / 8] & (1 << (shift.keycode % 8)) != 0)
+    };
+    injector.key(xcom_x11::keymap::XK_SHIFT_L, true)?;
+    injector.key(0x41, true)?; // 'A' needs Shift
+    injector.key(0x41, false)?;
+    if !shift_down(&draw_conn)? {
+        bail!("selftest: typing 'A' released the user's held Shift");
+    }
+    injector.key(xcom_x11::keymap::XK_SHIFT_L, false)?;
+    if shift_down(&draw_conn)? {
+        bail!("selftest: Shift stayed down after its own release");
+    }
+
     println!(
-        "SELFTEST PASS: small draw+erase captured correctly ({}x{}), incremental == full, unmap/remap kept the window",
+        "SELFTEST PASS: draw+erase correct ({}x{}), incremental == full, unmap/remap kept the window, held modifiers preserved",
         w, h
     );
     Ok(())

@@ -131,34 +131,54 @@ pub fn keysym_for(key: &Key) -> Option<u32> {
     }
 }
 
+/// Keysym for the text the OS produced.
+///
+/// This is the most reliable signal for *characters*: Wine can mis-detect the
+/// keyboard layout and report nonsense named keys (q → MediaTrackPrevious,
+/// w → F17) while the text is correct. Control codes from Ctrl+letter are
+/// mapped back to the letter, because the physical Ctrl is already held on the
+/// remote. Ambiguous C0 codes (Tab, Enter, Backspace, Escape, …) return None so
+/// the named-key mapping handles them.
+pub fn text_keysym(text: Option<&str>) -> Option<u32> {
+    let mut chars = text?.chars();
+    let c = chars.next()?;
+    if chars.next().is_some() {
+        return None; // multi-char IME/compose commits have no single keysym
+    }
+    let cp = c as u32;
+    match cp {
+        0x01..=0x1a if !matches!(cp, 0x08 | 0x09 | 0x0a | 0x0d) => Some('a' as u32 + cp - 1),
+        0x20..=0x7e | 0xa0..=0xff => Some(cp),
+        0x100..=0x10ffff => Some(0x0100_0000 + cp),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use winit::keyboard::{Key, KeyCode, NamedKey};
 
-/// Numpad keys are only exposed as physical codes in winit 0.30.
-pub fn keysym_for_physical(code: KeyCode) -> Option<u32> {
-    Some(match code {
-        KeyCode::Numpad0 => XK_KP_0,
-        KeyCode::Numpad1 => XK_KP_0 + 1,
-        KeyCode::Numpad2 => XK_KP_0 + 2,
-        KeyCode::Numpad3 => XK_KP_0 + 3,
-        KeyCode::Numpad4 => XK_KP_0 + 4,
-        KeyCode::Numpad5 => XK_KP_0 + 5,
-        KeyCode::Numpad6 => XK_KP_0 + 6,
-        KeyCode::Numpad7 => XK_KP_0 + 7,
-        KeyCode::Numpad8 => XK_KP_0 + 8,
-        KeyCode::Numpad9 => XK_KP_0 + 9,
-        KeyCode::NumpadAdd => XK_KP_ADD,
-        KeyCode::NumpadSubtract => XK_KP_SUBTRACT,
-        KeyCode::NumpadMultiply => XK_KP_MULTIPLY,
-        KeyCode::NumpadDivide => XK_KP_DIVIDE,
-        KeyCode::NumpadDecimal => XK_KP_DECIMAL,
-        KeyCode::NumpadEnter => XK_KP_ENTER,
-        KeyCode::NumpadEqual => XK_KP_EQUAL,
-        _ => return None,
-    })
-}
+    #[test]
+    fn text_preferred_over_named_key() {
+        // Wine's mis-detected session: named key is garbage, text is right.
+        assert_eq!(text_keysym(Some("q")), Some(0x71));
+        assert_eq!(text_keysym(Some("1")), Some(0x31));
+        assert_eq!(text_keysym(Some(" ")), Some(0x20));
+        assert_eq!(text_keysym(Some("é")), Some(0xe9));
+        assert_eq!(text_keysym(Some("λ")), Some(0x0100_0000 + 0x3bb));
+        // Ctrl+letter control codes become the letter (Ctrl is held remotely).
+        assert_eq!(text_keysym(Some("\u{3}")), Some(0x63)); // Ctrl+C
+        // Ambiguous control codes are left to the named-key mapping.
+        assert_eq!(text_keysym(Some("\u{1b}")), None);
+        assert_eq!(text_keysym(Some("\t")), None);
+        assert_eq!(text_keysym(Some("\r")), None);
+        assert_eq!(text_keysym(Some("\u{8}")), None);
+        // Multi-char / DEL are not a single keysym.
+        assert_eq!(text_keysym(Some("ab")), None);
+        assert_eq!(text_keysym(Some("\u{7f}")), None);
+        assert_eq!(text_keysym(None), None);
+    }
 
     #[test]
     fn character_keys() {

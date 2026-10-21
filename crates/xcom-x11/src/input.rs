@@ -4,7 +4,8 @@
 //! behave exactly like real hardware input: grabs, focus and toolkit event
 //! handling all work unchanged.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{anyhow, bail, Result};
 use x11rb::connection::Connection;
@@ -28,6 +29,13 @@ pub struct Injector<'c, C: Connection> {
     scratch: Option<u8>,
     /// (keysym, keycode) currently installed on the scratch keycode.
     scratch_active: Cell<Option<(u32, u8)>>,
+    /// Keycodes currently down, whoever pressed them (the user's modifier
+    /// keys, synthesized modifiers, normal keys). Needed so a binding never
+    /// releases a modifier the user is still holding.
+    down_keys: RefCell<HashSet<u8>>,
+    /// Per-keysym modifiers this injector pressed for that key; released on
+    /// key-up only if it pressed them.
+    synth_mods: RefCell<HashMap<u32, u16>>,
 }
 
 impl<'c, C: Connection> Injector<'c, C> {
@@ -46,6 +54,8 @@ impl<'c, C: Connection> Injector<'c, C> {
             keymap,
             scratch,
             scratch_active: Cell::new(None),
+            down_keys: RefCell::new(HashSet::new()),
+            synth_mods: RefCell::new(HashMap::new()),
         }
     }
 
@@ -73,14 +83,29 @@ impl<'c, C: Connection> Injector<'c, C> {
         self.keymap.resolve(sym).map(|b| Keycode::from(b.keycode))
     }
 
-    fn set_modifier(&self, mask: u16, press: bool) -> Result<()> {
-        if let Some(kc) = self.modifier_keycode(mask) {
-            let t = if press {
-                FAKE_KEY_PRESS
-            } else {
-                FAKE_KEY_RELEASE
-            };
-            self.fake(t, kc, 0, 0)?;
+    /// Press a modifier if it is not already down.
+    ///
+    /// Returns true when this call actually pressed it (and therefore owns
+    /// the matching release). A user holding Shift and typing `A` must not
+    /// have Shift released when `A` goes up.
+    fn press_modifier(&self, mask: u16) -> Result<bool> {
+        let Some(kc) = self.modifier_keycode(mask) else {
+            return Ok(false);
+        };
+        if self.down_keys.borrow().contains(&kc) {
+            return Ok(false);
+        }
+        self.fake(FAKE_KEY_PRESS, kc, 0, 0)?;
+        self.down_keys.borrow_mut().insert(kc);
+        Ok(true)
+    }
+
+    fn release_modifier(&self, mask: u16) -> Result<()> {
+        let Some(kc) = self.modifier_keycode(mask) else {
+            return Ok(());
+        };
+        if self.down_keys.borrow_mut().remove(&kc) {
+            self.fake(FAKE_KEY_RELEASE, kc, 0, 0)?;
         }
         Ok(())
     }
@@ -96,6 +121,7 @@ impl<'c, C: Connection> Injector<'c, C> {
             if let Some((active, kc)) = self.scratch_active.get() {
                 if active == sym {
                     self.fake(FAKE_KEY_RELEASE, kc, 0, 0)?;
+                    self.down_keys.borrow_mut().remove(&kc);
                     self.set_scratch(kc, None)?;
                     self.scratch_active.set(None);
                     return Ok(());
@@ -104,13 +130,14 @@ impl<'c, C: Connection> Injector<'c, C> {
         }
 
         if let Some(binding) = self.keymap.resolve(sym) {
-            return self.key_binding(binding, press);
+            return self.key_binding(sym, binding, press);
         }
 
         if press {
             if let Some(kc) = self.scratch {
                 self.set_scratch(kc, Some(sym))?;
                 self.fake(FAKE_KEY_PRESS, kc, 0, 0)?;
+                self.down_keys.borrow_mut().insert(kc);
                 self.scratch_active.set(Some((sym, kc)));
                 return Ok(());
             }
@@ -118,28 +145,33 @@ impl<'c, C: Connection> Injector<'c, C> {
         bail!("keysym {sym:#x} not in the remote keymap and no free keycode to type it")
     }
 
-    fn key_binding(&self, binding: Binding, press: bool) -> Result<()> {
+    fn key_binding(&self, sym: u32, binding: Binding, press: bool) -> Result<()> {
         let Binding { keycode, mods } = binding;
 
         // Press modifiers in a stable order, release in reverse.
         const ORDER: [u16; 3] = [MASK_SHIFT, MASK_CONTROL, MASK_MOD1];
         if press {
+            let mut synthesized = 0u16;
             for m in ORDER {
-                if mods & m != 0 {
-                    self.set_modifier(m, true)?;
+                if mods & m != 0 && self.press_modifier(m)? {
+                    synthesized |= m;
                 }
             }
-        }
-        let t = if press {
-            FAKE_KEY_PRESS
+            self.fake(FAKE_KEY_PRESS, keycode, 0, 0)?;
+            self.down_keys.borrow_mut().insert(keycode);
+            // Auto-repeat sends another press; keep the modifiers recorded by
+            // the original press so the eventual release still frees them.
+            self.synth_mods
+                .borrow_mut()
+                .entry(sym)
+                .or_insert(synthesized);
         } else {
-            FAKE_KEY_RELEASE
-        };
-        self.fake(t, keycode, 0, 0)?;
-        if !press {
+            self.fake(FAKE_KEY_RELEASE, keycode, 0, 0)?;
+            self.down_keys.borrow_mut().remove(&keycode);
+            let synthesized = self.synth_mods.borrow_mut().remove(&sym).unwrap_or(0);
             for m in ORDER.iter().rev() {
-                if mods & m != 0 {
-                    self.set_modifier(*m, false)?;
+                if synthesized & m != 0 {
+                    self.release_modifier(*m)?;
                 }
             }
         }

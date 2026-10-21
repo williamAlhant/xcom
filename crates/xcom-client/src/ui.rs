@@ -724,12 +724,12 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     return;
                 }
-                let sym = keysym_for(&event.logical_key).or_else(|| {
-                    match event.physical_key {
+                let sym = crate::keys::text_keysym(event.text.as_deref())
+                    .or_else(|| keysym_for(&event.logical_key))
+                    .or_else(|| match event.physical_key {
                         winit::keyboard::PhysicalKey::Code(code) => keysym_for_physical(code),
                         _ => None,
-                    }
-                });
+                    });
                 if xcom_proto::debug_keys() {
                     eprintln!(
                         "[ui] key {:?} -> sym={} pressed={} text={:?}",
