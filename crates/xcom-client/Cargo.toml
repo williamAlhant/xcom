@@ -10,6 +10,7 @@ name = "xcom"
 path = "src/main.rs"
 
 [dependencies]
+arboard = { version = "3", default-features = false }
 anyhow = { workspace = true }
 clap = { workspace = true }
 raw-window-handle = "0.6"

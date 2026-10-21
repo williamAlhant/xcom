@@ -75,6 +75,8 @@ pub enum UserEvent {
     Dump,
     /// Test aid: close one attached window (per-window close semantics).
     CloseOne,
+    /// Text read from the remote selection (server reply).
+    ClipboardData { text: String },
 }
 
 type Target = softbuffer::Surface<Arc<Window>, Arc<Window>>;
@@ -198,6 +200,8 @@ pub struct App {
     /// Needed for Ctrl/Alt shortcuts under Wine, where winit reports a bogus
     /// named key and no text while a modifier is held.
     plain_chars: HashMap<winit::keyboard::PhysicalKey, u32>,
+    /// Local (client) clipboard. None when the platform has no text clipboard.
+    clipboard: Option<arboard::Clipboard>,
     dump: Option<PathBuf>,
     dump_seq: u32,
     fullscreen: bool,
@@ -230,6 +234,13 @@ impl App {
         fullscreen: bool,
         debug_tools: bool,
     ) -> App {
+        let clipboard = match arboard::Clipboard::new() {
+            Ok(c) => Some(c),
+            Err(e) => {
+                eprintln!("[ui] clipboard unavailable: {e}");
+                None
+            }
+        };
         App {
             input_tx,
             pixels: HashMap::new(),
@@ -242,6 +253,7 @@ impl App {
             ever_had_windows: false,
             held: HashMap::new(),
             plain_chars: HashMap::new(),
+            clipboard,
             dump,
             dump_seq: 0,
             fullscreen,
@@ -701,6 +713,18 @@ impl ApplicationHandler<UserEvent> for App {
                 self.send(Message::Bye);
                 el.exit();
             }
+            UserEvent::ClipboardData { text } => {
+                if text.is_empty() {
+                    eprintln!("[ui] clipboard: remote selection is empty");
+                } else if let Some(cb) = self.clipboard.as_mut() {
+                    match cb.set_text(text.clone()) {
+                        Ok(()) => {
+                            eprintln!("[ui] clipboard: copied {} bytes locally", text.len())
+                        }
+                        Err(e) => eprintln!("[ui] clipboard write failed: {e}"),
+                    }
+                }
+            }
             UserEvent::Dump => self.dump("mid."),
             UserEvent::CloseOne => {
                 if let Some((&id, _)) = self.attached.iter().next() {
@@ -891,9 +915,44 @@ impl ApplicationHandler<UserEvent> for App {
                         .values()
                         .any(|s| syms.contains(s))
                 };
-                let ctrl_alt =
-                    held_any(CTRL) || held_any(ALT) || held_any(SUPER);
+                let ctrl = held_any(CTRL);
                 let shift = held_any(SHIFT);
+                let alt_super = held_any(ALT) || held_any(SUPER);
+                let ctrl_alt = ctrl || alt_super;
+
+                // Local clipboard shortcuts (not forwarded): copy the remote
+                // selection locally, or push the local clipboard remotely.
+                if ctrl && shift && !alt_super {
+                    match event.physical_key {
+                        winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyC) => {
+                            eprintln!("[ui] clipboard: requesting the remote selection");
+                            self.send(Message::ClipboardGet {
+                                target: xcom_proto::CLIPBOARD_CLIPBOARD,
+                            });
+                            return;
+                        }
+                        winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyV) => {
+                            match self.clipboard.as_mut().map(|cb| cb.get_text()) {
+                                Some(Ok(text)) if !text.is_empty() => {
+                                    let text = xcom_proto::truncate_clipboard(text);
+                                    eprintln!(
+                                        "[ui] clipboard: pushing {} bytes to the remote",
+                                        text.len()
+                                    );
+                                    self.send(Message::ClipboardSet {
+                                        target: xcom_proto::CLIPBOARD_CLIPBOARD,
+                                        text,
+                                    });
+                                }
+                                Some(Ok(_)) => eprintln!("[ui] clipboard: local clipboard is empty"),
+                                Some(Err(e)) => eprintln!("[ui] clipboard read failed: {e}"),
+                                None => eprintln!("[ui] clipboard: no local clipboard"),
+                            }
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
 
                 let text_sym = crate::keys::text_keysym(event.text.as_deref());
                 // Learn the layout's plain character. ASCII only and with no

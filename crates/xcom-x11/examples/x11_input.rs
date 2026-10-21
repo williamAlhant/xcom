@@ -63,7 +63,9 @@ fn main() -> Result<()> {
                     .event_mask(
                         EventMask::BUTTON_PRESS
                             | EventMask::BUTTON_RELEASE
-                            | EventMask::POINTER_MOTION,
+                            | EventMask::POINTER_MOTION
+                            | EventMask::KEY_PRESS
+                            | EventMask::KEY_RELEASE,
                     ),
             )?;
             conn.map_window(win)?;
@@ -85,11 +87,50 @@ fn main() -> Result<()> {
                         x11rb::protocol::Event::MotionNotify(e) => {
                             println!("Motion {}x{}", e.event_x, e.event_y)
                         }
+                        x11rb::protocol::Event::KeyPress(e) => {
+                            println!("KeyPress detail={}", e.detail)
+                        }
+                        x11rb::protocol::Event::KeyRelease(e) => {
+                            println!("KeyRelease detail={}", e.detail)
+                        }
                         _ => {}
                     }
                 }
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
+        }
+        "clipboard-get" => {
+            let target = if args.next().as_deref() == Some("primary") {
+                xcom_x11::clipboard::Target::Primary
+            } else {
+                xcom_x11::clipboard::Target::Clipboard
+            };
+            let display = std::env::var("DISPLAY").unwrap_or_else(|_| ":0".into());
+            let cb = xcom_x11::clipboard::Clipboard::spawn(&display)?;
+            match cb.get(target, std::time::Duration::from_secs(2)) {
+                Some(text) => println!("{text}"),
+                None => bail!("selection is empty"),
+            }
+        }
+        "clipboard-set" => {
+            let text = args.next().context("clipboard-set needs text")?;
+            // Keep owning the selection for a while: the worker dies (and the
+            // selection is lost) when the process exits.
+            let hold: u64 = args
+                .next()
+                .map(|s| s.parse())
+                .transpose()?
+                .unwrap_or(0);
+            let display = std::env::var("DISPLAY").unwrap_or_else(|_| ":0".into());
+            let cb = xcom_x11::clipboard::Clipboard::spawn(&display)?;
+            cb.set(xcom_x11::clipboard::Target::Clipboard, text)?;
+            if hold > 0 {
+                std::thread::sleep(std::time::Duration::from_secs(hold));
+            }
+        }
+        "focus-get" => {
+            let r = conn.get_input_focus()?.reply()?;
+            println!("focus={:#x} revert={:?}", r.focus, r.revert_to);
         }
         "pointer" => {
             let r = conn.query_pointer(root)?.reply()?;
@@ -143,7 +184,8 @@ fn main() -> Result<()> {
             let needle = args.next().context("focus needs a title substring")?;
             let win = find_window(&conn, root, &needle)?.context("no window matched")?;
             // No window manager under Xvfb: focus has to be set explicitly.
-            conn.set_input_focus(InputFocus::PARENT, win, Timestamp::from(0u32))?;
+            conn.set_input_focus(InputFocus::PARENT, win, Timestamp::from(0u32))?
+                .check()?;
             conn.flush()?;
             println!("focused {win:#x}");
         }

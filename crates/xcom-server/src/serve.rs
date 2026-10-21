@@ -21,6 +21,7 @@ use x11rb::protocol::xproto::{self, ConnectionExt as _, Window};
 use xcom_proto::{logln, Message, MSG_DAMAGE};
 use xcom_transport::{random_token, Channel, ChannelAcceptor, Identity, Role};
 use xcom_x11::capture::{CaptureConfig, CaptureSession, PumpEvent};
+use xcom_x11::clipboard::{Clipboard, Target};
 use xcom_x11::input::Injector;
 use xcom_x11::keymap::Keymap;
 use xcom_x11::windows;
@@ -161,6 +162,16 @@ pub fn run(args: ServeArgs) -> Result<()> {
 
     let keymap = Keymap::query(session.connection().as_ref())?;
 
+    // Clipboard worker: own connection, separate thread; the session still
+    // works without it (e.g. if the display refuses another connection).
+    let clipboard = match Clipboard::spawn(&display) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            logln!("[serve] clipboard disabled: {e:#}");
+            None
+        }
+    };
+
     // --- identity, tokens, listener --------------------------------------
     let identity = Identity::generate()?;
     // One single-use token per role: burning the control token cannot make the
@@ -196,9 +207,10 @@ pub fn run(args: ServeArgs) -> Result<()> {
     // The single handshake line: everything the client needs to authenticate
     // us (fingerprint) and itself (one token per role), plus where to dial.
     let line = format!(
-        "{{\"proto\":2,\"session\":\"{session_id:016x}\",\"display\":\"{display}\",\
+        "{{\"proto\":{},\"session\":\"{session_id:016x}\",\"display\":\"{display}\",\
          \"connect\":\"{addr}\",\"token_control\":\"{}\",\"token_bulk\":\"{}\",\
          \"cert_sha256\":\"{}\"}}",
+        xcom_proto::PROTO_VERSION,
         xcom_transport::hex(&control_token),
         xcom_transport::hex(&bulk_token),
         identity.fingerprint(),
@@ -243,6 +255,7 @@ pub fn run(args: ServeArgs) -> Result<()> {
         }
     }
     let geo_ctrl = Arc::clone(&geo);
+    let ctrl_send = ctrl_tx.clone();
     let ctrl_thread = std::thread::spawn(move || {
         if let Err(e) = control_loop(
             control,
@@ -250,9 +263,11 @@ pub fn run(args: ServeArgs) -> Result<()> {
             root,
             keymap,
             ctrl_rx,
+            ctrl_send,
             full_tx,
             shutdown_ctrl,
             geo_ctrl,
+            clipboard,
         ) {
             logln!("[serve] control loop ended with error: {e:#}");
         }
@@ -356,9 +371,11 @@ fn control_loop(
     root: Window,
     keymap: Keymap,
     outbound: mpsc::Receiver<Message>,
+    outbound_tx: mpsc::Sender<Message>,
     full_requests: mpsc::Sender<Window>,
     shutdown: Arc<AtomicBool>,
     geo: GeometryMap,
+    clipboard: Option<Clipboard>,
 ) -> Result<()> {
     let _guard = ShutdownGuard(Arc::clone(&shutdown));
     let injector = Injector::new(&*conn, root, keymap);
@@ -471,6 +488,49 @@ fn control_loop(
                 Message::Ping { t } => {
                     let pong = Message::Pong { t };
                     control.send(pong.msg_type(), &pong.encode())?;
+                }
+                Message::ClipboardGet { target } => {
+                    match (&clipboard, Target::from_u8(target)) {
+                        (Some(cb), Some(t)) => {
+                            // Read on the worker thread; deliver to the client
+                            // through the outbound queue so input never blocks.
+                            let (tx, rx) = mpsc::channel();
+                            cb.request(t, tx);
+                            let out = outbound_tx.clone();
+                            std::thread::spawn(move || {
+                                let text = rx
+                                    .recv_timeout(Duration::from_secs(2))
+                                    .ok()
+                                    .flatten()
+                                    .unwrap_or_default();
+                                let msg = Message::ClipboardData {
+                                    target: t.as_u8(),
+                                    text: xcom_proto::truncate_clipboard(text),
+                                };
+                                let _ = out.send(msg);
+                            });
+                        }
+                        _ => logln!("[serve] clipboard get: unavailable (target {target})"),
+                    }
+                }
+                Message::ClipboardSet { target, text } => {
+                    match (&clipboard, Target::from_u8(target)) {
+                        (Some(cb), Some(t)) => {
+                            let text = xcom_proto::truncate_clipboard(text);
+                            match cb.set(t, text.clone()) {
+                                Ok(()) => {
+                                    if xcom_proto::debug() {
+                                        logln!(
+                                            "[serve] clipboard set ({t:?}, {} bytes)",
+                                            text.len()
+                                        );
+                                    }
+                                }
+                                Err(e) => logln!("[serve] clipboard set failed: {e:#}"),
+                            }
+                        }
+                        _ => logln!("[serve] clipboard set: unavailable (target {target})"),
+                    }
                 }
                 Message::Bye => {
                     shutdown.store(true, Ordering::SeqCst);

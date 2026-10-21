@@ -11,7 +11,7 @@
 //! (the M0 harness and the e2e key-latency check rely on that); other targets
 //! fall back to the system clock so this crate still builds for Windows.
 
-pub const PROTO_VERSION: u16 = 3;
+pub const PROTO_VERSION: u16 = 4;
 
 // Window kinds (server -> client), derived from _NET_WM_WINDOW_TYPE,
 // WM_TRANSIENT_FOR and override_redirect.
@@ -55,6 +55,31 @@ pub const MSG_FULL_REQUEST: u8 = 24;
 pub const MSG_BYE: u8 = 25;
 /// Close one remote window (not the whole session).
 pub const MSG_WINDOW_CLOSE: u8 = 26;
+
+// Clipboard (text). Target ids.
+pub const CLIPBOARD_CLIPBOARD: u8 = 0;
+pub const CLIPBOARD_PRIMARY: u8 = 1;
+/// Client asks the server for the current selection (server replies with data).
+pub const MSG_CLIPBOARD_GET: u8 = 30;
+/// Client pushes local clipboard text to the server, which owns the selection.
+pub const MSG_CLIPBOARD_SET: u8 = 31;
+/// Server replies with the requested selection text (empty = none/refused).
+pub const MSG_CLIPBOARD_DATA: u8 = 32;
+
+/// Selection text is length-prefixed with u16; keep a margin below the limit.
+pub const MAX_CLIPBOARD_TEXT: usize = 60_000;
+
+/// Truncate clipboard text at a char boundary to the wire limit.
+pub fn truncate_clipboard(mut s: String) -> String {
+    if s.len() > MAX_CLIPBOARD_TEXT {
+        let mut end = MAX_CLIPBOARD_TEXT;
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        s.truncate(end);
+    }
+    s
+}
 
 /// `XCOM_DEBUG=1` enables protocol/input tracing (test and diagnosis aid).
 pub fn debug() -> bool {
@@ -322,6 +347,20 @@ pub enum Message {
     Pong {
         t: u64,
     },
+    /// Client asks for the current selection text.
+    ClipboardGet {
+        target: u8,
+    },
+    /// Client pushes text; the server takes selection ownership.
+    ClipboardSet {
+        target: u8,
+        text: String,
+    },
+    /// Server's reply to `ClipboardGet` (empty when there is no selection).
+    ClipboardData {
+        target: u8,
+        text: String,
+    },
     Bye,
 }
 
@@ -389,6 +428,9 @@ impl Message {
             Message::FullRequest { .. } => MSG_FULL_REQUEST,
             Message::Ping { .. } => MSG_PING,
             Message::Pong { .. } => MSG_PONG,
+            Message::ClipboardGet { .. } => MSG_CLIPBOARD_GET,
+            Message::ClipboardSet { .. } => MSG_CLIPBOARD_SET,
+            Message::ClipboardData { .. } => MSG_CLIPBOARD_DATA,
             Message::Bye => MSG_BYE,
         }
     }
@@ -459,6 +501,12 @@ impl Message {
             }
             Message::FullRequest { id } => put_u32(&mut out, *id),
             Message::Ping { t } | Message::Pong { t } => put_u64(&mut out, *t),
+            Message::ClipboardGet { target } => out.push(*target),
+            Message::ClipboardSet { target, text } | Message::ClipboardData { target, text } => {
+                out.push(*target);
+                put_u16(&mut out, text.len() as u16);
+                out.extend_from_slice(text.as_bytes());
+            }
             Message::Bye => {}
         }
         out
@@ -526,6 +574,17 @@ impl Message {
             },
             MSG_PING => Message::Ping { t: take_u64(&mut p)? },
             MSG_PONG => Message::Pong { t: take_u64(&mut p)? },
+            MSG_CLIPBOARD_GET => Message::ClipboardGet {
+                target: take(&mut p, 1)?[0],
+            },
+            MSG_CLIPBOARD_SET => Message::ClipboardSet {
+                target: take(&mut p, 1)?[0],
+                text: take_str(&mut p)?,
+            },
+            MSG_CLIPBOARD_DATA => Message::ClipboardData {
+                target: take(&mut p, 1)?[0],
+                text: take_str(&mut p)?,
+            },
             MSG_BYE => Message::Bye,
             _ => return Err(ProtoError::BadMessage("unknown message type")),
         };
@@ -802,6 +861,17 @@ mod tests {
             Message::FullRequest { id: 7 },
             Message::Ping { t: 123456789 },
             Message::Pong { t: 123456789 },
+            Message::ClipboardGet {
+                target: CLIPBOARD_CLIPBOARD,
+            },
+            Message::ClipboardSet {
+                target: CLIPBOARD_PRIMARY,
+                text: "héllo".to_string(),
+            },
+            Message::ClipboardData {
+                target: CLIPBOARD_CLIPBOARD,
+                text: "wörld".to_string(),
+            },
             Message::Bye,
         ];
         for m in msgs {

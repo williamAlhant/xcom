@@ -447,6 +447,9 @@ fn control_loop(
                     Message::WindowGeometry { id, x, y, w, h } => {
                         Some(UserEvent::Geometry { id, x, y, w, h })
                     }
+                    Message::ClipboardData { text, .. } => {
+                        Some(UserEvent::ClipboardData { text })
+                    }
                     Message::WindowUnmapped { id } => Some(UserEvent::Unmap { id }),
                     Message::WindowMapped { id } => Some(UserEvent::Map { id }),
                     Message::WindowDestroy { id } => Some(UserEvent::Close { id }),
