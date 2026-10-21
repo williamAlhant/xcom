@@ -735,6 +735,60 @@ fn selftest(args: SelftestArgs) -> Result<()> {
     let mut buf = Vec::new();
 
     // Baseline: the whole window is black.
+    // XFixes delivers the current pointer image at startup; the client mirrors
+    // it before any window exists.
+    if !wait_pump(&mut session, Duration::from_secs(2), |e| {
+        matches!(e, PumpEvent::Cursor { .. })
+    })? {
+        bail!("selftest: no initial cursor event");
+    }
+
+    // Changing the cursor over the window must notify us again.
+    let cursor: x11rb::protocol::xproto::Cursor = draw_conn.generate_id()?;
+    let source: x11rb::protocol::xproto::Pixmap = draw_conn.generate_id()?;
+    draw_conn.create_pixmap(1, source, win, 16, 16)?;
+    let cursor_gc: x11rb::protocol::xproto::Gcontext = draw_conn.generate_id()?;
+    draw_conn.create_gc(
+        cursor_gc,
+        source,
+        &x11rb::protocol::xproto::CreateGCAux::new().foreground(1u32),
+    )?;
+    draw_conn.poly_fill_rectangle(
+        source,
+        cursor_gc,
+        &[x11rb::protocol::xproto::Rectangle {
+            x: 0,
+            y: 0,
+            width: 16,
+            height: 16,
+        }],
+    )?;
+    // The cursor must exist before the window attribute references it.
+    draw_conn.create_cursor(
+        cursor,
+        source,
+        source,
+        0xffff,
+        0xffff,
+        0xffff,
+        0x0000,
+        0x0000,
+        0x0000,
+        8,
+        8,
+    )?;
+    draw_conn.change_window_attributes(
+        win,
+        &x11rb::protocol::xproto::ChangeWindowAttributesAux::new().cursor(cursor),
+    )?;
+    draw_conn.warp_pointer(x11rb::NONE, win, 0, 0, 0, 0, 8, 8)?;
+    draw_conn.flush()?;
+    if !wait_pump(&mut session, Duration::from_secs(2), |e| {
+        matches!(e, PumpEvent::Cursor { w: 16, h: 16, .. })
+    })? {
+        bail!("selftest: cursor change was not reported");
+    }
+
     let (frame, _) = session.capture_full(win)?.context("initial full capture")?;
     apply(&mut store, w, &frame, &mut buf);
     if pixel(&store, 10, 10, w) != 0 {

@@ -450,6 +450,19 @@ fn control_loop(
                     Message::ClipboardData { text, .. } => {
                         Some(UserEvent::ClipboardData { text })
                     }
+                    Message::Cursor {
+                        xhot,
+                        yhot,
+                        w,
+                        h,
+                        pixels,
+                    } => Some(UserEvent::Cursor {
+                        xhot,
+                        yhot,
+                        w,
+                        h,
+                        pixels,
+                    }),
                     Message::WindowUnmapped { id } => Some(UserEvent::Unmap { id }),
                     Message::WindowMapped { id } => Some(UserEvent::Map { id }),
                     Message::WindowDestroy { id } => Some(UserEvent::Close { id }),

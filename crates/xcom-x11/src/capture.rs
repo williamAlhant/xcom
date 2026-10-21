@@ -83,11 +83,19 @@ pub enum PumpEvent {
     Mapped(Window),
     Unmapped(Window),
     Destroyed(Window),
-    /// A tracked window changed size (the app reflowed or was resized).
+    /// A tracked window changed size or position.
     Resized {
         window: Window,
         w: u16,
         h: u16,
+    },
+    /// The pointer image changed (ARGB premultiplied, row-major).
+    Cursor {
+        xhot: u16,
+        yhot: u16,
+        w: u16,
+        h: u16,
+        pixels: Vec<u32>,
     },
 }
 
@@ -131,6 +139,7 @@ pub struct CaptureSession {
     compressor: Compressor,
     queue: VecDeque<PumpEvent>,
     cfg: CaptureConfig,
+    last_cursor_serial: u32,
 }
 
 impl CaptureSession {
@@ -174,11 +183,14 @@ impl CaptureSession {
             &xproto::ChangeWindowAttributesAux::new().event_mask(EventMask::SUBSTRUCTURE_NOTIFY),
         )?;
 
+        // Pointer shape changes (XFixes): the client mirrors them locally.
+        conn.xfixes_select_cursor_input(root, xfixes::CursorNotifyMask::DISPLAY_CURSOR)?;
+
         // One full-screen 1080p window needs ~8 MB; growth is handled per rect.
         let shm = attach_shm(&conn, 8 << 20)?;
         conn.flush()?;
 
-        Ok(CaptureSession {
+        let mut session = CaptureSession {
             conn,
             screen: screen_num,
             root,
@@ -187,7 +199,11 @@ impl CaptureSession {
             compressor: Compressor::new(),
             queue: VecDeque::new(),
             cfg,
-        })
+            // Force the initial image through; notifications dedupe afterwards.
+            last_cursor_serial: u32::MAX,
+        };
+        session.read_cursor()?;
+        Ok(session)
     }
 
     pub fn connection(&self) -> Arc<RustConnection> {
@@ -466,8 +482,46 @@ impl CaptureSession {
                 self.remove_window(e.window);
                 self.queue.push_back(PumpEvent::Destroyed(e.window));
             }
+            Event::XfixesCursorNotify(e)
+                if e.subtype == xfixes::CursorNotify::DISPLAY_CURSOR =>
+            {
+                self.read_cursor()?;
+            }
             _ => {}
         }
+        Ok(())
+    }
+
+    /// Fetch the current pointer image (XFixes) and queue it if it changed.
+    fn read_cursor(&mut self) -> Result<()> {
+        let reply = self.conn.xfixes_get_cursor_image()?.reply()?;
+        if reply.width == 0 || reply.height == 0 {
+            return Ok(());
+        }
+        if reply.width > xcom_proto::MAX_CURSOR_DIM || reply.height > xcom_proto::MAX_CURSOR_DIM {
+            if xcom_proto::debug() {
+                eprintln!(
+                    "[capture] cursor {}x{} exceeds the wire limit; ignored",
+                    reply.width, reply.height
+                );
+            }
+            return Ok(());
+        }
+        if reply.cursor_serial == self.last_cursor_serial {
+            return Ok(());
+        }
+        let n = reply.width as usize * reply.height as usize;
+        if reply.cursor_image.len() < n {
+            return Ok(());
+        }
+        self.last_cursor_serial = reply.cursor_serial;
+        self.queue.push_back(PumpEvent::Cursor {
+            xhot: reply.xhot,
+            yhot: reply.yhot,
+            w: reply.width,
+            h: reply.height,
+            pixels: reply.cursor_image[..n].to_vec(),
+        });
         Ok(())
     }
 

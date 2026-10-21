@@ -837,6 +837,26 @@ fn serve_loop(
                 announced.remove(&win);
                 ctrl_tx.send(Message::WindowDestroy { id: win }).ok();
             }
+            Some(PumpEvent::Cursor {
+                xhot,
+                yhot,
+                w,
+                h,
+                pixels,
+            }) => {
+                if xcom_proto::debug() {
+                    logln!("[serve] cursor {w}x{h} hot=({xhot},{yhot})");
+                }
+                ctrl_tx
+                    .send(Message::Cursor {
+                        xhot,
+                        yhot,
+                        w,
+                        h,
+                        pixels,
+                    })
+                    .ok();
+            }
             Some(PumpEvent::Resized { window, w, h }) => {
                 let (x, y) = if let Some((x, y, _, _)) = session.window_geometry(window) {
                     geo.lock().unwrap().insert(window, (x, y, w, h));

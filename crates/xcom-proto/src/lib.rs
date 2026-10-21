@@ -11,7 +11,7 @@
 //! (the M0 harness and the e2e key-latency check rely on that); other targets
 //! fall back to the system clock so this crate still builds for Windows.
 
-pub const PROTO_VERSION: u16 = 4;
+pub const PROTO_VERSION: u16 = 5;
 
 // Window kinds (server -> client), derived from _NET_WM_WINDOW_TYPE,
 // WM_TRANSIENT_FOR and override_redirect.
@@ -26,8 +26,11 @@ pub const KIND_OTHER: u8 = 6;
 
 /// Pre-authentication frames (the hello) are tiny; anything larger is hostile.
 pub const MAX_HELLO_LEN: usize = 64;
-/// Control messages are small (input, lifecycle, pings).
-pub const CONTROL_MAX_FRAME: usize = 64 * 1024;
+/// Control messages (input, lifecycle, pings, cursor images).
+pub const CONTROL_MAX_FRAME: usize = 128 * 1024;
+/// Cursor images are sent on the control channel; cap their dimensions so a
+/// frame stays well under the control limit (128x128x4 = 64 KiB).
+pub const MAX_CURSOR_DIM: u16 = 128;
 /// Bulk damage frames: a 4K full-window raw frame is ~33 MiB.
 pub const BULK_MAX_FRAME: usize = 64 * 1024 * 1024;
 
@@ -65,6 +68,9 @@ pub const MSG_CLIPBOARD_GET: u8 = 30;
 pub const MSG_CLIPBOARD_SET: u8 = 31;
 /// Server replies with the requested selection text (empty = none/refused).
 pub const MSG_CLIPBOARD_DATA: u8 = 32;
+
+/// Server -> client: the remote pointer image changed.
+pub const MSG_CURSOR: u8 = 33;
 
 /// Selection text is length-prefixed with u16; keep a margin below the limit.
 pub const MAX_CLIPBOARD_TEXT: usize = 60_000;
@@ -361,6 +367,14 @@ pub enum Message {
         target: u8,
         text: String,
     },
+    /// Remote pointer image (ARGB premultiplied, row-major).
+    Cursor {
+        xhot: u16,
+        yhot: u16,
+        w: u16,
+        h: u16,
+        pixels: Vec<u32>,
+    },
     Bye,
 }
 
@@ -431,6 +445,7 @@ impl Message {
             Message::ClipboardGet { .. } => MSG_CLIPBOARD_GET,
             Message::ClipboardSet { .. } => MSG_CLIPBOARD_SET,
             Message::ClipboardData { .. } => MSG_CLIPBOARD_DATA,
+            Message::Cursor { .. } => MSG_CURSOR,
             Message::Bye => MSG_BYE,
         }
     }
@@ -506,6 +521,21 @@ impl Message {
                 out.push(*target);
                 put_u16(&mut out, text.len() as u16);
                 out.extend_from_slice(text.as_bytes());
+            }
+            Message::Cursor {
+                xhot,
+                yhot,
+                w,
+                h,
+                pixels,
+            } => {
+                put_u16(&mut out, *xhot);
+                put_u16(&mut out, *yhot);
+                put_u16(&mut out, *w);
+                put_u16(&mut out, *h);
+                for px in pixels {
+                    put_u32(&mut out, *px);
+                }
             }
             Message::Bye => {}
         }
@@ -585,6 +615,28 @@ impl Message {
                 target: take(&mut p, 1)?[0],
                 text: take_str(&mut p)?,
             },
+            MSG_CURSOR => {
+                let xhot = take_u16(&mut p)?;
+                let yhot = take_u16(&mut p)?;
+                let w = take_u16(&mut p)?;
+                let h = take_u16(&mut p)?;
+                if w == 0 || h == 0 || w > MAX_CURSOR_DIM || h > MAX_CURSOR_DIM {
+                    return Err(ProtoError::BadMessage("implausible cursor size"));
+                }
+                let n = w as usize * h as usize;
+                let raw = take(&mut p, n * 4)?;
+                let pixels = raw
+                    .chunks_exact(4)
+                    .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                    .collect();
+                Message::Cursor {
+                    xhot,
+                    yhot,
+                    w,
+                    h,
+                    pixels,
+                }
+            }
             MSG_BYE => Message::Bye,
             _ => return Err(ProtoError::BadMessage("unknown message type")),
         };
@@ -871,6 +923,13 @@ mod tests {
             Message::ClipboardData {
                 target: CLIPBOARD_CLIPBOARD,
                 text: "wörld".to_string(),
+            },
+            Message::Cursor {
+                xhot: 1,
+                yhot: 2,
+                w: 2,
+                h: 2,
+                pixels: vec![0xff00_0000, 0xffff_ffff, 0x0000_0000, 0x80ff_0000],
             },
             Message::Bye,
         ];

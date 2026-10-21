@@ -77,6 +77,14 @@ pub enum UserEvent {
     CloseOne,
     /// Text read from the remote selection (server reply).
     ClipboardData { text: String },
+    /// Remote pointer image (ARGB premultiplied).
+    Cursor {
+        xhot: u16,
+        yhot: u16,
+        w: u16,
+        h: u16,
+        pixels: Vec<u32>,
+    },
 }
 
 type Target = softbuffer::Surface<Arc<Window>, Arc<Window>>;
@@ -202,6 +210,8 @@ pub struct App {
     plain_chars: HashMap<winit::keyboard::PhysicalKey, u32>,
     /// Local (client) clipboard. None when the platform has no text clipboard.
     clipboard: Option<arboard::Clipboard>,
+    /// Cursor mirroring the remote pointer, applied to every window.
+    custom_cursor: Option<winit::window::CustomCursor>,
     dump: Option<PathBuf>,
     dump_seq: u32,
     fullscreen: bool,
@@ -254,6 +264,7 @@ impl App {
             held: HashMap::new(),
             plain_chars: HashMap::new(),
             clipboard,
+            custom_cursor: None,
             dump,
             dump_seq: 0,
             fullscreen,
@@ -436,6 +447,9 @@ impl App {
             return;
         };
         let window = Arc::new(window);
+        if let Some(cursor) = &self.custom_cursor {
+            window.set_cursor(cursor.clone());
+        }
         let Ok(context) = softbuffer::Context::new(Arc::clone(&window)) else {
             return;
         };
@@ -723,6 +737,30 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                         Err(e) => eprintln!("[ui] clipboard write failed: {e}"),
                     }
+                }
+            }
+            UserEvent::Cursor {
+                xhot,
+                yhot,
+                w,
+                h,
+                pixels,
+            } => {
+                let rgba = cursor_rgba(&pixels);
+                let hx = xhot.min(w.saturating_sub(1));
+                let hy = yhot.min(h.saturating_sub(1));
+                match winit::window::CustomCursor::from_rgba(rgba, w, h, hx, hy) {
+                    Ok(source) => {
+                        let cursor = el.create_custom_cursor(source);
+                        if xcom_proto::debug() {
+                            eprintln!("[ui] cursor {w}x{h} hot=({hx},{hy})");
+                        }
+                        for att in self.attached.values() {
+                            att.window.set_cursor(cursor.clone());
+                        }
+                        self.custom_cursor = Some(cursor);
+                    }
+                    Err(e) => eprintln!("[ui] cursor rejected: {e:?}"),
                 }
             }
             UserEvent::Dump => self.dump("mid."),
@@ -1049,6 +1087,27 @@ fn x11_button(b: MouseButton) -> u8 {
         MouseButton::Forward => 9,
         MouseButton::Other(n) => n as u8,
     }
+}
+
+/// XFixes returns ARGB with premultiplied alpha; winit wants straight RGBA.
+fn cursor_rgba(pixels: &[u32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(pixels.len() * 4);
+    for &px in pixels {
+        let a = (px >> 24) as u8;
+        if a == 0 {
+            out.extend_from_slice(&[0, 0, 0, 0]);
+        } else {
+            let a32 = a as u32;
+            let unpremultiply = |c: u32| ((c * 255 + a32 / 2) / a32).min(255) as u8;
+            out.extend_from_slice(&[
+                unpremultiply((px >> 16) & 0xff),
+                unpremultiply((px >> 8) & 0xff),
+                unpremultiply(px & 0xff),
+                a,
+            ]);
+        }
+    }
+    out
 }
 
 /// Encode 0x00RRGGBB pixels as a binary PPM (P6).
