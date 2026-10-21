@@ -68,6 +68,14 @@ cargo run -p xcom-x11 --example x11_input -- up 50
    on the remote Xvfb: a single XTEST press held for 1.5 s produced 25
    characters. Local winit repeats are now ignored: the remote server repeats
    a held key at its own rate.
+5. **Ctrl shortcuts did not work.** Winit deliberately ignores the character
+   when Ctrl is held and falls back to the VK — which Wine mangles into a
+   spare named key (`Ctrl+C` arrived as `Named(AudioVolumeDown)`, text none).
+   **Fix:** the client caches the plain (unmodified, ASCII) character per
+   physical key from text events and uses it when a Ctrl/Alt/Super press has
+   no text and the physical key is a character key. Genuine named keys (Enter,
+   arrows, F-keys) are unchanged. Cold start: pressing a shortcut before the
+   key has ever been typed sends nothing (deliberately no wrong-layout guess).
 3. **Flaky display startup.** Killing Xvfb with SIGKILL left
    `/tmp/.X11-unix/X<n>` behind; `-displayfd` selects by lock file, so the next
    server picked the dead socket and failed to bind. The readiness connect could
@@ -85,6 +93,9 @@ cargo run -p xcom-x11 --example x11_input -- up 50
 | US keycodes 24/25/26, 10–13, 38 | remote received `qwe1234a`, unchanged 1.5 s later (no stuck key) |
 | Shift held across two `a` taps, then released | remote received `AAa` |
 | `a` held 1.2 s | ~17 repeats from the remote X server, then stable |
+| type `c`, then Ctrl+C | bytes `63 03` |
+| type `d`, then Ctrl+D | bytes `64 04` |
+| Ctrl+C before typing `c` | nothing (cold-start caveat, no wrong guess) |
 | Client log | `logical_key` still shows Wine's bogus named keys; `sym` is correct |
 
 ## Not verified / caveats

@@ -154,10 +154,79 @@ pub fn text_keysym(text: Option<&str>) -> Option<u32> {
     }
 }
 
+/// True for physical keys that normally produce a character (letters, digits,
+/// punctuation, space) — i.e. keys where a Ctrl/Alt shortcut uses the plain
+/// character. Named keys (Enter, arrows, F-keys) are not included.
+pub fn is_text_key(code: KeyCode) -> bool {
+    matches!(
+        code,
+        KeyCode::KeyA
+            | KeyCode::KeyB
+            | KeyCode::KeyC
+            | KeyCode::KeyD
+            | KeyCode::KeyE
+            | KeyCode::KeyF
+            | KeyCode::KeyG
+            | KeyCode::KeyH
+            | KeyCode::KeyI
+            | KeyCode::KeyJ
+            | KeyCode::KeyK
+            | KeyCode::KeyL
+            | KeyCode::KeyM
+            | KeyCode::KeyN
+            | KeyCode::KeyO
+            | KeyCode::KeyP
+            | KeyCode::KeyQ
+            | KeyCode::KeyR
+            | KeyCode::KeyS
+            | KeyCode::KeyT
+            | KeyCode::KeyU
+            | KeyCode::KeyV
+            | KeyCode::KeyW
+            | KeyCode::KeyX
+            | KeyCode::KeyY
+            | KeyCode::KeyZ
+            | KeyCode::Digit0
+            | KeyCode::Digit1
+            | KeyCode::Digit2
+            | KeyCode::Digit3
+            | KeyCode::Digit4
+            | KeyCode::Digit5
+            | KeyCode::Digit6
+            | KeyCode::Digit7
+            | KeyCode::Digit8
+            | KeyCode::Digit9
+            | KeyCode::Space
+            | KeyCode::Minus
+            | KeyCode::Equal
+            | KeyCode::BracketLeft
+            | KeyCode::BracketRight
+            | KeyCode::Backslash
+            | KeyCode::Semicolon
+            | KeyCode::Quote
+            | KeyCode::Comma
+            | KeyCode::Period
+            | KeyCode::Slash
+            | KeyCode::Backquote
+            | KeyCode::IntlBackslash
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use winit::keyboard::{Key, KeyCode, NamedKey};
+
+    #[test]
+    fn text_keys_are_letters_digits_and_punctuation() {
+        assert!(is_text_key(KeyCode::KeyC));
+        assert!(is_text_key(KeyCode::Digit3));
+        assert!(is_text_key(KeyCode::Comma));
+        assert!(is_text_key(KeyCode::Space));
+        assert!(!is_text_key(KeyCode::Enter));
+        assert!(!is_text_key(KeyCode::F4));
+        assert!(!is_text_key(KeyCode::ArrowLeft));
+    }
 
     #[test]
     fn text_preferred_over_named_key() {

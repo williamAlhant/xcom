@@ -179,6 +179,10 @@ pub struct App {
     /// no text and may carry a Wine-mangled logical key, so the only reliable
     /// way to release the same key the press created is to remember it here.
     held: HashMap<winit::keyboard::PhysicalKey, u32>,
+    /// Plain (unmodified) character per physical key, learned from text events.
+    /// Needed for Ctrl/Alt shortcuts under Wine, where winit reports a bogus
+    /// named key and no text while a modifier is held.
+    plain_chars: HashMap<winit::keyboard::PhysicalKey, u32>,
     dump: Option<PathBuf>,
     dump_seq: u32,
     fullscreen: bool,
@@ -222,6 +226,7 @@ impl App {
             present_errors: 0,
             ever_had_windows: false,
             held: HashMap::new(),
+            plain_chars: HashMap::new(),
             dump,
             dump_seq: 0,
             fullscreen,
@@ -726,24 +731,11 @@ impl ApplicationHandler<UserEvent> for App {
                 if event.repeat {
                     return;
                 }
-                let keysym = |event: &winit::event::KeyEvent| {
-                    crate::keys::text_keysym(event.text.as_deref())
-                        .or_else(|| keysym_for(&event.logical_key))
-                        .or_else(|| match event.physical_key {
-                            winit::keyboard::PhysicalKey::Code(code) => {
-                                keysym_for_physical(code)
-                            }
-                            _ => None,
-                        })
-                };
                 if event.state == ElementState::Released {
-                    // Use the keysym from the press: the release has no text
-                    // and Wine may report a bogus named key.
-                    let sym = self
-                        .held
-                        .remove(&event.physical_key)
-                        .or_else(|| keysym(&event));
-                    if let Some(sym) = sym {
+                    // Release exactly what the press sent: the release has no
+                    // text and Wine may report a bogus named key. Keys whose
+                    // press sent nothing are not in the map, so they stay silent.
+                    if let Some(sym) = self.held.remove(&event.physical_key) {
                         self.send(Message::InputKey {
                             sym,
                             pressed: false,
@@ -751,13 +743,38 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     return;
                 }
+
+                const CTRL: [u32; 2] = [0xffe3, 0xffe4];
+                const ALT: [u32; 2] = [0xffe9, 0xffea];
+                const SUPER: [u32; 2] = [0xffeb, 0xffec];
+                const SHIFT: [u32; 2] = [0xffe1, 0xffe2];
+                let held_any = |syms: [u32; 2]| {
+                    self.held
+                        .values()
+                        .any(|s| syms.contains(s))
+                };
+                let ctrl_alt =
+                    held_any(CTRL) || held_any(ALT) || held_any(SUPER);
+                let shift = held_any(SHIFT);
+
+                let text_sym = crate::keys::text_keysym(event.text.as_deref());
+                // Learn the layout's plain character. ASCII only and with no
+                // modifiers, so dead-key accents and shifted symbols can't
+                // pollute the map.
+                if !ctrl_alt && !shift {
+                    if let Some(sym) = text_sym {
+                        if (0x20..=0x7e).contains(&sym) {
+                            self.plain_chars.insert(event.physical_key, sym);
+                        }
+                    }
+                }
+
                 // Local hotkey (test aid): dump the store exactly when the user
                 // sees the artifact (not forwarded to the remote app). Opt-in.
                 if self.debug_tools
                     && matches!(event.logical_key, winit::keyboard::Key::Named(
                         winit::keyboard::NamedKey::F12
                     ))
-                    && event.state == ElementState::Pressed
                 {
                     eprintln!("[ui] F12: dumping store and requesting full refresh");
                     self.dump("mid.");
@@ -766,7 +783,41 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     return;
                 }
-                let sym = keysym(&event);
+
+                let logical_sym = keysym_for(&event.logical_key);
+                let sym = if ctrl_alt && text_sym.is_none() {
+                    if matches!(event.logical_key, winit::keyboard::Key::Character(_)) {
+                        // Real Windows: the logical key is the layout character
+                        // even with Ctrl held.
+                        logical_sym
+                    } else {
+                        match event.physical_key {
+                            winit::keyboard::PhysicalKey::Code(code)
+                                if crate::keys::is_text_key(code) =>
+                            {
+                                // Wine: bogus named VK. Use the character this
+                                // key normally produces; send nothing if the
+                                // user has not typed it yet (no wrong guesses).
+                                self.plain_chars.get(&event.physical_key).copied()
+                            }
+                            _ => logical_sym.or_else(|| match event.physical_key {
+                                winit::keyboard::PhysicalKey::Code(code) => {
+                                    keysym_for_physical(code)
+                                }
+                                _ => None,
+                            }),
+                        }
+                    }
+                } else {
+                    text_sym
+                        .or(logical_sym)
+                        .or_else(|| match event.physical_key {
+                            winit::keyboard::PhysicalKey::Code(code) => {
+                                keysym_for_physical(code)
+                            }
+                            _ => None,
+                        })
+                };
                 if xcom_proto::debug_keys() {
                     eprintln!(
                         "[ui] key {:?} -> sym={} pressed={} text={:?}",
