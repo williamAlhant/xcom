@@ -4,10 +4,10 @@
 //! behave exactly like real hardware input: grabs, focus and toolkit event
 //! handling all work unchanged.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, Result};
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{ConnectionExt, InputFocus, Keycode, Timestamp, Window};
 use x11rb::protocol::xtest::ConnectionExt as _;
@@ -25,10 +25,15 @@ pub struct Injector<'c, C: Connection> {
     conn: &'c C,
     root: Window,
     pub keymap: Keymap,
-    /// A keycode with no keysyms, used to type Unicode the layout lacks.
-    scratch: Option<u8>,
-    /// (keysym, keycode) currently installed on the scratch keycode.
-    scratch_active: Cell<Option<(u32, u8)>>,
+    /// Keycodes with no keysyms, available for Unicode keysyms.
+    scratch_free: RefCell<Vec<u8>>,
+    /// Unicode keysym -> keycode. Assigned once and kept for the session:
+    /// remapping a keycode between presses races the app's keymap lookup
+    /// (xterm can translate a KeyPress with the *next* character's mapping,
+    /// which is how é came out as à).
+    scratch_map: RefCell<HashMap<u32, u8>>,
+    /// Assignment order, oldest first, for reuse only when the pool is empty.
+    scratch_lru: RefCell<Vec<u32>>,
     /// Keycodes currently down, whoever pressed them (the user's modifier
     /// keys, synthesized modifiers, normal keys). Needed so a binding never
     /// releases a modifier the user is still holding.
@@ -40,20 +45,23 @@ pub struct Injector<'c, C: Connection> {
 
 impl<'c, C: Connection> Injector<'c, C> {
     pub fn new(conn: &'c C, root: Window, keymap: Keymap) -> Self {
-        // Highest unused keycode: layouts usually leave the top codes free.
-        let scratch = (8u8..=255).rev().find(|kc| {
-            keymap
-                .columns
-                .get(kc)
-                .map(|syms| syms.iter().all(|&s| s == 0))
-                .unwrap_or(true)
-        });
+        // Ascending order; pop() takes the highest unused keycode.
+        let scratch_free: Vec<u8> = (8u8..=255)
+            .filter(|kc| {
+                keymap
+                    .columns
+                    .get(kc)
+                    .map(|syms| syms.iter().all(|&s| s == 0))
+                    .unwrap_or(true)
+            })
+            .collect();
         Self {
             conn,
             root,
             keymap,
-            scratch,
-            scratch_active: Cell::new(None),
+            scratch_free: RefCell::new(scratch_free),
+            scratch_map: RefCell::new(HashMap::new()),
+            scratch_lru: RefCell::new(Vec::new()),
             down_keys: RefCell::new(HashSet::new()),
             synth_mods: RefCell::new(HashMap::new()),
         }
@@ -113,36 +121,60 @@ impl<'c, C: Connection> Injector<'c, C> {
     /// Press (or release) a keysym, synthesizing whatever modifiers it needs.
     ///
     /// Keysyms the remote layout does not contain (most non-Latin-1 Unicode)
-    /// are typed by temporarily binding a spare keycode to the Unicode keysym,
-    /// the same technique xdotool uses.
+    /// get a dedicated spare keycode the first time they are used; the mapping
+    /// is kept for the session so the app's keymap lookup can never see the
+    /// next character's mapping.
     pub fn key(&self, sym: u32, press: bool) -> Result<()> {
-        // Release of a key that went through the scratch keycode.
-        if !press {
-            if let Some((active, kc)) = self.scratch_active.get() {
-                if active == sym {
-                    self.fake(FAKE_KEY_RELEASE, kc, 0, 0)?;
-                    self.down_keys.borrow_mut().remove(&kc);
-                    self.set_scratch(kc, None)?;
-                    self.scratch_active.set(None);
-                    return Ok(());
-                }
-            }
-        }
-
         if let Some(binding) = self.keymap.resolve(sym) {
             return self.key_binding(sym, binding, press);
         }
 
+        let kc = self.scratch_for(sym)?;
         if press {
-            if let Some(kc) = self.scratch {
-                self.set_scratch(kc, Some(sym))?;
-                self.fake(FAKE_KEY_PRESS, kc, 0, 0)?;
-                self.down_keys.borrow_mut().insert(kc);
-                self.scratch_active.set(Some((sym, kc)));
-                return Ok(());
-            }
+            self.fake(FAKE_KEY_PRESS, kc, 0, 0)?;
+            self.down_keys.borrow_mut().insert(kc);
+        } else {
+            self.fake(FAKE_KEY_RELEASE, kc, 0, 0)?;
+            self.down_keys.borrow_mut().remove(&kc);
         }
-        bail!("keysym {sym:#x} not in the remote keymap and no free keycode to type it")
+        Ok(())
+    }
+
+    /// Keycode for a Unicode keysym, assigned once and kept for the session.
+    fn scratch_for(&self, sym: u32) -> Result<u8> {
+        if let Some(&kc) = self.scratch_map.borrow().get(&sym) {
+            let mut lru = self.scratch_lru.borrow_mut();
+            lru.retain(|s| *s != sym);
+            lru.push(sym);
+            return Ok(kc);
+        }
+
+        let kc = match self.scratch_free.borrow_mut().pop() {
+            Some(kc) => kc,
+            None => {
+                // Every spare keycode is in use (dozens of distinct non-US
+                // characters): reuse the least recently used one.
+                let mut lru = self.scratch_lru.borrow_mut();
+                let old = lru
+                    .first()
+                    .copied()
+                    .ok_or_else(|| anyhow!("no scratch keycode available"))?;
+                lru.remove(0);
+                let kc = self
+                    .scratch_map
+                    .borrow_mut()
+                    .remove(&old)
+                    .ok_or_else(|| anyhow!("scratch keycode bookkeeping is out of sync"))?;
+                kc
+            }
+        };
+        self.set_scratch(kc, sym)?;
+        // Round trip: make sure the mapping is in effect (and MappingNotify is
+        // queued before the KeyPress) for every client, including ours.
+        self.conn.get_input_focus()?.reply()?;
+        self.scratch_map.borrow_mut().insert(sym, kc);
+        self.scratch_lru.borrow_mut().push(sym);
+        Ok(kc)
     }
 
     fn key_binding(&self, sym: u32, binding: Binding, press: bool) -> Result<()> {
@@ -178,13 +210,13 @@ impl<'c, C: Connection> Injector<'c, C> {
         Ok(())
     }
 
-    /// Bind the scratch keycode to `sym` (or clear it with `None`).
-    fn set_scratch(&self, kc: u8, sym: Option<u32>) -> Result<()> {
+    /// Bind the scratch keycode to `sym` on every level.
+    ///
+    /// All columns get the same keysym so a held Shift/AltGr cannot turn the
+    /// character into an undefined level.
+    fn set_scratch(&self, kc: u8, sym: u32) -> Result<()> {
         let n = self.keymap.keysyms_per_keycode.max(1);
-        let mut syms = vec![0u32; n as usize];
-        if let Some(sym) = sym {
-            syms[0] = sym;
-        }
+        let syms = vec![sym; n as usize];
         self.conn
             .change_keyboard_mapping(1, kc, n, &syms)?
             .check()?;

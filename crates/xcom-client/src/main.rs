@@ -310,7 +310,15 @@ fn main() -> Result<()> {
                     '\u{8}' => 0xff08, // BackSpace
                     '\n' => 0xff0d,    // Return
                     '\t' => 0xff09,    // Tab
-                    _ => c as u32,
+                    _ => {
+                        let cp = c as u32;
+                        // Match the client's keysym convention above Latin-1.
+                        if cp >= 0x100 {
+                            0x0100_0000 + cp
+                        } else {
+                            cp
+                        }
+                    }
                 };
                 for pressed in [true, false] {
                     tx.send(Message::InputKey { sym, pressed }).ok();

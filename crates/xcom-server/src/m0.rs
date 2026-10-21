@@ -835,8 +835,40 @@ fn selftest(args: SelftestArgs) -> Result<()> {
         bail!("selftest: Shift stayed down after its own release");
     }
 
+    // Unicode keysyms the layout lacks get stable scratch keycodes. A rapid
+    // é/à sequence must be read back with those keysyms: remapping one
+    // keycode between presses let xterm translate é with à's mapping.
+    draw_conn.change_window_attributes(
+        win,
+        &x11rb::protocol::xproto::ChangeWindowAttributesAux::new()
+            .event_mask(EventMask::KEY_PRESS),
+    )?;
+    draw_conn.flush()?;
+    injector.focus(win)?;
+    for sym in [0xE9u32, 0xE0, 0xE9, 0xE0] {
+        injector.key(sym, true)?;
+        injector.key(sym, false)?;
+    }
+    let expected = vec![0xE9u32, 0xE0, 0xE9, 0xE0];
+    let mut seen = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while seen.len() < expected.len() && Instant::now() < deadline {
+        while let Some(ev) = draw_conn.poll_for_event()? {
+            if let Event::KeyPress(e) = ev {
+                let map = draw_conn.get_keyboard_mapping(e.detail, 1)?.reply()?;
+                seen.push(map.keysyms.first().copied().unwrap_or(0));
+            }
+        }
+        if seen.len() < expected.len() {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    if seen != expected {
+        bail!("selftest: unicode keysyms came back as {seen:x?}, expected {expected:x?}");
+    }
+
     println!(
-        "SELFTEST PASS: draw+erase correct ({}x{}), incremental == full, unmap/remap kept the window, held modifiers preserved",
+        "SELFTEST PASS: draw+erase correct ({}x{}), incremental == full, unmap/remap kept the window, held modifiers preserved, unicode keycodes stable",
         w, h
     );
     Ok(())

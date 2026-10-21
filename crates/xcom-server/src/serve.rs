@@ -132,6 +132,12 @@ pub fn run(args: ServeArgs) -> Result<()> {
                 .env("DISPLAY", &display)
                 .stdout(Stdio::null())
                 .stderr(Stdio::inherit());
+            // xterm and command-line tools need a UTF-8 locale to turn
+            // non-ASCII keysyms into characters; in a POSIX locale they drop
+            // them. Never override a locale the caller set.
+            if std::env::var_os("LANG").is_none() && std::env::var_os("LC_ALL").is_none() {
+                c.env("LANG", "C.UTF-8");
+            }
             die_with_parent(&mut c);
             Some(
                 c.spawn()

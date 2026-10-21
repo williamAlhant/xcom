@@ -8,6 +8,9 @@
 # Run:    scripts/testvm.sh up   (also builds and starts the container)
 FROM debian:bookworm-slim
 
+# X11 apps (xterm, shells) need a UTF-8 locale to convert non-ASCII keysyms.
+ENV LANG=C.UTF-8
+
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         openssh-server \
         xauth xvfb xfonts-base fonts-dejavu-core \

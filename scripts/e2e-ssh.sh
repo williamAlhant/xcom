@@ -15,6 +15,7 @@
 #   CHECK_KEYS=1 type into the anim and assert the app received the keysyms
 #   CHECK_RESIZE=1  assert one user resize does not start a resize ping-pong
 #   CHECK_CLOSE=1   close one of two windows; the session must keep the other
+#   CHECK_UNICODE=1 type non-ASCII text and compare the exact UTF-8 bytes
 #   CHECK_TEARDOWN=0  skip the no-zombie check after the client exits
 #   CLOSE_AFTER=N   seconds after start to close one window (test aid)
 #   XCOM_DEBUG=1 protocol/input tracing (client and daemon)
@@ -36,6 +37,12 @@ if [ "${CHECK_KEYS:-0}" = 1 ]; then
     APP=${APP_ANIM:-"xcomd m0 anim --mode box --fps 60 --seconds 60 --input-log /tmp/xcom-keys.log"}
     TYPE_TEXT=${TYPE_TEXT:-hello}
     podman exec xcom-testvm rm -f /tmp/xcom-keys.log 2>/dev/null || true
+fi
+
+if [ "${CHECK_UNICODE:-0}" = 1 ]; then
+    APP="xterm -T xterm -geometry 80x24 -e sh -c 'stty raw -echo; cat > /tmp/unicode.txt'"
+    TYPE_TEXT=${UNICODE_TEXT:-éàéàéà}
+    podman exec xcom-testvm rm -f /tmp/unicode.txt 2>/dev/null || true
 fi
 
 "$REPO/scripts/testvm.sh" up
@@ -98,6 +105,20 @@ if [ "${CHECK_CLOSE:-0}" = 1 ]; then
         echo "check-close: OK (one window closed, the other stayed up)"
     else
         echo "check-close: FAIL (the session did not survive the close)"
+        PASS=0
+    fi
+fi
+
+if [ "${CHECK_UNICODE:-0}" = 1 ]; then
+    echo "--- unicode check ---"
+    GOT=$(podman exec xcom-testvm od -An -tx1 -v /tmp/unicode.txt 2>/dev/null | tr -d ' \n')
+    EXPECT=$(printf '%s' "$TYPE_TEXT" | od -An -tx1 -v | tr -d ' \n')
+    echo "got:      $GOT"
+    echo "expected: $EXPECT"
+    if [ -n "$GOT" ] && [ "$GOT" = "$EXPECT" ]; then
+        echo "check-unicode: OK ($TYPE_TEXT round-tripped)"
+    else
+        echo "check-unicode: FAIL"
         PASS=0
     fi
 fi
