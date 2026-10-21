@@ -212,6 +212,8 @@ pub struct App {
     clipboard: Option<arboard::Clipboard>,
     /// Cursor mirroring the remote pointer, applied to every window.
     custom_cursor: Option<winit::window::CustomCursor>,
+    /// Numbered cursor dumps under XCOM_DEBUG.
+    cursor_seq: u32,
     dump: Option<PathBuf>,
     dump_seq: u32,
     fullscreen: bool,
@@ -265,6 +267,7 @@ impl App {
             plain_chars: HashMap::new(),
             clipboard,
             custom_cursor: None,
+            cursor_seq: 0,
             dump,
             dump_seq: 0,
             fullscreen,
@@ -746,6 +749,9 @@ impl ApplicationHandler<UserEvent> for App {
                 h,
                 pixels,
             } => {
+                if xcom_proto::debug() {
+                    self.dump_cursor(w, h, xhot, yhot, &pixels);
+                }
                 let rgba = cursor_rgba(&pixels);
                 let hx = xhot.min(w.saturating_sub(1));
                 let hy = yhot.min(h.saturating_sub(1));
@@ -1086,6 +1092,45 @@ fn x11_button(b: MouseButton) -> u8 {
         MouseButton::Back => 8,
         MouseButton::Forward => 9,
         MouseButton::Other(n) => n as u8,
+    }
+}
+
+impl App {
+    /// Debug aid: print the alpha mask and write a PPM of a received cursor.
+    fn dump_cursor(&mut self, w: u16, h: u16, xhot: u16, yhot: u16, pixels: &[u32]) {
+        let mut art = String::new();
+        for y in 0..h {
+            for x in 0..w {
+                let a = (pixels[y as usize * w as usize + x as usize] >> 24) as u8;
+                art.push(if a > 128 {
+                    '#'
+                } else if a > 0 {
+                    ':'
+                } else {
+                    '.'
+                });
+            }
+            art.push('\n');
+        }
+        eprintln!("[ui] cursor image {w}x{h} hot=({xhot},{yhot}):\n{art}");
+        let rgba = cursor_rgba(pixels);
+        let mut ppm = Vec::with_capacity(w as usize * h as usize * 3 + 32);
+        ppm.extend_from_slice(format!("P6\n{w} {h}\n255\n").as_bytes());
+        for px in rgba.chunks_exact(4) {
+            let a = px[3] as u32;
+            let blend = |c: u8| ((c as u32 * a + 255 * (255 - a)) / 255) as u8;
+            ppm.extend_from_slice(&[blend(px[0]), blend(px[1]), blend(px[2])]);
+        }
+        self.cursor_seq += 1;
+        let base = self
+            .dump
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("/tmp/xcom-cursor.ppm"));
+        let path = base.with_extension(format!("cursor{}.ppm", self.cursor_seq));
+        match std::fs::write(&path, &ppm) {
+            Ok(()) => eprintln!("[ui] cursor dumped to {}", path.display()),
+            Err(e) => eprintln!("[ui] cannot dump cursor: {e}"),
+        }
     }
 }
 

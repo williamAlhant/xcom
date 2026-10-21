@@ -152,7 +152,15 @@ pub fn run(args: ServeArgs) -> Result<()> {
     };
 
     // --- capture session -------------------------------------------------
-    let mut session = CaptureSession::connect(Some(&display), CaptureConfig::default())?;
+    // Only set the root arrow when we own the display; attaching to a real
+    // session must not change its cursor.
+    let mut session = CaptureSession::connect(
+        Some(&display),
+        CaptureConfig {
+            root_arrow: args.display.is_none(),
+            ..Default::default()
+        },
+    )?;
     let root = session.root();
     for t in windows::list_top_levels(session.connection().as_ref(), root, true)? {
         if t.mapped {

@@ -20,6 +20,8 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
+use x11rb::connection::Connection as _;
+use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _, PropMode};
 
 pub struct Xvfb {
     pub display: String,
@@ -130,6 +132,23 @@ impl Xvfb {
             }
             if x11rb::connect(Some(display.as_str())).is_ok() {
                 if socket_is_fresh(&display, spawned_after) {
+                    // Bare X servers have no XSETTINGS manager, so GTK falls
+                    // back to the core X cursor. libXcursor reads these
+                    // resources for every client; set them before apps start.
+                    if let Ok((conn, screen)) = x11rb::connect(Some(display.as_str())) {
+                        let root = conn.setup().roots[screen].root;
+                        let res = b"Xcursor.theme: Adwaita\nXcursor.size: 24\n";
+                        let _ = conn.change_property(
+                            PropMode::REPLACE,
+                            root,
+                            AtomEnum::RESOURCE_MANAGER,
+                            AtomEnum::STRING,
+                            8,
+                            res.len() as u32,
+                            res,
+                        );
+                        let _ = conn.flush();
+                    }
                     return Ok(Xvfb {
                         display,
                         log,

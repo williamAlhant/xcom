@@ -132,6 +132,13 @@ fn main() -> Result<()> {
             let r = conn.get_input_focus()?.reply()?;
             println!("focus={:#x} revert={:?}", r.focus, r.revert_to);
         }
+        "move" => {
+            let x: i16 = args.next().context("move needs x")?.parse()?;
+            let y: i16 = args.next().context("move needs y")?.parse()?;
+            conn.xtest_fake_input(6, 0, Timestamp::from(0u32), root, x, y, 0)?
+                .check()?;
+            conn.flush()?;
+        }
         "pointer" => {
             let r = conn.query_pointer(root)?.reply()?;
             println!("pointer root=({},{}) child={:#x}", r.root_x, r.root_y, r.child);

@@ -379,6 +379,7 @@ fn capture(args: CaptureArgs) -> Result<()> {
             DamageArg::NonEmpty => DamageMode::NonEmpty,
         },
         max_rects: args.max_rects,
+        root_arrow: true,
     };
     let mut cap = CaptureSession::from_connection(conn, screen_num, cfg)?;
     let (_, _, win_w, win_h) = cap

@@ -48,6 +48,10 @@ pub enum DamageMode {
 pub struct CaptureConfig {
     pub mode: DamageMode,
     pub max_rects: usize,
+    /// Point the root window at the classic left_ptr arrow. A bare X server
+    /// has no desktop to do it, and widgets without their own cursor inherit
+    /// the root cursor (which is otherwise the X glyph).
+    pub root_arrow: bool,
 }
 
 impl Default for CaptureConfig {
@@ -55,6 +59,7 @@ impl Default for CaptureConfig {
         Self {
             mode: DamageMode::NonEmpty,
             max_rects: 32,
+            root_arrow: true,
         }
     }
 }
@@ -182,6 +187,13 @@ impl CaptureSession {
             root,
             &xproto::ChangeWindowAttributesAux::new().event_mask(EventMask::SUBSTRUCTURE_NOTIFY),
         )?;
+
+        if cfg.root_arrow {
+            // Must happen before the initial cursor is read below.
+            set_root_arrow(&conn, root).unwrap_or_else(|e| {
+                eprintln!("[capture] root cursor: {e:#}");
+            });
+        }
 
         // Pointer shape changes (XFixes): the client mirrors them locally.
         conn.xfixes_select_cursor_input(root, xfixes::CursorNotifyMask::DISPLAY_CURSOR)?;
@@ -753,6 +765,29 @@ impl Drop for CaptureSession {
         }
         let _ = self.conn.flush();
     }
+}
+
+/// Set the classic X left_ptr arrow as the root cursor.
+///
+/// The cursor resource must live on a long-lived connection: X frees a
+/// client's resources when it disconnects, which would reset the root cursor.
+fn set_root_arrow(conn: &RustConnection, root: Window) -> Result<()> {
+    let font: xproto::Font = conn.generate_id()?;
+    conn.open_font(font, b"cursor")?.check()?;
+    let cid: xproto::Cursor = conn.generate_id()?;
+    // Cursor font glyphs come in source/mask pairs; left_ptr is 68/69.
+    conn.create_glyph_cursor(
+        cid, font, font, 68, 69, 0xffff, 0xffff, 0xffff, 0, 0, 0,
+    )?
+    .check()?;
+    conn.change_window_attributes(
+        root,
+        &xproto::ChangeWindowAttributesAux::new().cursor(cid),
+    )?
+    .check()?;
+    conn.close_font(font)?.check()?;
+    conn.flush()?;
+    Ok(())
 }
 
 /// Create a SysV shared memory segment, attach it locally and with the server.
