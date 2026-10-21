@@ -17,6 +17,97 @@ pub struct TopLevel {
     pub name: String,
 }
 
+/// Window classification for the mini-WM: what kind of top-level this is,
+/// which window it belongs to, and whether the app manages it itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowInfo {
+    pub kind: u8,
+    pub parent: Option<Window>,
+    pub override_redirect: bool,
+}
+
+fn atom<C: Connection>(conn: &C, name: &[u8]) -> Option<u32> {
+    conn.intern_atom(false, name).ok()?.reply().ok().map(|r| r.atom)
+}
+
+/// Classify a window from `override_redirect`, `_NET_WM_WINDOW_TYPE` and
+/// `WM_TRANSIENT_FOR`. Unknown/absent types fall back to normal; bare
+/// override-redirect windows are treated as popups (menus/tooltips).
+pub fn window_info<C: Connection>(conn: &C, win: Window) -> WindowInfo {
+    let override_redirect = conn
+        .get_window_attributes(win)
+        .ok()
+        .and_then(|c| c.reply().ok())
+        .map(|a| a.override_redirect)
+        .unwrap_or(false);
+
+    let parent = atom(conn, b"WM_TRANSIENT_FOR").and_then(|a| {
+        let reply = conn
+            .get_property(false, win, a, AtomEnum::WINDOW, 0, 1)
+            .ok()?
+            .reply()
+            .ok()?;
+        reply
+            .value32()
+            .and_then(|mut it| it.next())
+            .filter(|w| *w != 0)
+    });
+
+    let mut kind = None;
+    if let Some(type_atom) = atom(conn, b"_NET_WM_WINDOW_TYPE") {
+        let types = conn
+            .get_property(false, win, type_atom, AtomEnum::ATOM, 0, 16)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .and_then(|r| r.value32().map(|it| it.collect::<Vec<u32>>()));
+        if let Some(types) = types {
+            {
+                let dialog = atom(conn, b"_NET_WM_WINDOW_TYPE_DIALOG");
+                let menu = atom(conn, b"_NET_WM_WINDOW_TYPE_MENU");
+                let dropdown = atom(conn, b"_NET_WM_WINDOW_TYPE_DROPDOWN_MENU");
+                let popup = atom(conn, b"_NET_WM_WINDOW_TYPE_POPUP_MENU");
+                let combo = atom(conn, b"_NET_WM_WINDOW_TYPE_COMBO");
+                let tooltip = atom(conn, b"_NET_WM_WINDOW_TYPE_TOOLTIP");
+                let utility = atom(conn, b"_NET_WM_WINDOW_TYPE_UTILITY");
+                let toolbar = atom(conn, b"_NET_WM_WINDOW_TYPE_TOOLBAR");
+                let splash = atom(conn, b"_NET_WM_WINDOW_TYPE_SPLASH");
+                let normal = atom(conn, b"_NET_WM_WINDOW_TYPE_NORMAL");
+                for t in types {
+                    let t = Some(t);
+                    if t == dialog {
+                        kind = Some(xcom_proto::KIND_DIALOG);
+                    } else if t == menu || t == dropdown || t == popup || t == combo {
+                        kind = Some(xcom_proto::KIND_MENU);
+                    } else if t == tooltip {
+                        kind = Some(xcom_proto::KIND_TOOLTIP);
+                    } else if t == utility || t == toolbar {
+                        kind = Some(xcom_proto::KIND_UTILITY);
+                    } else if t == splash {
+                        kind = Some(xcom_proto::KIND_SPLASH);
+                    } else if t == normal {
+                        kind = Some(xcom_proto::KIND_NORMAL);
+                    }
+                    if kind.is_some() {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    let kind = kind.unwrap_or(if override_redirect {
+        xcom_proto::KIND_MENU
+    } else {
+        xcom_proto::KIND_NORMAL
+    });
+
+    WindowInfo {
+        kind,
+        parent,
+        override_redirect,
+    }
+}
+
 /// Children of `root` that look like application top-levels.
 ///
 /// Override-redirect windows (menus, tooltips, drags) are excluded unless

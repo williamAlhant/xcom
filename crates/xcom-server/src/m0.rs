@@ -45,6 +45,8 @@ pub enum Cmd {
     InputTest(InputTestArgs),
     /// Draw/erase a small cell through the real capture path and check pixels.
     Selftest(SelftestArgs),
+    /// Mini-WM demo: normal window, transient dialog, override-redirect menu.
+    WmDemo(WmDemoArgs),
 }
 
 pub fn run(args: Args) -> Result<()> {
@@ -54,6 +56,7 @@ pub fn run(args: Args) -> Result<()> {
         Cmd::Sink(a) => sink(a),
         Cmd::InputTest(a) => input_test(a),
         Cmd::Selftest(a) => selftest(a),
+        Cmd::WmDemo(a) => wm_demo(a),
     }
 }
 
@@ -1017,5 +1020,133 @@ fn input_test(args: InputTestArgs) -> Result<()> {
     if missing > 0 {
         bail!("{missing} injected keys did not arrive as typed");
     }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// wm-demo
+// ---------------------------------------------------------------------------
+
+#[derive(clap::Args)]
+pub struct WmDemoArgs {
+    /// X display; defaults to $DISPLAY.
+    #[arg(long, default_value = "")]
+    pub display: String,
+    /// How long to keep the windows up.
+    #[arg(long, default_value_t = 20)]
+    pub seconds: u64,
+}
+
+fn wm_demo(args: WmDemoArgs) -> Result<()> {
+    use x11rb::protocol::xproto::{
+        AtomEnum, CreateGCAux, PropMode, Rectangle, WindowClass,
+    };
+
+    let display = if args.display.is_empty() {
+        std::env::var("DISPLAY").unwrap_or_else(|_| ":9".into())
+    } else {
+        args.display
+    };
+    let (conn, screen) = x11rb::connect(Some(&display))?;
+    let root = conn.setup().roots[screen].root;
+    let atom = |name: &[u8]| -> Result<u32> {
+        Ok(conn.intern_atom(false, name)?.reply()?.atom)
+    };
+    let net_wm_type = atom(b"_NET_WM_WINDOW_TYPE")?;
+    let type_dialog = atom(b"_NET_WM_WINDOW_TYPE_DIALOG")?;
+    let type_menu = atom(b"_NET_WM_WINDOW_TYPE_POPUP_MENU")?;
+    let transient_for = atom(b"WM_TRANSIENT_FOR")?;
+
+    let make = |w: u16, h: u16, x: i16, y: i16, bg: u32, or: bool| -> Result<Window> {
+        let win: Window = conn.generate_id()?;
+        conn.create_window(
+            0,
+            win,
+            root,
+            x,
+            y,
+            w,
+            h,
+            0,
+            WindowClass::INPUT_OUTPUT,
+            x11rb::COPY_FROM_PARENT,
+            &CreateWindowAux::new()
+                .background_pixel(bg)
+                .override_redirect(or.then_some(1u32))
+                .event_mask(EventMask::EXPOSURE),
+        )?;
+        Ok(win)
+    };
+    let set_title = |win: Window, title: &str| -> Result<()> {
+        conn.change_property(
+            PropMode::REPLACE,
+            win,
+            AtomEnum::WM_NAME,
+            AtomEnum::STRING,
+            8,
+            title.len() as u32,
+            title.as_bytes(),
+        )?;
+        Ok(())
+    };
+    let set_prop_atom = |win: Window, prop: u32, value: u32| -> Result<()> {
+        conn.change_property(PropMode::REPLACE, win, prop, AtomEnum::ATOM, 32, 1, &value.to_le_bytes())?;
+        Ok(())
+    };
+
+    let main: Window = make(320, 200, 80, 60, 0x00204080, false)?;
+    set_title(main, "wm-demo main")?;
+    let dialog: Window = make(220, 120, 0, 0, 0x00408020, false)?;
+    set_title(dialog, "wm-demo dialog")?;
+    set_prop_atom(dialog, net_wm_type, type_dialog)?;
+    conn.change_property(
+        PropMode::REPLACE,
+        dialog,
+        transient_for,
+        AtomEnum::WINDOW,
+        32,
+        1,
+        &main.to_le_bytes(),
+    )?;
+    let menu: Window = make(160, 80, 130, 100, 0x00802020, true)?;
+    set_title(menu, "wm-demo menu")?;
+    set_prop_atom(menu, net_wm_type, type_menu)?;
+    // Menus often omit this; set it so placement is deterministic here.
+    conn.change_property(
+        PropMode::REPLACE,
+        menu,
+        transient_for,
+        AtomEnum::WINDOW,
+        32,
+        1,
+        &main.to_le_bytes(),
+    )?;
+
+    conn.map_window(main)?;
+    conn.flush()?;
+    std::thread::sleep(Duration::from_millis(400));
+    conn.map_window(dialog)?;
+    conn.flush()?;
+    std::thread::sleep(Duration::from_millis(400));
+    conn.map_window(menu)?;
+    conn.flush()?;
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Distinct content so the windows are visibly different (and non-empty).
+    let gc: Gcontext = conn.generate_id()?;
+    conn.create_gc(gc, main, &CreateGCAux::new().foreground(0x00ffffff))?;
+    conn.poly_fill_rectangle(main, gc, &[Rectangle { x: 20, y: 20, width: 120, height: 60 }])?;
+    let gc2: Gcontext = conn.generate_id()?;
+    conn.create_gc(gc2, dialog, &CreateGCAux::new().foreground(0x00ffff00))?;
+    conn.poly_fill_rectangle(dialog, gc2, &[Rectangle { x: 30, y: 30, width: 80, height: 40 }])?;
+    let gc3: Gcontext = conn.generate_id()?;
+    conn.create_gc(gc3, menu, &CreateGCAux::new().foreground(0x00ffffff))?;
+    conn.poly_fill_rectangle(menu, gc3, &[Rectangle { x: 10, y: 10, width: 140, height: 20 }])?;
+    conn.flush()?;
+
+    eprintln!(
+        "[wm-demo] main={main:#x} dialog={dialog:#x} menu={menu:#x} display={display}"
+    );
+    std::thread::sleep(Duration::from_secs(args.seconds));
     Ok(())
 }

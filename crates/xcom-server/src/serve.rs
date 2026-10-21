@@ -102,6 +102,9 @@ fn die_with_parent(cmd: &mut Command) {
     unsafe {
         cmd.pre_exec(|| {
             libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+            // Own process group: teardown can kill grandchildren spawned by
+            // the shell (e.g. `xterm & xterm & wait`) instead of orphaning them.
+            libc::setpgid(0, 0);
             Ok(())
         });
     }
@@ -266,6 +269,7 @@ pub fn run(args: ServeArgs) -> Result<()> {
         };
         let title =
             windows::window_name(session.connection().as_ref(), win).unwrap_or_default();
+        let info = windows::window_info(session.connection().as_ref(), win);
         geo.lock().unwrap().insert(win, (x, y, w, h));
         let msg = Message::WindowCreate {
             id: win,
@@ -274,6 +278,9 @@ pub fn run(args: ServeArgs) -> Result<()> {
             w,
             h,
             title,
+            kind: info.kind,
+            parent: info.parent.unwrap_or(0),
+            override_redirect: info.override_redirect,
         };
         if ctrl_tx.send(msg).is_err() {
             break;
@@ -305,6 +312,26 @@ pub fn run(args: ServeArgs) -> Result<()> {
 
     shutdown.store(true, Ordering::SeqCst);
     if let Some(mut app) = app.take() {
+        #[cfg(target_os = "linux")]
+        {
+            let pid = app.id() as i32;
+            // The app is its own process-group leader (setpgid in pre_exec):
+            // signal the whole group, then force it after a short grace.
+            unsafe {
+                libc::kill(-pid, libc::SIGTERM);
+            }
+            let deadline = Instant::now() + Duration::from_millis(300);
+            while Instant::now() < deadline {
+                match app.try_wait() {
+                    Ok(Some(_)) => break,
+                    Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+                    Err(_) => break,
+                }
+            }
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
+        }
         let _ = app.kill();
         let _ = app.wait();
     }
@@ -649,17 +676,38 @@ fn serve_loop(
             }
             Some(PumpEvent::Mapped(win)) => {
                 if let Some((x, y, w, h)) = session.window_geometry(win) {
+                    let mut info = windows::window_info(session.connection().as_ref(), win);
+                    // Menus/tooltips often omit WM_TRANSIENT_FOR. Their parent
+                    // is, for placement purposes, the window that had focus
+                    // when they popped up.
+                    if info.parent.is_none() && info.override_redirect {
+                        if let Some(focus) = session
+                            .connection()
+                            .get_input_focus()
+                            .ok()
+                            .and_then(|c| c.reply().ok())
+                            .map(|r| r.focus)
+                        {
+                            if session.tracked(focus) {
+                                info.parent = Some(focus);
+                            }
+                        }
+                    }
                     // No WM on this display: give new windows keyboard focus,
                     // or XTEST keystrokes go to whatever the pointer is over.
-                    session
-                        .connection()
-                        .set_input_focus(
-                            xproto::InputFocus::PARENT,
-                            win,
-                            xproto::Timestamp::from(0u32),
-                        )
-                        .map_err(|e| anyhow::anyhow!("set_input_focus: {e}"))?;
-                    session.connection().flush().ok();
+                    // Override-redirect popups (menus, tooltips) rely on grabs
+                    // and must not have focus moved to them.
+                    if !info.override_redirect {
+                        session
+                            .connection()
+                            .set_input_focus(
+                                xproto::InputFocus::PARENT,
+                                win,
+                                xproto::Timestamp::from(0u32),
+                            )
+                            .map_err(|e| anyhow::anyhow!("set_input_focus: {e}"))?;
+                        session.connection().flush().ok();
+                    }
                     geo.lock().unwrap().insert(win, (x, y, w, h));
                     if announced.insert(win) {
                         let title = windows::window_name(
@@ -667,6 +715,14 @@ fn serve_loop(
                             win,
                         )
                         .unwrap_or_default();
+                        if xcom_proto::debug() {
+                            logln!(
+                                "[serve] mapped {win:#x} kind={} parent={:?} override={}",
+                                info.kind,
+                                info.parent,
+                                info.override_redirect
+                            );
+                        }
                         ctrl_tx
                             .send(Message::WindowCreate {
                                 id: win,
@@ -675,6 +731,9 @@ fn serve_loop(
                                 w,
                                 h,
                                 title,
+                                kind: info.kind,
+                                parent: info.parent.unwrap_or(0),
+                                override_redirect: info.override_redirect,
                             })
                             .ok();
                     } else {

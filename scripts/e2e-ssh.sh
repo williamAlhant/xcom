@@ -16,6 +16,7 @@
 #   CHECK_RESIZE=1  assert one user resize does not start a resize ping-pong
 #   CHECK_CLOSE=1   close one of two windows; the session must keep the other
 #   CHECK_UNICODE=1 type non-ASCII text and compare the exact UTF-8 bytes
+#   CHECK_WM=1      normal window + transient dialog + override-redirect menu
 #   CHECK_TEARDOWN=0  skip the no-zombie check after the client exits
 #   CLOSE_AFTER=N   seconds after start to close one window (test aid)
 #   XCOM_DEBUG=1 protocol/input tracing (client and daemon)
@@ -43,6 +44,10 @@ if [ "${CHECK_UNICODE:-0}" = 1 ]; then
     APP="xterm -T xterm -geometry 80x24 -e sh -c 'stty raw -echo; cat > /tmp/unicode.txt'"
     TYPE_TEXT=${UNICODE_TEXT:-éàéàéà}
     podman exec xcom-testvm rm -f /tmp/unicode.txt 2>/dev/null || true
+fi
+
+if [ "${CHECK_WM:-0}" = 1 ]; then
+    APP="xcomd m0 wm-demo --seconds 20"
 fi
 
 "$REPO/scripts/testvm.sh" up
@@ -109,6 +114,25 @@ if [ "${CHECK_CLOSE:-0}" = 1 ]; then
     fi
 fi
 
+if [ "${CHECK_WM:-0}" = 1 ]; then
+    echo "--- mini-WM check ---"
+    OPENED=$(grep -c 'window .* opened' "$OUT/client-ssh.log" || true)
+    KINDS=$(grep -o 'kind=[0-9]*' "$OUT/client-ssh.log" | tr '\n' ' ')
+    DIALOG=$(grep 'kind=1' "$OUT/client-ssh.log" | head -1)
+    MENU=$(grep 'kind=2' "$OUT/client-ssh.log" | head -1)
+    echo "opened=$OPENED kinds=[$KINDS]"
+    echo "dialog: $DIALOG"
+    echo "menu:   $MENU"
+    if [ "$OPENED" -eq 3 ] \
+        && echo "$DIALOG" | grep -q 'parent=0x[1-9a-f]' \
+        && echo "$MENU" | grep -q 'override=true'; then
+        echo "check-wm: OK (normal + transient dialog + override menu)"
+    else
+        echo "check-wm: FAIL"
+        PASS=0
+    fi
+fi
+
 if [ "${CHECK_UNICODE:-0}" = 1 ]; then
     echo "--- unicode check ---"
     GOT=$(podman exec xcom-testvm od -An -tx1 -v /tmp/unicode.txt 2>/dev/null | tr -d ' \n')
@@ -126,7 +150,8 @@ fi
 if [ "${CHECK_TEARDOWN:-1}" = 1 ]; then
     echo "--- teardown check ---"
     sleep 1
-    LEFT_DAEMON=$(podman exec xcom-testvm sh -c "pgrep -x xcomd || true" | tr -d '\r')
+    # Only the daemon counts: the exec'd app is also named xcomd.
+    LEFT_DAEMON=$(podman exec xcom-testvm sh -c "ps -eo args | grep '^xcomd serve' || true" | tr -d '\r')
     LEFT_XVFB=$(podman exec xcom-testvm sh -c "pgrep -x Xvfb || true" | tr -d '\r')
     if [ -n "$LEFT_DAEMON$LEFT_XVFB" ]; then
         echo "check-teardown: FAIL (daemon='$LEFT_DAEMON' xvfb='$LEFT_XVFB' left behind)"

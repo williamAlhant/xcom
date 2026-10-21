@@ -11,7 +11,18 @@
 //! (the M0 harness and the e2e key-latency check rely on that); other targets
 //! fall back to the system clock so this crate still builds for Windows.
 
-pub const PROTO_VERSION: u16 = 2;
+pub const PROTO_VERSION: u16 = 3;
+
+// Window kinds (server -> client), derived from _NET_WM_WINDOW_TYPE,
+// WM_TRANSIENT_FOR and override_redirect.
+pub const KIND_NORMAL: u8 = 0;
+pub const KIND_DIALOG: u8 = 1;
+pub const KIND_MENU: u8 = 2;
+pub const KIND_TOOLTIP: u8 = 3;
+/// Toolbars/palettes/utility windows.
+pub const KIND_UTILITY: u8 = 4;
+pub const KIND_SPLASH: u8 = 5;
+pub const KIND_OTHER: u8 = 6;
 
 /// Pre-authentication frames (the hello) are tiny; anything larger is hostile.
 pub const MAX_HELLO_LEN: usize = 64;
@@ -246,6 +257,12 @@ pub enum Message {
         w: u16,
         h: u16,
         title: String,
+        /// One of the `KIND_*` constants.
+        kind: u8,
+        /// `WM_TRANSIENT_FOR` parent (0 when none).
+        parent: u32,
+        /// Override-redirect windows (menus, tooltips) must not steal focus.
+        override_redirect: bool,
     },
     WindowDestroy {
         id: u32,
@@ -386,6 +403,9 @@ impl Message {
                 w,
                 h,
                 title,
+                kind,
+                parent,
+                override_redirect,
             } => {
                 put_u32(&mut out, *id);
                 put_i16(&mut out, *x);
@@ -394,6 +414,9 @@ impl Message {
                 put_u16(&mut out, *h);
                 put_u16(&mut out, title.len() as u16);
                 out.extend_from_slice(title.as_bytes());
+                put_u32(&mut out, *parent);
+                out.push(*kind);
+                out.push(*override_redirect as u8);
             }
             Message::WindowDestroy { id } => put_u32(&mut out, *id),
             Message::WindowUnmapped { id } | Message::WindowMapped { id } | Message::WindowClose { id } => {
@@ -451,6 +474,9 @@ impl Message {
                 w: take_u16(&mut p)?,
                 h: take_u16(&mut p)?,
                 title: take_str(&mut p)?,
+                parent: take_u32(&mut p)?,
+                kind: take(&mut p, 1)?[0],
+                override_redirect: take(&mut p, 1)?[0] != 0,
             },
             MSG_WINDOW_DESTROY => Message::WindowDestroy {
                 id: take_u32(&mut p)?,
@@ -736,6 +762,9 @@ mod tests {
                 w: 800,
                 h: 600,
                 title: "xterm — ü".to_string(),
+                kind: KIND_DIALOG,
+                parent: 3,
+                override_redirect: true,
             },
             Message::WindowDestroy { id: 7 },
             Message::WindowUnmapped { id: 7 },

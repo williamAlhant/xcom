@@ -41,6 +41,9 @@ pub enum UserEvent {
         w: u16,
         h: u16,
         title: String,
+        kind: u8,
+        parent: u32,
+        override_redirect: bool,
     },
     Geometry {
         id: u32,
@@ -85,6 +88,10 @@ struct Pixels {
     title: String,
     x: i16,
     y: i16,
+    /// Mini-WM metadata from `WindowCreate`.
+    kind: u8,
+    parent: u32,
+    override_redirect: bool,
 }
 
 impl Pixels {
@@ -96,6 +103,9 @@ impl Pixels {
             title: String::new(),
             x: 0,
             y: 0,
+            kind: xcom_proto::KIND_NORMAL,
+            parent: 0,
+            override_redirect: false,
         }
     }
 
@@ -161,6 +171,11 @@ struct Attached {
     /// Size the server last told us (to tell user resizes from echo resizes).
     remote: (u16, u16),
     cursor: (i16, i16),
+    /// Override-redirect popups must not move the remote input focus.
+    override_redirect: bool,
+    /// Position we asked the compositor for (and the last known one). Wayland
+    /// has no global positions, so parent-relative placement uses this.
+    placed: (i32, i32),
 }
 
 pub struct App {
@@ -295,6 +310,9 @@ impl App {
                     title: String::new(),
                     x: 0,
                     y: 0,
+                    kind: xcom_proto::KIND_NORMAL,
+                    parent: 0,
+                    override_redirect: false,
                 };
                 let _ = std::fs::write(&screen_path, ppm_bytes(spix.w, spix.h, &spix.buf));
                 // Compare RGB only: readback may set an alpha byte our store
@@ -338,8 +356,34 @@ impl App {
         } else {
             format!("{} — xcom", pix.title)
         };
+        let (kind, parent, override_redirect) = (pix.kind, pix.parent, pix.override_redirect);
+        // Mini-WM placement: dialogs asking for (0,0) are centered on their
+        // parent; popups keep their offset from the parent (menus); otherwise
+        // offset from the remote position as before.
+        let mut x = (pix.x as i32).max(0) + 32;
+        let mut y = (pix.y as i32).max(0) + 32;
+        if let Some(att) = self.attached.get(&parent) {
+            let pp = att
+                .window
+                .outer_position()
+                .map(|p| (p.x, p.y))
+                .unwrap_or(att.placed);
+            if kind == xcom_proto::KIND_DIALOG && pix.x == 0 && pix.y == 0 {
+                x = pp.0 + (att.local.0 as i32 - w as i32) / 2;
+                y = pp.1 + (att.local.1 as i32 - h as i32) / 2;
+            } else if override_redirect || kind == xcom_proto::KIND_MENU {
+                if let Some(ppix) = self.pixels.get(&parent) {
+                    x = pp.0 + pix.x as i32 - ppix.x as i32;
+                    y = pp.1 + pix.y as i32 - ppix.y as i32;
+                }
+            }
+        }
+        let placed = (x, y);
         let attrs = Window::default_attributes()
             .with_title(title)
+            // Menus/tooltips are chrome-less; dialogs keep decorations.
+            .with_decorations(!override_redirect)
+            .with_resizable(!override_redirect)
             .with_fullscreen(if self.fullscreen {
                 Some(winit::window::Fullscreen::Borderless(None))
             } else {
@@ -347,10 +391,7 @@ impl App {
             })
             // 1:1 pixel mapping for now; DPI-aware scaling lands with M3.
             .with_inner_size(PhysicalSize::new(w, h))
-            .with_position(winit::dpi::PhysicalPosition::new(
-                (pix.x as i32).max(0) + 32,
-                (pix.y as i32).max(0) + 32,
-            ));
+            .with_position(winit::dpi::PhysicalPosition::new(x, y));
         let Ok(window) = el.create_window(attrs) else {
             return;
         };
@@ -372,12 +413,17 @@ impl App {
             eprintln!("[ui] window {id:#x}: surface resize {w}x{h} failed: {e}");
         }
         eprintln!(
-            "[ui] window {id:#x} opened {w}x{h} (backend: {:?})",
+            "[ui] window {id:#x} opened {w}x{h} at ({x},{y}) kind={kind} parent={parent:#x} override={override_redirect} (backend: {:?})",
             window
                 .window_handle()
                 .map(|h| format!("{:?}", h.as_raw()))
                 .unwrap_or_else(|e| format!("unknown: {e}"))
         );
+        // Dialogs should come to the front; popups are raised too, but their
+        // Focused event does not move the remote X input focus.
+        if override_redirect || kind == xcom_proto::KIND_DIALOG || kind == xcom_proto::KIND_MENU {
+            window.focus_window();
+        }
         self.by_winit.insert(window.id(), id);
         self.attached.insert(
             id,
@@ -387,6 +433,8 @@ impl App {
                 local: (w, h),
                 remote: (pix.w, pix.h),
                 cursor: (0, 0),
+                override_redirect,
+                placed,
             },
         );
         // Paint immediately (black + whatever content already arrived) and ask
@@ -496,6 +544,9 @@ impl ApplicationHandler<UserEvent> for App {
                 w,
                 h,
                 title,
+                kind,
+                parent,
+                override_redirect,
             } => {
                 if !sane_size(w, h) {
                     eprintln!("[ui] window {id:#x} rejected: implausible size {w}x{h}");
@@ -506,6 +557,9 @@ impl ApplicationHandler<UserEvent> for App {
                 pix.x = x;
                 pix.y = y;
                 pix.title = title;
+                pix.kind = kind;
+                pix.parent = parent;
+                pix.override_redirect = override_redirect;
                 // If the size came from a frame first, trust the create message.
                 pix.resize(w, h);
                 if self.attached.contains_key(&id) {
@@ -604,6 +658,11 @@ impl ApplicationHandler<UserEvent> for App {
             return;
         };
         match event {
+            WindowEvent::Moved(pos) => {
+                if let Some(att) = self.attached.get_mut(&remote) {
+                    att.placed = (pos.x, pos.y);
+                }
+            }
             WindowEvent::CloseRequested => {
                 // Close just this remote window (WM_DELETE_REQUEST); the
                 // session ends when the last one is destroyed.
@@ -718,6 +777,16 @@ impl ApplicationHandler<UserEvent> for App {
                             pressed: false,
                         });
                     }
+                    return;
+                }
+                // Popups rely on the app's own grabs; moving the remote input
+                // focus to a menu breaks its keyboard handling.
+                if self
+                    .attached
+                    .get(&remote)
+                    .map(|a| a.override_redirect)
+                    .unwrap_or(false)
+                {
                     return;
                 }
                 // Keyboard focus follows OS window focus: without a WM on the

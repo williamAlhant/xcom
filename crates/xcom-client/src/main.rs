@@ -430,6 +430,9 @@ fn control_loop(
                         w,
                         h,
                         title,
+                        kind,
+                        parent,
+                        override_redirect,
                     } => Some(UserEvent::Open {
                         id,
                         x,
@@ -437,6 +440,9 @@ fn control_loop(
                         w,
                         h,
                         title,
+                        kind,
+                        parent,
+                        override_redirect,
                     }),
                     Message::WindowGeometry { id, x, y, w, h } => {
                         Some(UserEvent::Geometry { id, x, y, w, h })
