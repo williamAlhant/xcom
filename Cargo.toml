@@ -22,5 +22,18 @@ lz4_flex = "0.11"
 socket2 = "0.5"
 x11rb = { version = "0.13", features = ["composite", "damage", "shm", "xfixes", "xtest"] }
 
+# Local release builds keep debug info for usable backtraces. Shipping
+# artifacts strip it: scripts/build-static.sh passes
+# CARGO_PROFILE_RELEASE_DEBUG=false and STRIP=debuginfo; build-windows.sh sets
+# DEBUG=false (PE debug info would otherwise be a ~37 MB .pdb).
 [profile.release]
 debug = true
+
+# Fully stripped, LTO'd build for a small Linux client:
+#   cargo build --profile dist -p xcom-client
+[profile.dist]
+inherits = "release"
+debug = false
+strip = "symbols"
+lto = "thin"
+codegen-units = 1

@@ -27,6 +27,8 @@ podman run --rm \
     -v xcom-cargo-target:/build/target \
     -w /src \
     -e CARGO_TARGET_DIR=/build/target \
+    -e CARGO_PROFILE_RELEASE_DEBUG=false \
+    -e CARGO_PROFILE_RELEASE_STRIP=debuginfo \
     "$IMAGE" \
     sh -c "
         set -e
@@ -38,6 +40,6 @@ podman run --rm \
     "
 
 for b in $BINS; do
-    echo "--- dist/$b-linux-x86_64"
+    echo "--- dist/$b-linux-x86_64 ($(du -h "$REPO/dist/$b-linux-x86_64" | cut -f1))"
     file "$REPO/dist/$b-linux-x86_64" | cut -c1-110
 done
