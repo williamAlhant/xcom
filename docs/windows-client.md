@@ -58,6 +58,16 @@ cargo run -p xcom-x11 --example x11_input -- up 50
    held pressed Shift again and released it on key-up, flipping the remote
    modifier state. **Fix:** the injector tracks down keycodes and only releases
    modifiers it pressed itself.
+3. **Releases did not match presses.** A release event has no text, so it fell
+   back to `logical_key` — Wine's bogus named key. The press sent `q`, the
+   release sent `F17` (or nothing), so the remote key stayed down and the X
+   server auto-repeated it forever ("another key repeats" after a while).
+   **Fix:** the client remembers the keysym per physical key on press and uses
+   it for the release; losing OS focus releases everything still held.
+4. **Auto-repeat was forwarded on top of the server's own repeat.** Verified
+   on the remote Xvfb: a single XTEST press held for 1.5 s produced 25
+   characters. Local winit repeats are now ignored: the remote server repeats
+   a held key at its own rate.
 3. **Flaky display startup.** Killing Xvfb with SIGKILL left
    `/tmp/.X11-unix/X<n>` behind; `-displayfd` selects by lock file, so the next
    server picked the dead socket and failed to bind. The readiness connect could
@@ -72,8 +82,9 @@ cargo run -p xcom-x11 --example x11_input -- up 50
 | Check | Result |
 |---|---|
 | Window opens, xterm renders, pixel streaming | yes |
-| US keycodes 24/25/26, 10–13, 38 | remote received `qwe1234a` |
+| US keycodes 24/25/26, 10–13, 38 | remote received `qwe1234a`, unchanged 1.5 s later (no stuck key) |
 | Shift held across two `a` taps, then released | remote received `AAa` |
+| `a` held 1.2 s | ~17 repeats from the remote X server, then stable |
 | Client log | `logical_key` still shows Wine's bogus named keys; `sym` is correct |
 
 ## Not verified / caveats

@@ -175,6 +175,10 @@ pub struct App {
     /// A window has been opened at least once: used to distinguish "the last
     /// window was closed" from "nothing has arrived yet".
     ever_had_windows: bool,
+    /// Keysym sent for each physical key currently down. The release event has
+    /// no text and may carry a Wine-mangled logical key, so the only reliable
+    /// way to release the same key the press created is to remember it here.
+    held: HashMap<winit::keyboard::PhysicalKey, u32>,
     dump: Option<PathBuf>,
     dump_seq: u32,
     fullscreen: bool,
@@ -217,6 +221,7 @@ impl App {
             presents: 0,
             present_errors: 0,
             ever_had_windows: false,
+            held: HashMap::new(),
             dump,
             dump_seq: 0,
             fullscreen,
@@ -699,6 +704,15 @@ impl ApplicationHandler<UserEvent> for App {
                     eprintln!("[ui] focused={focused} (win {remote:#x})");
                 }
                 if !focused {
+                    // Releases may never arrive after losing OS focus; never
+                    // leave a remote key held (the X server would autorepeat it).
+                    let held: Vec<u32> = self.held.drain().map(|(_, sym)| sym).collect();
+                    for sym in held {
+                        self.send(Message::InputKey {
+                            sym,
+                            pressed: false,
+                        });
+                    }
                     return;
                 }
                 // Keyboard focus follows OS window focus: without a WM on the
@@ -707,11 +721,39 @@ impl ApplicationHandler<UserEvent> for App {
                 self.send(Message::Focus { window: remote });
             }
             WindowEvent::KeyboardInput { event, .. } => {
+                // The remote X server autorepeats a held XTEST key by itself;
+                // forwarding the local repeats too would double the rate.
+                if event.repeat {
+                    return;
+                }
+                let keysym = |event: &winit::event::KeyEvent| {
+                    crate::keys::text_keysym(event.text.as_deref())
+                        .or_else(|| keysym_for(&event.logical_key))
+                        .or_else(|| match event.physical_key {
+                            winit::keyboard::PhysicalKey::Code(code) => {
+                                keysym_for_physical(code)
+                            }
+                            _ => None,
+                        })
+                };
+                if event.state == ElementState::Released {
+                    // Use the keysym from the press: the release has no text
+                    // and Wine may report a bogus named key.
+                    let sym = self
+                        .held
+                        .remove(&event.physical_key)
+                        .or_else(|| keysym(&event));
+                    if let Some(sym) = sym {
+                        self.send(Message::InputKey {
+                            sym,
+                            pressed: false,
+                        });
+                    }
+                    return;
+                }
                 // Local hotkey (test aid): dump the store exactly when the user
-                // sees the artifact (not forwarded to the remote app). Opt-in,
-                // and never on auto-repeat.
+                // sees the artifact (not forwarded to the remote app). Opt-in.
                 if self.debug_tools
-                    && !event.repeat
                     && matches!(event.logical_key, winit::keyboard::Key::Named(
                         winit::keyboard::NamedKey::F12
                     ))
@@ -724,12 +766,7 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     return;
                 }
-                let sym = crate::keys::text_keysym(event.text.as_deref())
-                    .or_else(|| keysym_for(&event.logical_key))
-                    .or_else(|| match event.physical_key {
-                        winit::keyboard::PhysicalKey::Code(code) => keysym_for_physical(code),
-                        _ => None,
-                    });
+                let sym = keysym(&event);
                 if xcom_proto::debug_keys() {
                     eprintln!(
                         "[ui] key {:?} -> sym={} pressed={} text={:?}",
@@ -741,9 +778,10 @@ impl ApplicationHandler<UserEvent> for App {
                     );
                 }
                 if let Some(sym) = sym {
+                    self.held.insert(event.physical_key, sym);
                     self.send(Message::InputKey {
                         sym,
-                        pressed: event.state == ElementState::Pressed,
+                        pressed: true,
                     });
                 }
             }

@@ -44,6 +44,18 @@ fn main() -> Result<()> {
                 println!("keycode {kc}: {}", syms.join(" "));
             }
         }
+        "list" => {
+            let tree = conn.query_tree(root)?.reply()?;
+            for win in tree.children {
+                let name = conn
+                    .get_property(false, win, AtomEnum::WM_NAME, AtomEnum::ANY, 0, 1024)
+                    .ok()
+                    .and_then(|c| c.reply().ok())
+                    .map(|r| String::from_utf8_lossy(&r.value).into_owned())
+                    .unwrap_or_default();
+                println!("{win:#x} {name:?}");
+            }
+        }
         "focus" => {
             let needle = args.next().context("focus needs a title substring")?;
             let win = find_window(&conn, root, &needle)?.context("no window matched")?;
