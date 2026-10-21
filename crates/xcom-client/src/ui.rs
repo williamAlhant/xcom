@@ -341,6 +341,39 @@ impl App {
         }
     }
 
+    /// Where a window should live locally: dialogs asking for (0,0) are
+    /// centered on their parent, dialogs/popups keep their offset from the
+    /// parent, normal windows keep the +32 screen offset.
+    fn target_position(&self, id: u32, w: u16, h: u16) -> (i32, i32) {
+        let Some(pix) = self.pixels.get(&id) else {
+            return (32, 32);
+        };
+        let mut x = (pix.x as i32).max(0) + 32;
+        let mut y = (pix.y as i32).max(0) + 32;
+        if let Some(att) = self.attached.get(&pix.parent) {
+            // Wayland has no global positions; fall back to what we asked for.
+            let pp = att
+                .window
+                .outer_position()
+                .map(|p| (p.x, p.y))
+                .unwrap_or(att.placed);
+            if pix.kind == xcom_proto::KIND_DIALOG && pix.x == 0 && pix.y == 0 {
+                x = pp.0 + (att.local.0 as i32 - w as i32) / 2;
+                y = pp.1 + (att.local.1 as i32 - h as i32) / 2;
+            } else if pix.override_redirect
+                || pix.kind == xcom_proto::KIND_MENU
+                || pix.kind == xcom_proto::KIND_TOOLTIP
+                || pix.kind == xcom_proto::KIND_DIALOG
+            {
+                if let Some(ppix) = self.pixels.get(&pix.parent) {
+                    x = pp.0 + pix.x as i32 - ppix.x as i32;
+                    y = pp.1 + pix.y as i32 - ppix.y as i32;
+                }
+            }
+        }
+        (x, y)
+    }
+
     fn open_window(&mut self, el: &ActiveEventLoop, id: u32) {
         if self.attached.contains_key(&id) {
             return;
@@ -350,34 +383,21 @@ impl App {
         let Some(pix) = self.pixels.get(&id) else {
             return;
         };
-        let (w, h) = (pix.w.max(64), pix.h.max(64));
+        // Popups/menus must keep their real size: forcing 64x64 would draw
+        // black margins (or a black box for tiny helper windows). The minimum
+        // only exists to satisfy WM constraints for normal windows.
+        let (w, h) = if pix.override_redirect {
+            (pix.w.max(1), pix.h.max(1))
+        } else {
+            (pix.w.max(64), pix.h.max(64))
+        };
         let title = if pix.title.is_empty() {
             format!("xcom {id:#x}")
         } else {
             format!("{} — xcom", pix.title)
         };
         let (kind, parent, override_redirect) = (pix.kind, pix.parent, pix.override_redirect);
-        // Mini-WM placement: dialogs asking for (0,0) are centered on their
-        // parent; popups keep their offset from the parent (menus); otherwise
-        // offset from the remote position as before.
-        let mut x = (pix.x as i32).max(0) + 32;
-        let mut y = (pix.y as i32).max(0) + 32;
-        if let Some(att) = self.attached.get(&parent) {
-            let pp = att
-                .window
-                .outer_position()
-                .map(|p| (p.x, p.y))
-                .unwrap_or(att.placed);
-            if kind == xcom_proto::KIND_DIALOG && pix.x == 0 && pix.y == 0 {
-                x = pp.0 + (att.local.0 as i32 - w as i32) / 2;
-                y = pp.1 + (att.local.1 as i32 - h as i32) / 2;
-            } else if override_redirect || kind == xcom_proto::KIND_MENU {
-                if let Some(ppix) = self.pixels.get(&parent) {
-                    x = pp.0 + pix.x as i32 - ppix.x as i32;
-                    y = pp.1 + pix.y as i32 - ppix.y as i32;
-                }
-            }
-        }
+        let (x, y) = self.target_position(id, w, h);
         let placed = (x, y);
         let attrs = Window::default_attributes()
             .with_title(title)
@@ -589,9 +609,50 @@ impl ApplicationHandler<UserEvent> for App {
                     // Follow the app's size, but only when it really differs:
                     // asking the WM to round-trip a 1px change loops forever.
                     if !size_close(att.local, att.remote) {
+                        let (mw, mh) = if att.override_redirect {
+                            (w.max(1), h.max(1))
+                        } else {
+                            (w.max(64), h.max(64))
+                        };
                         let _ = att
                             .window
-                            .request_inner_size(PhysicalSize::new(w.max(64), h.max(64)));
+                            .request_inner_size(PhysicalSize::new(mw, mh));
+                    }
+                }
+                // Toolkits map popups first and move them into place right
+                // after; follow moves for dialogs/popups (normal windows are
+                // left where the user put them).
+                let is_popup = self
+                    .pixels
+                    .get(&id)
+                    .map(|p| {
+                        p.override_redirect
+                            || p.kind == xcom_proto::KIND_DIALOG
+                            || p.kind == xcom_proto::KIND_MENU
+                            || p.kind == xcom_proto::KIND_TOOLTIP
+                    })
+                    .unwrap_or(false);
+                if is_popup {
+                    let (lw, lh) = self
+                        .pixels
+                        .get(&id)
+                        .map(|p| {
+                            if p.override_redirect {
+                                (p.w.max(1), p.h.max(1))
+                            } else {
+                                (p.w.max(64), p.h.max(64))
+                            }
+                        })
+                        .unwrap_or((w, h));
+                    let (tx, ty) = self.target_position(id, lw, lh);
+                    if let Some(att) = self.attached.get_mut(&id) {
+                        if att.placed != (tx, ty) {
+                            att.window.set_outer_position(
+                                winit::dpi::PhysicalPosition::new(tx, ty),
+                            );
+                            att.placed = (tx, ty);
+                            eprintln!("[ui] moved {id:#x} -> local ({tx},{ty})");
+                        }
                     }
                 }
                 self.present(id);

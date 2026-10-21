@@ -123,10 +123,13 @@ if [ "${CHECK_WM:-0}" = 1 ]; then
     echo "opened=$OPENED kinds=[$KINDS]"
     echo "dialog: $DIALOG"
     echo "menu:   $MENU"
+    MOVED=$(grep -c '\[ui\] moved' "$OUT/client-ssh.log" || true)
+    echo "popup moves followed: $MOVED"
     if [ "$OPENED" -eq 3 ] \
         && echo "$DIALOG" | grep -q 'parent=0x[1-9a-f]' \
-        && echo "$MENU" | grep -q 'override=true'; then
-        echo "check-wm: OK (normal + transient dialog + override menu)"
+        && echo "$MENU" | grep -q 'override=true' \
+        && [ "$MOVED" -ge 1 ]; then
+        echo "check-wm: OK (3 windows, dialog parent, override menu, move followed)"
     else
         echo "check-wm: FAIL"
         PASS=0

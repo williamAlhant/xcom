@@ -68,8 +68,11 @@ impl<'c, C: Connection> Injector<'c, C> {
     }
 
     fn fake(&self, type_: u8, detail: u8, x: i16, y: i16) -> Result<()> {
+        // Like Xlib: motion is relative to the root, key/button events pass
+        // None. Some servers drop button events when a root is supplied.
+        let root = if type_ == FAKE_MOTION { self.root } else { 0 };
         self.conn
-            .xtest_fake_input(type_, detail, Timestamp::from(0u32), self.root, x, y, 0)
+            .xtest_fake_input(type_, detail, Timestamp::from(0u32), root, x, y, 0)
             .map_err(|e| anyhow::anyhow!(e))?;
         // x11rb buffers requests: without an explicit flush the XTest event
         // sits in userspace until unrelated traffic happens to flush it, so

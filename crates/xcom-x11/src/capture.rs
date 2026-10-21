@@ -213,11 +213,12 @@ impl CaptureSession {
             .map(|s| (s.x, s.y, s.w, s.h))
     }
 
-    /// Start capturing a top-level window. Returns its current geometry.
-    pub fn add_window(&mut self, win: Window) -> Result<(i16, i16, u16, u16)> {
-        if self.windows.contains_key(&win) {
-            let s = &self.windows[&win];
-            return Ok((s.x, s.y, s.w, s.h));
+    /// Start capturing a top-level window. Returns its current geometry, or
+    /// `None` for windows that are not real content (input-only windows and
+    /// tiny helper windows such as GTK's 1x1 grab window).
+    pub fn add_window(&mut self, win: Window) -> Result<Option<(i16, i16, u16, u16)>> {
+        if let Some(s) = self.windows.get(&win) {
+            return Ok(Some((s.x, s.y, s.w, s.h)));
         }
         let geom = self
             .conn
@@ -225,6 +226,31 @@ impl CaptureSession {
             .context("get_geometry")?
             .reply()
             .context("window does not exist")?;
+        let attrs = self
+            .conn
+            .get_window_attributes(win)
+            .context("get_window_attributes")?
+            .reply()
+            .context("window does not exist")?;
+        if attrs.class == xproto::WindowClass::INPUT_ONLY {
+            if xcom_proto::debug() {
+                eprintln!("[capture] ignoring input-only window {win:#x}");
+            }
+            return Ok(None);
+        }
+        // Toolkits map tiny helper windows for grabs/selections; they are not
+        // content and would show up as black boxes (our client enforces a
+        // minimum native window size).
+        const MIN_DIM: u16 = 8;
+        if geom.width < MIN_DIM || geom.height < MIN_DIM {
+            if xcom_proto::debug() {
+                eprintln!(
+                    "[capture] ignoring helper window {win:#x} ({}x{})",
+                    geom.width, geom.height
+                );
+            }
+            return Ok(None);
+        }
 
         let pixmap: xproto::Pixmap = self.conn.generate_id()?;
         self.conn.composite_name_window_pixmap(win, pixmap)?;
@@ -265,7 +291,7 @@ impl CaptureSession {
             },
         );
         self.conn.flush()?;
-        Ok((geom.x, geom.y, geom.width, geom.height))
+        Ok(Some((geom.x, geom.y, geom.width, geom.height)))
     }
 
     pub fn remove_window(&mut self, win: Window) {
@@ -373,16 +399,27 @@ impl CaptureSession {
                     .and_then(|c| c.reply().ok())
                     .map(|r| (r.dst_x, r.dst_y))
                     .unwrap_or((e.x, e.y));
-                let resized = {
+                let (moved, resized) = {
                     let Some(state) = self.windows.get_mut(&e.window) else {
                         return Ok(());
                     };
+                    let moved = root_x != state.x || root_y != state.y;
+                    let resized = e.width != state.w || e.height != state.h;
                     state.x = root_x;
                     state.y = root_y;
-                    e.width != state.w || e.height != state.h
+                    (moved, resized)
                 };
                 if resized {
                     self.on_resize(e.window, e.width, e.height)?;
+                }
+                // Moves matter for dialogs/popups: toolkits map them first and
+                // then move them into place.
+                if moved || resized {
+                    self.queue.push_back(PumpEvent::Resized {
+                        window: e.window,
+                        w: e.width,
+                        h: e.height,
+                    });
                 }
             }
             Event::MapNotify(e) => {
@@ -402,10 +439,8 @@ impl CaptureSession {
                     Some(true) => self.queue.push_back(PumpEvent::Mapped(e.window)),
                     Some(false) => {}
                     None => {
-                        if let Ok((_, _, w, h)) = self.add_window(e.window) {
-                            if w > 0 && h > 0 {
-                                self.queue.push_back(PumpEvent::Mapped(e.window));
-                            }
+                        if let Ok(Some(_)) = self.add_window(e.window) {
+                            self.queue.push_back(PumpEvent::Mapped(e.window));
                         }
                     }
                 }
@@ -520,7 +555,6 @@ impl CaptureSession {
         }
         self.ensure_shm(w as usize * h as usize * 4)?;
         self.conn.flush()?;
-        self.queue.push_back(PumpEvent::Resized { window: win, w, h });
         Ok(())
     }
 

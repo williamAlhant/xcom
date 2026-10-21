@@ -44,6 +44,57 @@ fn main() -> Result<()> {
                 println!("keycode {kc}: {}", syms.join(" "));
             }
         }
+        "watch" => {
+            use x11rb::protocol::xproto::{CreateWindowAux, EventMask, WindowClass};
+            let win: Window = conn.generate_id()?;
+            conn.create_window(
+                0,
+                win,
+                root,
+                100,
+                100,
+                400,
+                300,
+                0,
+                WindowClass::INPUT_OUTPUT,
+                x11rb::COPY_FROM_PARENT,
+                &CreateWindowAux::new()
+                    .background_pixel(0x00ff_ffff)
+                    .event_mask(
+                        EventMask::BUTTON_PRESS
+                            | EventMask::BUTTON_RELEASE
+                            | EventMask::POINTER_MOTION,
+                    ),
+            )?;
+            conn.map_window(win)?;
+            conn.flush()?;
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            conn.set_input_focus(InputFocus::PARENT, win, Timestamp::from(0u32))?;
+            conn.flush()?;
+            eprintln!("watching {win:#x} at 100,100 400x300 for 6s");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(6);
+            while std::time::Instant::now() < deadline {
+                while let Some(ev) = conn.poll_for_event()? {
+                    match ev {
+                        x11rb::protocol::Event::ButtonPress(e) => {
+                            println!("ButtonPress detail={} at {}x{}", e.detail, e.event_x, e.event_y)
+                        }
+                        x11rb::protocol::Event::ButtonRelease(e) => {
+                            println!("ButtonRelease detail={}", e.detail)
+                        }
+                        x11rb::protocol::Event::MotionNotify(e) => {
+                            println!("Motion {}x{}", e.event_x, e.event_y)
+                        }
+                        _ => {}
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        "pointer" => {
+            let r = conn.query_pointer(root)?.reply()?;
+            println!("pointer root=({},{}) child={:#x}", r.root_x, r.root_y, r.child);
+        }
         "list" => {
             let tree = conn.query_tree(root)?.reply()?;
             for win in tree.children {
@@ -53,8 +104,39 @@ fn main() -> Result<()> {
                     .and_then(|c| c.reply().ok())
                     .map(|r| String::from_utf8_lossy(&r.value).into_owned())
                     .unwrap_or_default();
-                println!("{win:#x} {name:?}");
+                let (g, class, mapped) = match conn.get_geometry(win) {
+                    Ok(c) => match c.reply() {
+                        Ok(g) => {
+                            let a = conn.get_window_attributes(win).ok().and_then(|c| c.reply().ok());
+                            (
+                                format!("{}+{}+{}x{}", g.x, g.y, g.width, g.height),
+                                a.map(|a| format!("{:?}", a.class)).unwrap_or_default(),
+                                a.map(|a| format!("{:?}", a.map_state)).unwrap_or_default(),
+                            )
+                        }
+                        Err(_) => (String::new(), String::new(), String::new()),
+                    },
+                    Err(_) => (String::new(), String::new(), String::new()),
+                };
+                println!("{win:#x} {g} {class} {mapped} {name:?}");
             }
+        }
+        "clickat" => {
+            let x: i16 = args.next().context("clickat needs x")?.parse()?;
+            let y: i16 = args.next().context("clickat needs y")?.parse()?;
+            let button: u8 = args.next().map(|s| s.parse()).transpose()?.unwrap_or(1);
+            conn.xtest_fake_input(6, 0, Timestamp::from(0u32), root, x, y, 0)?
+                .check()?;
+            conn.flush()?;
+            // Let the client process the motion (its button handler uses the
+            // last CursorMoved position).
+            std::thread::sleep(std::time::Duration::from_millis(120));
+            conn.xtest_fake_input(4, button, Timestamp::from(0u32), 0u32, 0, 0, 0)?
+                .check()?;
+            conn.xtest_fake_input(5, button, Timestamp::from(0u32), 0u32, 0, 0, 0)?
+                .check()?;
+            conn.flush()?;
+            println!("clicked button {button} at ({x},{y})");
         }
         "focus" => {
             let needle = args.next().context("focus needs a title substring")?;

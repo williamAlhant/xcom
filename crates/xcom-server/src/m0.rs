@@ -381,7 +381,9 @@ fn capture(args: CaptureArgs) -> Result<()> {
         max_rects: args.max_rects,
     };
     let mut cap = CaptureSession::from_connection(conn, screen_num, cfg)?;
-    let (_, _, win_w, win_h) = cap.add_window(win)?;
+    let (_, _, win_w, win_h) = cap
+        .add_window(win)?
+        .with_context(|| format!("capture window {win:#x} is not capturable"))?;
 
     let stream = TcpStream::connect(&args.target)
         .with_context(|| format!("connecting to sink {}", args.target))?;
@@ -697,7 +699,9 @@ fn selftest(args: SelftestArgs) -> Result<()> {
 
     let mut session = CaptureSession::from_connection(conn, screen_num, CaptureConfig::default())?;
     let draw_conn = session.connection();
-    session.add_window(win)?;
+    session
+        .add_window(win)?
+        .with_context(|| format!("selftest window {win:#x} is not capturable"))?;
 
     let (w, h) = session
         .window_geometry(win)
@@ -1039,7 +1043,7 @@ pub struct WmDemoArgs {
 
 fn wm_demo(args: WmDemoArgs) -> Result<()> {
     use x11rb::protocol::xproto::{
-        AtomEnum, CreateGCAux, PropMode, Rectangle, WindowClass,
+        AtomEnum, ConfigureWindowAux, CreateGCAux, PropMode, Rectangle, WindowClass,
     };
 
     let display = if args.display.is_empty() {
@@ -1129,6 +1133,38 @@ fn wm_demo(args: WmDemoArgs) -> Result<()> {
     conn.flush()?;
     std::thread::sleep(Duration::from_millis(400));
     conn.map_window(menu)?;
+    // Toolkits map tiny helper windows for grabs/selections; the capture must
+    // ignore them (a 1x1 window would become a 64x64 black box in the client).
+    let helper: Window = conn.generate_id()?;
+    conn.create_window(
+        0,
+        helper,
+        root,
+        0,
+        0,
+        1,
+        1,
+        0,
+        WindowClass::INPUT_OUTPUT,
+        x11rb::COPY_FROM_PARENT,
+        &CreateWindowAux::new(),
+    )?;
+    let helper_in: Window = conn.generate_id()?;
+    conn.create_window(
+        0,
+        helper_in,
+        root,
+        0,
+        0,
+        10,
+        10,
+        0,
+        WindowClass::INPUT_ONLY,
+        x11rb::COPY_FROM_PARENT,
+        &CreateWindowAux::new(),
+    )?;
+    conn.map_window(helper)?;
+    conn.map_window(helper_in)?;
     conn.flush()?;
     std::thread::sleep(Duration::from_millis(200));
 
@@ -1145,8 +1181,14 @@ fn wm_demo(args: WmDemoArgs) -> Result<()> {
     conn.flush()?;
 
     eprintln!(
-        "[wm-demo] main={main:#x} dialog={dialog:#x} menu={menu:#x} display={display}"
+        "[wm-demo] main={main:#x} dialog={dialog:#x} menu={menu:#x} helper={helper:#x} input-only={helper_in:#x} display={display}"
     );
+    // Move the menu after mapping, like toolkits do when they keep a popup on
+    // screen; the client must follow the ConfigureNotify.
+    std::thread::sleep(Duration::from_millis(1500));
+    conn.configure_window(menu, &ConfigureWindowAux::new().x(190).y(140))?;
+    conn.flush()?;
+    eprintln!("[wm-demo] menu moved to 190,140");
     std::thread::sleep(Duration::from_secs(args.seconds));
     Ok(())
 }

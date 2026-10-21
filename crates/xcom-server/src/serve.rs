@@ -155,7 +155,7 @@ pub fn run(args: ServeArgs) -> Result<()> {
     let root = session.root();
     for t in windows::list_top_levels(session.connection().as_ref(), root, true)? {
         if t.mapped {
-            session.add_window(t.window)?;
+            let _ = session.add_window(t.window)?;
         }
     }
 
