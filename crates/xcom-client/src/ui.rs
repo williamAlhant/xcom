@@ -412,6 +412,14 @@ impl App {
             // 1:1 pixel mapping for now; DPI-aware scaling lands with M3.
             .with_inner_size(PhysicalSize::new(w, h))
             .with_position(winit::dpi::PhysicalPosition::new(x, y));
+        // On X11, make remote override-redirect windows override-redirect
+        // locally too: the WM then cannot move/tile/decorate them, so the
+        // position is exact under any WM (Wayland ignores this field).
+        #[cfg(target_os = "linux")]
+        let attrs = {
+            use winit::platform::x11::WindowAttributesExtX11;
+            attrs.with_override_redirect(override_redirect)
+        };
         let Ok(window) = el.create_window(attrs) else {
             return;
         };

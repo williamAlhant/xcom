@@ -104,7 +104,7 @@ fn main() -> Result<()> {
                     .and_then(|c| c.reply().ok())
                     .map(|r| String::from_utf8_lossy(&r.value).into_owned())
                     .unwrap_or_default();
-                let (g, class, mapped) = match conn.get_geometry(win) {
+                let (g, class, mapped, or) = match conn.get_geometry(win) {
                     Ok(c) => match c.reply() {
                         Ok(g) => {
                             let a = conn.get_window_attributes(win).ok().and_then(|c| c.reply().ok());
@@ -112,13 +112,14 @@ fn main() -> Result<()> {
                                 format!("{}+{}+{}x{}", g.x, g.y, g.width, g.height),
                                 a.map(|a| format!("{:?}", a.class)).unwrap_or_default(),
                                 a.map(|a| format!("{:?}", a.map_state)).unwrap_or_default(),
+                                a.map(|a| a.override_redirect).unwrap_or(false),
                             )
                         }
-                        Err(_) => (String::new(), String::new(), String::new()),
+                        Err(_) => (String::new(), String::new(), String::new(), false),
                     },
-                    Err(_) => (String::new(), String::new(), String::new()),
+                    Err(_) => (String::new(), String::new(), String::new(), false),
                 };
-                println!("{win:#x} {g} {class} {mapped} {name:?}");
+                println!("{win:#x} {g} {class} {mapped} override={or} {name:?}");
             }
         }
         "clickat" => {
