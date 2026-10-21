@@ -27,13 +27,14 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
+use x11rb::errors::ReplyError;
 use x11rb::connection::Connection;
 use x11rb::protocol::composite::{self, ConnectionExt as _};
 use x11rb::protocol::damage::{self, ConnectionExt as _};
 use x11rb::protocol::shm::{self, ConnectionExt as _};
 use x11rb::protocol::xfixes::{self, ConnectionExt as _};
 use x11rb::protocol::xproto::{self, ConnectionExt as _, EventMask, Window};
-use x11rb::protocol::Event;
+use x11rb::protocol::{ErrorKind, Event};
 use x11rb::rust_connection::RustConnection;
 
 use xcom_codec::{coalesce, Compressor, Rect};
@@ -464,7 +465,19 @@ impl CaptureSession {
                 };
                 match remapped {
                     // Already tracked: the window was hidden, announce it again.
-                    Some(true) => self.queue.push_back(PumpEvent::Mapped(e.window)),
+                    Some(true) => {
+                        // The named backing pixmap can be invalidated while the
+                        // window is unmapped; re-name it before the client
+                        // asks for a full frame.
+                        if let Err(err) = self.rename_pixmap(e.window) {
+                            if xcom_proto::debug() {
+                                eprintln!("[capture] remap {:#x}: {err}", e.window);
+                            }
+                            self.remove_window(e.window);
+                        } else {
+                            self.queue.push_back(PumpEvent::Mapped(e.window));
+                        }
+                    }
                     Some(false) => {}
                     None => {
                         if let Ok(Some(_)) = self.add_window(e.window) {
@@ -609,6 +622,19 @@ impl CaptureSession {
         Ok(())
     }
 
+    /// Re-create the named backing pixmap (e.g. after an unmap/remap).
+    fn rename_pixmap(&mut self, win: Window) -> Result<()> {
+        let Some(state) = self.windows.get_mut(&win) else {
+            return Ok(());
+        };
+        let pixmap: xproto::Pixmap = self.conn.generate_id()?;
+        self.conn.composite_name_window_pixmap(win, pixmap)?;
+        let old = std::mem::replace(&mut state.pixmap, pixmap);
+        let _ = self.conn.free_pixmap(old);
+        self.conn.flush()?;
+        Ok(())
+    }
+
     fn on_resize(&mut self, win: Window, w: u16, h: u16) -> Result<()> {
         // The named pixmap keeps the size it had when named: re-name it.
         if let Some(state) = self.windows.get_mut(&win) {
@@ -714,13 +740,29 @@ impl CaptureSession {
             }
 
             for (r, off, cookie) in cookies {
-                if let Err(e) = cookie.reply() {
-                    // The window may have gone away mid-frame; skip the rect.
-                    eprintln!(
-                        "capture: shm_get_image failed for {win:#x} rect {}x{}+{}+{} offset={off} segment={} bytes: {e}",
-                        r.w, r.h, r.x, r.y, self.shm.len
-                    );
-                    continue;
+                match cookie.reply() {
+                    Ok(_) => {}
+                    // The window was destroyed or unmapped between the damage
+                    // event and the readback; its pixmap is gone. The window
+                    // is disappearing anyway, so this is benign.
+                    Err(ReplyError::X11Error(x)) if x.error_kind == ErrorKind::Drawable => {
+                        if xcom_proto::debug() {
+                            eprintln!(
+                                "[capture] {win:#x}: drawable gone mid-capture (rect {}x{}+{}+{}, skipped)",
+                                r.w, r.h, r.x, r.y
+                            );
+                        }
+                        continue;
+                    }
+                    Err(e) => {
+                        // Anything else is a real capture bug (e.g. BadMatch
+                        // from an undersized segment).
+                        eprintln!(
+                            "capture: shm_get_image failed for {win:#x} rect {}x{}+{}+{} offset={off} segment={} bytes: {e}",
+                            r.w, r.h, r.x, r.y, self.shm.len
+                        );
+                        continue;
+                    }
                 }
                 capture_ns = now_ns();
                 let len = r.area() * 4;
