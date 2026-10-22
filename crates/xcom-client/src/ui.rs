@@ -293,6 +293,40 @@ fn size_close(a: (u16, u16), b: (u16, u16)) -> bool {
     a.0.abs_diff(b.0) <= SIZE_TOLERANCE && a.1.abs_diff(b.1) <= SIZE_TOLERANCE
 }
 
+/// (parent local position, parent local size, parent remote position).
+type ParentPlacement = ((i32, i32), (u16, u16), (i16, i16));
+
+/// Pure window placement: normal windows keep the remote position plus a 32 px
+/// cascade; dialogs that ask for (0,0) are centered on their parent;
+/// dialogs/popups keep the same offset from the parent that the remote windows
+/// have. `parent` is (local position, local size, remote position).
+fn place_window(
+    pix_x: i16,
+    pix_y: i16,
+    kind: u8,
+    override_redirect: bool,
+    w: u16,
+    h: u16,
+    parent: Option<ParentPlacement>,
+) -> (i32, i32) {
+    let mut x = (pix_x as i32).max(0) + 32;
+    let mut y = (pix_y as i32).max(0) + 32;
+    if let Some(((px, py), (lw, lh), (rx, ry))) = parent {
+        if kind == xcom_proto::KIND_DIALOG && pix_x == 0 && pix_y == 0 {
+            x = px + (lw as i32 - w as i32) / 2;
+            y = py + (lh as i32 - h as i32) / 2;
+        } else if override_redirect
+            || kind == xcom_proto::KIND_MENU
+            || kind == xcom_proto::KIND_TOOLTIP
+            || kind == xcom_proto::KIND_DIALOG
+        {
+            x = px + pix_x as i32 - rx as i32;
+            y = py + pix_y as i32 - ry as i32;
+        }
+    }
+    (x, y)
+}
+
 impl App {
     pub fn new(
         _proxy: EventLoopProxy<UserEvent>,
@@ -450,30 +484,26 @@ impl App {
         let Some(pix) = self.pixels.get(&id) else {
             return (32, 32);
         };
-        let mut x = (pix.x as i32).max(0) + 32;
-        let mut y = (pix.y as i32).max(0) + 32;
-        if let Some(att) = self.attached.get(&pix.parent) {
-            // Wayland has no global positions; fall back to what we asked for.
-            let pp = att
-                .window
-                .outer_position()
-                .map(|p| (p.x, p.y))
-                .unwrap_or(att.placed);
-            if pix.kind == xcom_proto::KIND_DIALOG && pix.x == 0 && pix.y == 0 {
-                x = pp.0 + (att.local.0 as i32 - w as i32) / 2;
-                y = pp.1 + (att.local.1 as i32 - h as i32) / 2;
-            } else if pix.override_redirect
-                || pix.kind == xcom_proto::KIND_MENU
-                || pix.kind == xcom_proto::KIND_TOOLTIP
-                || pix.kind == xcom_proto::KIND_DIALOG
-            {
-                if let Some(ppix) = self.pixels.get(&pix.parent) {
-                    x = pp.0 + pix.x as i32 - ppix.x as i32;
-                    y = pp.1 + pix.y as i32 - ppix.y as i32;
-                }
-            }
-        }
-        (x, y)
+        // Wayland has no global positions; fall back to what we asked for.
+        let parent = self.pixels.get(&pix.parent).and_then(|ppix| {
+            self.attached.get(&pix.parent).map(|att| {
+                let pp = att
+                    .window
+                    .outer_position()
+                    .map(|p| (p.x, p.y))
+                    .unwrap_or(att.placed);
+                (pp, att.local, (ppix.x, ppix.y))
+            })
+        });
+        place_window(
+            pix.x,
+            pix.y,
+            pix.kind,
+            pix.override_redirect,
+            w,
+            h,
+            parent,
+        )
     }
 
     fn open_window(&mut self, el: &ActiveEventLoop, id: u32) {
@@ -1504,6 +1534,79 @@ mod tests {
         assert!(!is_hud_toggle(&Key::Character("m".into()), &m, true, true, true));
         // Any other key must not toggle.
         assert!(!is_hud_toggle(&Key::Named(NamedKey::F5), &PhysicalKey::Code(KeyCode::F5), true, true, false));
+    }
+
+    #[test]
+    fn placement_cascades_and_centers() {
+        // Normal window: remote position with a 32 px cascade; negatives clamp.
+        assert_eq!(place_window(10, 20, xcom_proto::KIND_NORMAL, false, 100, 80, None), (42, 52));
+        assert_eq!(place_window(-5, -7, xcom_proto::KIND_NORMAL, false, 100, 80, None), (32, 32));
+        // Dialog asking for (0,0): centered on the parent.
+        let parent = Some(((100, 100), (300u16, 200u16), (5i16, 5i16)));
+        assert_eq!(
+            place_window(0, 0, xcom_proto::KIND_DIALOG, false, 100, 80, parent),
+            (200, 160)
+        );
+        // Menu: keeps the offset the remote windows have from each other.
+        assert_eq!(
+            place_window(15, 25, xcom_proto::KIND_MENU, false, 50, 40, parent),
+            (110, 120)
+        );
+        // A dialog with a real position also keeps the offset (not centered).
+        assert_eq!(
+            place_window(15, 25, xcom_proto::KIND_DIALOG, false, 50, 40, parent),
+            (110, 120)
+        );
+        // Override-redirect popups too, whatever their kind.
+        assert_eq!(
+            place_window(15, 25, xcom_proto::KIND_OTHER, true, 50, 40, parent),
+            (110, 120)
+        );
+    }
+
+    #[test]
+    fn blit_places_rects_with_the_store_stride() {
+        use xcom_proto::WireRect;
+        // Two BGRA pixels, one 2x1 damage rect at (1,1) in a 4x3 frame.
+        let src: [u8; 8] = [10, 20, 30, 255, 40, 50, 60, 255];
+        let mut enc = xcom_codec::Compressor::new();
+        let (codec, data) = enc.encode(&src);
+        let frame = DamageFrame {
+            window: 7,
+            win_w: 4,
+            win_h: 3,
+            t_event_ns: 0,
+            t_capture_ns: 0,
+            rects: vec![WireRect {
+                x: 1,
+                y: 1,
+                w: 2,
+                h: 1,
+                codec,
+                raw_len: 8,
+                data: data.to_vec(),
+            }],
+        };
+        let mut p = Pixels::new(4, 3);
+        let mut decode = Vec::new();
+        p.blit(&frame, &mut decode);
+        assert_eq!(p.buf[4 + 1], 0xff1e140a, "first source pixel at (1,1)");
+        assert_eq!(p.buf[4 + 2], 0xff3c3228, "second source pixel at (2,1)");
+        assert_eq!(p.buf[0], 0xff00_0000, "outside the rect stays black");
+        assert_eq!(p.buf[2 * 4 + 1], 0xff00_0000, "other rows untouched");
+        // A frame with a different size resizes the store first.
+        let bigger = DamageFrame { win_w: 6, win_h: 5, ..frame };
+        p.blit(&bigger, &mut decode);
+        assert_eq!((p.w, p.h), (6, 5));
+        assert_eq!(p.buf[6 + 1], 0xff1e140a, "content kept at new stride");
+    }
+
+    #[test]
+    fn byte_rate_formatting() {
+        assert_eq!(fmt_rate(0.0), "0B");
+        assert_eq!(fmt_rate(999.0), "999B");
+        assert_eq!(fmt_rate(1500.0), "1.5kB");
+        assert_eq!(fmt_rate(2_500_000.0), "2.5MB");
     }
 
     #[test]

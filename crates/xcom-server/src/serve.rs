@@ -965,3 +965,29 @@ fn serve_loop(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn geo(win: Window, x: i16, y: i16, w: u16, h: u16) -> GeometryMap {
+        let mut m = HashMap::new();
+        m.insert(win, (x, y, w, h));
+        Arc::new(std::sync::Mutex::new(m))
+    }
+
+    #[test]
+    fn root_coords_translates_and_clamps() {
+        let g = geo(7, 10, 20, 300, 200);
+        assert_eq!(root_coords(&g, 7, 5, 7), Some((15, 27)));
+        // Out-of-window coordinates clamp to the window edges: XTEST must not
+        // land on the desktop outside the remote window.
+        assert_eq!(root_coords(&g, 7, -4, -9), Some((10, 20)));
+        assert_eq!(root_coords(&g, 7, 299, 199), Some((309, 219)));
+        assert_eq!(root_coords(&g, 7, 500, 500), Some((309, 219)));
+        assert_eq!(root_coords(&g, 8, 0, 0), None, "untracked window");
+        // A zero-size window still resolves to its origin (no negative index).
+        let z = geo(9, 5, 6, 0, 0);
+        assert_eq!(root_coords(&z, 9, 10, 10), Some((5, 6)));
+    }
+}

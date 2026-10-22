@@ -692,4 +692,10 @@ mod tests {
         assert!(matches!(server.join().unwrap(), Err(TransportError::Timeout)));
         drop(first);
     }
+
+    #[test]
+    fn hex_encodes_nibbles() {
+        assert_eq!(hex(&[]), "");
+        assert_eq!(hex(&[0x00, 0x0f, 0xa5, 0xff]), "000fa5ff");
+    }
 }
