@@ -253,6 +253,30 @@ fn size_close(a: (u16, u16), b: (u16, u16)) -> bool {
 /// (parent local position, parent local size, parent remote position).
 type ParentPlacement = ((i32, i32), (u16, u16), (i16, i16));
 
+/// Origin to anchor a child's content-relative position to.
+///
+/// Remote coordinates are content-relative. For an *undecorated* child (menus,
+/// tooltips) the parent's decorations must be subtracted, so its client-area
+/// origin (`inner`) is the anchor — otherwise the popup lands one title bar too
+/// high. For a *decorated* child (dialogs) the parent's and the child's
+/// decorations cancel out, so the outer origin is the right anchor there.
+///
+/// `inner`/`outer` are `None` where the platform does not report positions
+/// (Wayland); `placed` is then the best available guess.
+fn parent_origin(
+    outer: Option<(i32, i32)>,
+    inner: Option<(i32, i32)>,
+    placed: (i32, i32),
+    child_undecorated: bool,
+) -> (i32, i32) {
+    if child_undecorated {
+        if let Some(p) = inner {
+            return p;
+        }
+    }
+    outer.unwrap_or(placed)
+}
+
 /// Pure window placement: normal windows keep the remote position plus a 32 px
 /// cascade; dialogs that ask for (0,0) are centered on their parent;
 /// dialogs/popups keep the same offset from the parent that the remote windows
@@ -425,18 +449,27 @@ impl App {
         let Some(pix) = self.pixels.get(&id) else {
             return (32, 32);
         };
-        // Wayland has no global positions; fall back to what we asked for.
-        let parent = self.pixels.get(&pix.parent).and_then(|ppix| {
-            self.attached.get(&pix.parent).map(|att| {
-                let pp = att
-                    .window
-                    .outer_position()
-                    .map(|p| (p.x, p.y))
-                    .unwrap_or(att.placed);
-                (pp, att.local, (ppix.x, ppix.y))
-            })
-        });
-        place_window(
+        let parent = match (self.pixels.get(&pix.parent), self.attached.get(&pix.parent)) {
+            (Some(ppix), Some(att)) => {
+                // Wayland has no global positions: both fail and we fall back
+                // to what we asked for.
+                let outer = att.window.outer_position().map(|p| (p.x, p.y)).ok();
+                let inner = att.window.inner_position().map(|p| (p.x, p.y)).ok();
+                let origin = parent_origin(outer, inner, att.placed, pix.override_redirect);
+                if xcom_proto::debug() {
+                    logln!(
+                        "[ui] place {id:#x} kind={} override={} parent={:#x} \
+                         outer={outer:?} inner={inner:?} origin={origin:?}",
+                        pix.kind,
+                        pix.override_redirect,
+                        pix.parent
+                    );
+                }
+                Some((origin, att.local, (ppix.x, ppix.y)))
+            }
+            _ => None,
+        };
+        let pos = place_window(
             pix.x,
             pix.y,
             pix.kind,
@@ -444,7 +477,17 @@ impl App {
             w,
             h,
             parent,
-        )
+        );
+        if xcom_proto::debug() {
+            logln!(
+                "[ui] place {id:#x} remote=({},{}) -> local=({},{})",
+                pix.x,
+                pix.y,
+                pos.0,
+                pos.1
+            );
+        }
+        pos
     }
 
     fn open_window(&mut self, el: &ActiveEventLoop, id: u32) {
@@ -1223,6 +1266,20 @@ mod tests {
         assert!(!sane_size(800, 0));
         assert!(!sane_size(65535, 65535));
         assert!(!sane_size(8193, 100));
+    }
+
+    #[test]
+    fn popup_origin_prefers_the_client_area() {
+        let outer = Some((100, 100));
+        let inner = Some((108, 131));
+        // Undecorated child: anchor to the client area, so the parent's title
+        // bar and border do not shift the menu.
+        assert_eq!(parent_origin(outer, inner, (0, 0), true), (108, 131));
+        // Decorated child: the decorations cancel, keep the outer origin.
+        assert_eq!(parent_origin(outer, inner, (0, 0), false), (100, 100));
+        // Platform without client-area positions (Wayland): outer, then placed.
+        assert_eq!(parent_origin(outer, None, (0, 0), true), (100, 100));
+        assert_eq!(parent_origin(None, None, (7, 9), true), (7, 9));
     }
 
     #[test]

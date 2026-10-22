@@ -116,10 +116,12 @@ fi
 
 if [ "${CHECK_WM:-0}" = 1 ]; then
     echo "--- mini-WM check ---"
+    # Only the client's "opened" lines describe the local windows; with
+    # XCOM_DEBUG the daemon also logs kind=/parent= for the same windows.
     OPENED=$(grep -c 'window .* opened' "$OUT/client-ssh.log" || true)
-    KINDS=$(grep -o 'kind=[0-9]*' "$OUT/client-ssh.log" | tr '\n' ' ')
-    DIALOG=$(grep 'kind=1' "$OUT/client-ssh.log" | head -1)
-    MENU=$(grep 'kind=2' "$OUT/client-ssh.log" | head -1)
+    KINDS=$(grep 'window .* opened' "$OUT/client-ssh.log" | grep -o 'kind=[0-9]*' | tr '\n' ' ')
+    DIALOG=$(grep 'window .* opened' "$OUT/client-ssh.log" | grep 'kind=1' | head -1)
+    MENU=$(grep 'window .* opened' "$OUT/client-ssh.log" | grep 'kind=2' | head -1)
     echo "opened=$OPENED kinds=[$KINDS]"
     echo "dialog: $DIALOG"
     echo "menu:   $MENU"
