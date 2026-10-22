@@ -30,7 +30,9 @@ use rustls::{ClientConfig, ClientConnection, DigitallySignedStruct};
 use rustls::{ServerConfig, ServerConnection, StreamOwned};
 use sha2::{Digest, Sha256};
 
-pub const PROTO_VERSION: u16 = 5;
+// One protocol version for both the handshake and the message set: the hello
+// check and the value advertised in the JSON handshake line must never drift.
+pub use xcom_proto::PROTO_VERSION;
 
 /// Per-attempt budget for TLS + hello. A stalled peer costs at most this much
 /// before the accept loop moves on; peers not on the allowlist never get here.

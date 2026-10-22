@@ -180,6 +180,18 @@ fn bootstrap_ssh(
             )?;
             let fingerprint =
                 json_field(&line, "cert_sha256").context("handshake line: cert_sha256")?;
+            // The JSON is informational, but a version mismatch here means the
+            // remote binary is from a different build: say so plainly instead of
+            // failing later on an unknown message type. (The TLS hello checks it
+            // too; this is the friendlier early error.)
+            match json_field(&line, "proto").and_then(|p| p.parse::<u16>().ok()) {
+                Some(p) if p == xcom_proto::PROTO_VERSION => {}
+                Some(p) => bail!(
+                    "remote speaks protocol {p}, this client speaks {} (update the other side)",
+                    xcom_proto::PROTO_VERSION
+                ),
+                None => bail!("handshake line: missing proto"),
+            }
             return Ok(Handshake {
                 addr,
                 control_token: token32(control)?,
