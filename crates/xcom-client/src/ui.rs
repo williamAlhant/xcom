@@ -14,18 +14,18 @@
 //!    local window size; a mismatch (WM constraints, DPI rounding) letterboxes
 //!    instead of corrupting rows.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use raw_window_handle::HasWindowHandle;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
-use winit::keyboard::{Key, ModifiersState, PhysicalKey};
+use winit::keyboard::ModifiersState;
 use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
 use winit::window::{Window, WindowId};
 
@@ -33,26 +33,8 @@ use xcom_codec::decompress;
 use xcom_proto::{DamageFrame, Message};
 use xcom_proto::logln;
 
-use crate::hud::Hud;
-use crate::keys::{keysym_for, keysym_for_physical};
-
-/// Server-side metrics for the last interval, as reported by `Message::Stats`.
-#[derive(Default, Clone, Copy)]
-pub struct ServerStats {
-    pub interval_ms: u32,
-    pub frames: u32,
-    pub rects: u32,
-    pub raw_bytes: u64,
-    pub comp_bytes: u64,
-    pub capture_us: u32,
-    pub encode_us: u32,
-    pub windows: u16,
-}
-
-/// How often the metrics snapshot (rates, HUD text) is recomputed.
-const METRICS_INTERVAL: Duration = Duration::from_millis(500);
-/// Samples kept for the bandwidth sparkline (one per metrics tick).
-const GRAPH_SAMPLES: usize = 48;
+use crate::keys::{KeyAction, KeyState};
+use crate::metrics::{Metrics, ServerStats};
 
 /// Events from the network threads to the UI thread.
 pub enum UserEvent {
@@ -225,19 +207,12 @@ pub struct App {
     by_winit: HashMap<WindowId, u32>,
     decode_buf: Vec<u8>,
     frames_blitted: u64,
-    presents: u64,
     present_errors: u64,
     /// A window has been opened at least once: used to distinguish "the last
     /// window was closed" from "nothing has arrived yet".
     ever_had_windows: bool,
-    /// Keysym sent for each physical key currently down. The release event has
-    /// no text and may carry a Wine-mangled logical key, so the only reliable
-    /// way to release the same key the press created is to remember it here.
-    held: HashMap<winit::keyboard::PhysicalKey, u32>,
-    /// Plain (unmodified) character per physical key, learned from text events.
-    /// Needed for Ctrl/Alt shortcuts under Wine, where winit reports a bogus
-    /// named key and no text while a modifier is held.
-    plain_chars: HashMap<winit::keyboard::PhysicalKey, u32>,
+    /// Keysym bookkeeping and the local key bindings (Ctrl+Shift+C/V/M).
+    keys: KeyState,
     /// Local (client) clipboard. None when the platform has no text clipboard.
     clipboard: Option<arboard::Clipboard>,
     /// Cursor mirroring the remote pointer, applied to every window.
@@ -249,30 +224,11 @@ pub struct App {
     fullscreen: bool,
     /// Test aids (F12 store dump) are opt-in: F12 belongs to the app otherwise.
     debug_tools: bool,
-    /// Metrics HUD shown over every window (toggle: Ctrl+Shift+M).
-    hud_on: bool,
-    hud: Hud,
-    stats: ServerStats,
-    /// Monotonic totals used to derive the rates below.
-    rx_bytes: u64,
-    raw_bytes: u64,
-    frames_seen: u64,
-    /// Rate snapshot, refreshed every `METRICS_INTERVAL`.
-    rate_fps: f32,
-    rate_rx: f64,
-    ratio: f32,
-    rtt_ms: Option<u32>,
-    input_ms: Option<f32>,
-    rx_history: VecDeque<u32>,
-    last_tick: Instant,
-    last_frames: u64,
-    last_rx: u64,
-    last_log: Instant,
-    /// Window and time of the last input we sent, for input -> present latency.
-    last_input: Option<(u32, Instant)>,
-    /// Modifier state from winit. The keysym map below only knows about
-    /// modifiers we saw a *press* for; Wayland reports modifiers held before
-    /// (or while) the window got focus only through `ModifiersChanged`.
+    /// Rates, RTT, server counters and the HUD overlay.
+    metrics: Metrics,
+    /// Modifier state from winit. The keysym map only knows about modifiers we
+    /// saw a *press* for; Wayland reports modifiers held before (or while) the
+    /// window got focus only through `ModifiersChanged`.
     mods: ModifiersState,
 }
 
@@ -350,11 +306,9 @@ impl App {
             by_winit: HashMap::new(),
             decode_buf: Vec::new(),
             frames_blitted: 0,
-            presents: 0,
             present_errors: 0,
             ever_had_windows: false,
-            held: HashMap::new(),
-            plain_chars: HashMap::new(),
+            keys: KeyState::new(),
             clipboard,
             custom_cursor: None,
             cursor_seq: 0,
@@ -362,29 +316,13 @@ impl App {
             dump_seq: 0,
             fullscreen,
             debug_tools,
-            hud_on: hud,
-            hud: Hud::default(),
-            stats: ServerStats::default(),
-            rx_bytes: 0,
-            raw_bytes: 0,
-            frames_seen: 0,
-            rate_fps: 0.0,
-            rate_rx: 0.0,
-            ratio: 0.0,
-            rtt_ms: None,
-            input_ms: None,
-            rx_history: VecDeque::new(),
-            last_tick: Instant::now(),
-            last_frames: 0,
-            last_rx: 0,
-            last_log: Instant::now(),
-            last_input: None,
+            metrics: Metrics::new(hud),
             mods: ModifiersState::empty(),
         }
     }
 
     fn report(&mut self) {
-        self.tick_metrics(true);
+        self.metrics.tick(true);
         logln!(
             "[ui] {} window(s) open, {} frames blitted",
             self.attached.len(),
@@ -392,9 +330,10 @@ impl App {
         );
         logln!(
             "[ui] presents={}, present_errors={}",
-            self.presents, self.present_errors
+            self.metrics.presents(),
+            self.present_errors
         );
-        logln!("[ui] metrics: {}", self.metrics_line());
+        logln!("[ui] metrics: {}", self.metrics.line());
         self.dump("");
     }
 
@@ -624,11 +563,11 @@ impl App {
                 return;
             }
         };
-        self.presents += 1;
-        if self.presents <= 3 {
+        self.metrics.on_present();
+        if self.metrics.presents() <= 3 {
             logln!(
                 "[ui] present #{}, win {id:#x}: buffer={}px local={:?} remote={}x{}",
-                self.presents,
+                self.metrics.presents(),
                 buf.len(),
                 att.local,
                 pix.w,
@@ -653,8 +592,8 @@ impl App {
         }
         // The HUD is an overlay on the presented surface, never in the store:
         // it must not be mistaken for remote content.
-        if self.hud_on {
-            crate::hud::draw(&mut buf, lw, lh, &self.hud);
+        if self.metrics.hud_on() {
+            crate::hud::draw(&mut buf, lw, lh, self.metrics.hud());
         }
         if let Err(e) = buf.present() {
             self.present_errors += 1;
@@ -689,16 +628,10 @@ impl App {
             .or_insert_with(|| Pixels::new(frame.win_w, frame.win_h));
         pix.blit(frame, &mut self.decode_buf);
         self.frames_blitted += 1;
-        self.frames_seen += 1;
-        self.rx_bytes += frame.encoded_len() as u64;
-        self.raw_bytes += frame.rects.iter().map(|r| r.raw_len as u64).sum::<u64>();
-        if let Some((win, at)) = self.last_input {
-            if win == id {
-                self.input_ms = Some(at.elapsed().as_secs_f32() * 1000.0);
-                self.last_input = None;
-            }
-        }
-        self.tick_metrics(false);
+        let raw = frame.rects.iter().map(|r| r.raw_len as u64).sum::<u64>();
+        self.metrics
+            .on_frame(id, frame.encoded_len() as u64, raw);
+        self.metrics.tick(false);
         self.present(id);
     }
 
@@ -708,7 +641,7 @@ impl App {
 
     /// Send input and remember when, for the input -> present latency readout.
     fn send_input(&mut self, window: u32, msg: Message) {
-        self.last_input = Some((window, Instant::now()));
+        self.metrics.on_input(window);
         self.send(msg);
     }
 
@@ -898,15 +831,13 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             UserEvent::Stats(s) => {
-                self.stats = s;
+                self.metrics.on_stats(s);
                 // A fresh interval arrived: refresh the readouts right away.
-                if self.hud_on {
-                    self.tick_metrics(false);
+                if self.metrics.hud_on() {
+                    self.metrics.tick(false);
                 }
             }
-            UserEvent::Rtt { ms } => {
-                self.rtt_ms = Some(ms);
-            }
+            UserEvent::Rtt { ms } => self.metrics.on_rtt(ms),
             UserEvent::Dump => self.dump("mid."),
             UserEvent::CloseOne => {
                 if let Some((&id, _)) = self.attached.iter().next() {
@@ -1060,8 +991,7 @@ impl ApplicationHandler<UserEvent> for App {
                 if !focused {
                     // Releases may never arrive after losing OS focus; never
                     // leave a remote key held (the X server would autorepeat it).
-                    let held: Vec<u32> = self.held.drain().map(|(_, sym)| sym).collect();
-                    for sym in held {
+                    for sym in self.keys.release_all() {
                         self.send(Message::InputKey {
                             sym,
                             pressed: false,
@@ -1085,105 +1015,15 @@ impl ApplicationHandler<UserEvent> for App {
                 self.send(Message::Focus { window: remote });
             }
             WindowEvent::KeyboardInput { event, .. } => {
-                // The remote X server autorepeats a held XTEST key by itself;
-                // forwarding the local repeats too would double the rate.
-                if event.repeat {
-                    return;
-                }
-                if event.state == ElementState::Released {
-                    // Release exactly what the press sent: the release has no
-                    // text and Wine may report a bogus named key. Keys whose
-                    // press sent nothing are not in the map, so they stay silent.
-                    if let Some(sym) = self.held.remove(&event.physical_key) {
-                        self.send(Message::InputKey {
-                            sym,
-                            pressed: false,
-                        });
-                    }
-                    return;
-                }
-
-                const CTRL: [u32; 2] = [0xffe3, 0xffe4];
-                const ALT: [u32; 2] = [0xffe9, 0xffea];
-                const SUPER: [u32; 2] = [0xffeb, 0xffec];
-                const SHIFT: [u32; 2] = [0xffe1, 0xffe2];
-                let held_any = |syms: [u32; 2]| {
-                    self.held
-                        .values()
-                        .any(|s| syms.contains(s))
-                };
-                let ctrl = self.mods.control_key() || held_any(CTRL);
-                let shift = self.mods.shift_key() || held_any(SHIFT);
-                let alt_super = self.mods.alt_key()
-                    || self.mods.super_key()
-                    || held_any(ALT)
-                    || held_any(SUPER);
-                let ctrl_alt = ctrl || alt_super;
-
-                // Local clipboard shortcuts (not forwarded): copy the remote
-                // selection locally, or push the local clipboard remotely.
-                if ctrl && shift && !alt_super {
-                    // HUD toggle: accept the physical key or the logical
-                    // character (non-QWERTY layouts, Wine's bogus virtual
-                    // keys). Checked before the clipboard keys.
-                    if is_hud_toggle(&event.logical_key, &event.physical_key, ctrl, shift, alt_super)
-                    {
-                        self.hud_on = !self.hud_on;
-                        logln!("[ui] HUD {}", if self.hud_on { "on" } else { "off" });
-                        self.tick_metrics(true);
-                        for att in self.attached.values() {
-                            att.window.request_redraw();
-                        }
-                        return;
-                    }
-                    match event.physical_key {
-                        winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyC) => {
-                            logln!("[ui] clipboard: requesting the remote selection");
-                            self.send(Message::ClipboardGet {
-                                target: xcom_proto::CLIPBOARD_CLIPBOARD,
-                            });
-                            return;
-                        }
-                        winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyV) => {
-                            match self.clipboard.as_mut().map(|cb| cb.get_text()) {
-                                Some(Ok(text)) if !text.is_empty() => {
-                                    let text = xcom_proto::truncate_clipboard(text);
-                                    logln!(
-                                        "[ui] clipboard: pushing {} bytes to the remote",
-                                        text.len()
-                                    );
-                                    self.send(Message::ClipboardSet {
-                                        target: xcom_proto::CLIPBOARD_CLIPBOARD,
-                                        text,
-                                    });
-                                }
-                                Some(Ok(_)) => logln!("[ui] clipboard: local clipboard is empty"),
-                                Some(Err(e)) => logln!("[ui] clipboard read failed: {e}"),
-                                None => logln!("[ui] clipboard: no local clipboard"),
-                            }
-                            return;
-                        }
-                        _ => {}
-                    }
-                }
-                let text_sym = crate::keys::text_keysym(event.text.as_deref());
-                // Learn the layout's plain character. ASCII only and with no
-                // modifiers, so dead-key accents and shifted symbols can't
-                // pollute the map.
-                if !ctrl_alt && !shift {
-                    if let Some(sym) = text_sym {
-                        if (0x20..=0x7e).contains(&sym) {
-                            self.plain_chars.insert(event.physical_key, sym);
-                        }
-                    }
-                }
-
-                // Local hotkey (test aid): dump the store exactly when the user
-                // sees the artifact (not forwarded to the remote app). Opt-in.
+                // Local test aid: dump the store exactly when the user sees the
+                // artifact (not forwarded to the remote app). Opt-in.
                 if self.debug_tools
-                    && matches!(event.logical_key, winit::keyboard::Key::Named(
-                        winit::keyboard::NamedKey::F12
-                    ))
+                    && event.state == ElementState::Pressed
+                    && !event.repeat
+                    && matches!(
+                        event.logical_key,
+                        winit::keyboard::Key::Named(winit::keyboard::NamedKey::F12)
+                    )
                 {
                     logln!("[ui] F12: dumping store and requesting full refresh");
                     self.dump("mid.");
@@ -1192,60 +1032,59 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     return;
                 }
-
-                let logical_sym = keysym_for(&event.logical_key);
-                let sym = if ctrl_alt && text_sym.is_none() {
-                    if matches!(event.logical_key, winit::keyboard::Key::Character(_)) {
-                        // Real Windows: the logical key is the layout character
-                        // even with Ctrl held.
-                        logical_sym
-                    } else {
-                        match event.physical_key {
-                            winit::keyboard::PhysicalKey::Code(code)
-                                if crate::keys::is_text_key(code) =>
-                            {
-                                // Wine: bogus named VK. Use the character this
-                                // key normally produces; send nothing if the
-                                // user has not typed it yet (no wrong guesses).
-                                self.plain_chars.get(&event.physical_key).copied()
-                            }
-                            _ => logical_sym.or_else(|| match event.physical_key {
-                                winit::keyboard::PhysicalKey::Code(code) => {
-                                    keysym_for_physical(code)
-                                }
-                                _ => None,
-                            }),
-                        }
-                    }
-                } else {
-                    text_sym
-                        .or(logical_sym)
-                        .or_else(|| match event.physical_key {
-                            winit::keyboard::PhysicalKey::Code(code) => {
-                                keysym_for_physical(code)
-                            }
-                            _ => None,
-                        })
-                };
-                if xcom_proto::debug_keys() {
-                    logln!(
-                        "[ui] key {:?} -> sym={} pressed={} text={:?}",
-                        event.logical_key,
-                        sym.map(|s| format!("{s:#x}"))
-                            .unwrap_or_else(|| "NONE".into()),
-                        event.state == ElementState::Pressed,
-                        event.text
-                    );
-                }
-                if let Some(sym) = sym {
-                    self.held.insert(event.physical_key, sym);
-                    self.send_input(
+                let action = self.keys.on_key(
+                    &event.physical_key,
+                    &event.logical_key,
+                    event.text.as_deref(),
+                    event.state == ElementState::Pressed,
+                    event.repeat,
+                    self.mods,
+                );
+                match action {
+                    KeyAction::None => {}
+                    KeyAction::Press(sym) => self.send_input(
                         remote,
                         Message::InputKey {
                             sym,
                             pressed: true,
                         },
-                    );
+                    ),
+                    KeyAction::Release(sym) => self.send(Message::InputKey {
+                        sym,
+                        pressed: false,
+                    }),
+                    KeyAction::ClipboardGet => {
+                        logln!("[ui] clipboard: requesting the remote selection");
+                        self.send(Message::ClipboardGet {
+                            target: xcom_proto::CLIPBOARD_CLIPBOARD,
+                        });
+                    }
+                    KeyAction::PushClipboard => {
+                        match self.clipboard.as_mut().map(|cb| cb.get_text()) {
+                            Some(Ok(text)) if !text.is_empty() => {
+                                let text = xcom_proto::truncate_clipboard(text);
+                                logln!(
+                                    "[ui] clipboard: pushing {} bytes to the remote",
+                                    text.len()
+                                );
+                                self.send(Message::ClipboardSet {
+                                    target: xcom_proto::CLIPBOARD_CLIPBOARD,
+                                    text,
+                                });
+                            }
+                            Some(Ok(_)) => logln!("[ui] clipboard: local clipboard is empty"),
+                            Some(Err(e)) => logln!("[ui] clipboard read failed: {e}"),
+                            None => logln!("[ui] clipboard: no local clipboard"),
+                        }
+                    }
+                    KeyAction::ToggleHud => {
+                        let on = self.metrics.toggle_hud();
+                        logln!("[ui] HUD {}", if on { "on" } else { "off" });
+                        self.metrics.tick(true);
+                        for att in self.attached.values() {
+                            att.window.request_redraw();
+                        }
+                    }
                 }
             }
             _ => {}
@@ -1253,45 +1092,19 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
-        self.tick_metrics(false);
-        if self.hud_on {
+        self.metrics.tick(false);
+        if self.metrics.hud_on() {
             // Repaint so the HUD (rates, sparkline) stays live even when the
             // remote window is static and produces no frames.
             for att in self.attached.values() {
                 att.window.request_redraw();
             }
             el.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
-                Instant::now() + METRICS_INTERVAL,
+                Instant::now() + crate::metrics::INTERVAL,
             ));
         } else {
             el.set_control_flow(winit::event_loop::ControlFlow::Wait);
         }
-    }
-}
-
-/// True when a key event should toggle the metrics HUD (Ctrl+Shift+M).
-///
-/// The physical key covers the common case; the logical character covers
-/// layouts where `m` is not at `KeyCode::KeyM` and Wine, which reports bogus
-/// virtual keys (the same reason the Ctrl/Alt shortcuts use the logical key).
-fn is_hud_toggle(logical: &Key, physical: &PhysicalKey, ctrl: bool, shift: bool, alt_super: bool) -> bool {
-    if !ctrl || !shift || alt_super {
-        return false;
-    }
-    if matches!(physical, PhysicalKey::Code(winit::keyboard::KeyCode::KeyM)) {
-        return true;
-    }
-    matches!(logical, Key::Character(c) if c.eq_ignore_ascii_case("m"))
-}
-
-/// Human-readable byte rate (B/s, kB/s, MB/s).
-fn fmt_rate(bps: f64) -> String {
-    if bps >= 1e6 {
-        format!("{:.1}MB", bps / 1e6)
-    } else if bps >= 1e3 {
-        format!("{:.1}kB", bps / 1e3)
-    } else {
-        format!("{bps:.0}B")
     }
 }
 
@@ -1307,115 +1120,6 @@ fn x11_button(b: MouseButton) -> u8 {
 }
 
 impl App {
-    /// Recompute the rate snapshot and HUD text; log a line every 5 s.
-    ///
-    /// `force` bypasses the interval check (used at shutdown and on toggles).
-    fn tick_metrics(&mut self, force: bool) {
-        let now = Instant::now();
-        let dt = now.duration_since(self.last_tick);
-        if !force && dt < METRICS_INTERVAL {
-            return;
-        }
-        let secs = dt.as_secs_f64().max(1e-3);
-        let d_frames = self.frames_seen.saturating_sub(self.last_frames);
-        let d_rx = self.rx_bytes.saturating_sub(self.last_rx);
-        self.rate_fps = (d_frames as f64 / secs) as f32;
-        self.rate_rx = d_rx as f64 / secs;
-        self.ratio = if self.rx_bytes > 0 {
-            self.raw_bytes as f32 / self.rx_bytes as f32
-        } else {
-            0.0
-        };
-        self.rx_history
-            .push_back(self.rate_rx.min(u32::MAX as f64) as u32);
-        while self.rx_history.len() > GRAPH_SAMPLES {
-            self.rx_history.pop_front();
-        }
-        self.last_tick = now;
-        self.last_frames = self.frames_seen;
-        self.last_rx = self.rx_bytes;
-        self.rebuild_hud();
-        if now.duration_since(self.last_log) >= Duration::from_secs(5) {
-            self.last_log = now;
-            logln!("[ui] metrics: {}", self.metrics_line());
-        }
-    }
-
-    /// One compact, greppable metrics line (also used by the e2e checks).
-    fn metrics_line(&self) -> String {
-        let rtt = self
-            .rtt_ms
-            .map(|m| format!("{m}ms"))
-            .unwrap_or_else(|| "?".into());
-        format!(
-            "fps {:.1} srv-fps {:.1} rx {}/s ratio {:.1}x rtt {} cap {}us enc {}us win {}",
-            self.rate_fps,
-            self.server_fps(),
-            fmt_rate(self.rate_rx),
-            self.server_ratio(),
-            rtt,
-            self.stats.capture_us,
-            self.stats.encode_us,
-            self.stats.windows,
-        )
-    }
-
-    /// Server-reported frame rate for its last interval.
-    fn server_fps(&self) -> f32 {
-        if self.stats.interval_ms == 0 {
-            0.0
-        } else {
-            self.stats.frames as f32 * 1000.0 / self.stats.interval_ms as f32
-        }
-    }
-
-    /// Compression ratio from the server's byte counters (falls back to the
-    /// client's own wire accounting before the first `Stats` arrives).
-    fn server_ratio(&self) -> f32 {
-        if self.stats.comp_bytes > 0 {
-            self.stats.raw_bytes as f32 / self.stats.comp_bytes as f32
-        } else {
-            self.ratio
-        }
-    }
-
-    fn rebuild_hud(&mut self) {
-        let rtt = self
-            .rtt_ms
-            .map(|m| format!("{m}ms"))
-            .unwrap_or_else(|| "-".into());
-        let input = self
-            .input_ms
-            .map(|m| format!("{m:.1}ms"))
-            .unwrap_or_else(|| "-".into());
-        let lines = vec![
-            format!(
-                "xcom v{}  rtt {}  win {}",
-                xcom_proto::PROTO_VERSION,
-                rtt,
-                self.stats.windows
-            ),
-            format!(
-                "fps {:.1}/{:.1}  rx {}/s",
-                self.rate_fps,
-                self.server_fps(),
-                fmt_rate(self.rate_rx)
-            ),
-            format!(
-                "x{:.1}  cap {}us  enc {}us  rects {}",
-                self.server_ratio(),
-                self.stats.capture_us,
-                self.stats.encode_us,
-                self.stats.rects
-            ),
-            format!("in->px {}  pres {}", input, self.presents),
-        ];
-        self.hud = Hud {
-            lines,
-            graph: self.rx_history.iter().copied().collect(),
-        };
-    }
-
     /// Debug aid: print the alpha mask and write a PPM of a received cursor.
     fn dump_cursor(&mut self, w: u16, h: u16, xhot: u16, yhot: u16, pixels: &[u32]) {
         let mut art = String::new();
@@ -1519,24 +1223,6 @@ mod tests {
     }
 
     #[test]
-    fn hud_toggle_binding() {
-        use winit::keyboard::{Key, KeyCode, NamedKey};
-        let m = PhysicalKey::Code(KeyCode::KeyM);
-        let other = PhysicalKey::Code(KeyCode::KeyN);
-        // Physical key with Ctrl+Shift (the common case).
-        assert!(is_hud_toggle(&Key::Character("m".into()), &m, true, true, false));
-        assert!(is_hud_toggle(&Key::Character("M".into()), &m, true, true, false));
-        // Logical fallback: `m` on a different physical key (non-QWERTY).
-        assert!(is_hud_toggle(&Key::Character("m".into()), &other, true, true, false));
-        // Modifiers are required, and Alt/Super must be excluded.
-        assert!(!is_hud_toggle(&Key::Character("m".into()), &m, false, true, false));
-        assert!(!is_hud_toggle(&Key::Character("m".into()), &m, true, false, false));
-        assert!(!is_hud_toggle(&Key::Character("m".into()), &m, true, true, true));
-        // Any other key must not toggle.
-        assert!(!is_hud_toggle(&Key::Named(NamedKey::F5), &PhysicalKey::Code(KeyCode::F5), true, true, false));
-    }
-
-    #[test]
     fn placement_cascades_and_centers() {
         // Normal window: remote position with a 32 px cascade; negatives clamp.
         assert_eq!(place_window(10, 20, xcom_proto::KIND_NORMAL, false, 100, 80, None), (42, 52));
@@ -1599,14 +1285,6 @@ mod tests {
         p.blit(&bigger, &mut decode);
         assert_eq!((p.w, p.h), (6, 5));
         assert_eq!(p.buf[6 + 1], 0xff1e140a, "content kept at new stride");
-    }
-
-    #[test]
-    fn byte_rate_formatting() {
-        assert_eq!(fmt_rate(0.0), "0B");
-        assert_eq!(fmt_rate(999.0), "999B");
-        assert_eq!(fmt_rate(1500.0), "1.5kB");
-        assert_eq!(fmt_rate(2_500_000.0), "2.5MB");
     }
 
     #[test]

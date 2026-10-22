@@ -8,6 +8,7 @@
 
 mod hud;
 mod keys;
+mod metrics;
 mod ui;
 
 use std::io::{BufRead, BufReader};
@@ -501,7 +502,7 @@ fn control_loop(
                         capture_us,
                         encode_us,
                         windows,
-                    } => Some(UserEvent::Stats(ui::ServerStats {
+                    } => Some(UserEvent::Stats(crate::metrics::ServerStats {
                         interval_ms,
                         frames,
                         rects,
