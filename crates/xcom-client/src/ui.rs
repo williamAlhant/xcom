@@ -239,9 +239,12 @@ pub struct App {
     debug_tools: bool,
     /// Rates, RTT, server counters and the HUD overlay.
     metrics: Metrics,
-    /// A popup lost local focus: dismiss the remote menu if nothing of ours
-    /// regains focus by then.
+    /// Focus left the session with a popup open: dismiss the remote menu if
+    /// nothing of ours regains focus by then.
     dismiss_at: Option<Instant>,
+    /// Whether the local pointer is inside any of our windows. A menu must not
+    /// be dismissed while the user is interacting with it.
+    pointer_inside: bool,
     /// Modifier state from winit. The keysym map only knows about modifiers we
     /// saw a *press* for; Wayland reports modifiers held before (or while) the
     /// window got focus only through `ModifiersChanged`.
@@ -357,6 +360,7 @@ impl App {
             debug_tools,
             metrics: Metrics::new(hud, queue_us),
             dismiss_at: None,
+            pointer_inside: false,
             mods: ModifiersState::empty(),
         }
     }
@@ -929,6 +933,18 @@ impl ApplicationHandler<UserEvent> for App {
             return;
         };
         match event {
+            WindowEvent::CursorEntered { .. } => {
+                if xcom_proto::debug() {
+                    logln!("[ui] cursor entered {remote:#x}");
+                }
+                self.pointer_inside = true;
+            }
+            WindowEvent::CursorLeft { .. } => {
+                if xcom_proto::debug() {
+                    logln!("[ui] cursor left {remote:#x}");
+                }
+                self.pointer_inside = false;
+            }
             WindowEvent::Moved(pos) => {
                 if let Some(att) = self.attached.get_mut(&remote) {
                     att.placed = (pos.x, pos.y);
@@ -1049,14 +1065,13 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 // A remote menu dismisses itself via its X pointer grab, which
                 // only sees clicks we forward. If focus leaves the session
-                // (click on the desktop or another app) the menu would stay
-                // mapped, so schedule a dismiss; anything of ours regaining
-                // focus cancels it. Only a *popup* losing focus triggers this,
-                // so opening a menu (which focuses the popup) cannot close it.
+                // (desktop, another app) the menu would stay mapped, so
+                // schedule a dismiss. Any window losing focus can signal this:
+                // under XWayland an override-redirect popup may never take
+                // focus, so the *main* window is the one that loses it.
                 if focused {
                     self.dismiss_at = None;
-                } else if self.is_popup(remote) && self.attached.get(&remote).is_some_and(|a| a.visible)
-                {
+                } else if self.has_visible_popup() {
                     self.dismiss_at = Some(Instant::now() + POPUP_DISMISS_DELAY);
                 }
                 if !focused {
@@ -1178,6 +1193,13 @@ fn x11_button(b: MouseButton) -> u8 {
 }
 
 impl App {
+    /// A popup that is currently shown (menus/tooltips).
+    fn has_visible_popup(&self) -> bool {
+        self.attached
+            .iter()
+            .any(|(id, a)| a.visible && self.is_popup(*id))
+    }
+
     /// True for menu/tooltip-like windows (they behave as popups locally).
     fn is_popup(&self, id: u32) -> bool {
         self.attached.get(&id).is_some_and(|a| a.override_redirect)
@@ -1197,14 +1219,21 @@ impl App {
             return;
         }
         self.dismiss_at = None;
-        if self.attached.values().any(|a| a.window.has_focus()) {
+        let focused = self.attached.values().any(|a| a.window.has_focus());
+        let popup = self.has_visible_popup();
+        if xcom_proto::debug() {
+            logln!(
+                "[ui] dismiss check: focused={focused} pointer_inside={} popup={popup}",
+                self.pointer_inside
+            );
+        }
+        if focused {
             return; // focus stayed inside the session
         }
-        let popup_open = self
-            .attached
-            .iter()
-            .any(|(id, a)| a.visible && self.is_popup(*id));
-        if !popup_open {
+        if self.pointer_inside {
+            return; // the user is interacting with one of our windows
+        }
+        if !popup {
             return;
         }
         logln!("[ui] focus left the session; dismissing the remote popup");
