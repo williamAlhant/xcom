@@ -40,6 +40,17 @@ enum Cmd {
     Connect(ConnectArgs),
 }
 
+/// Which windowing backend to use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum Backend {
+    /// Prefer the X11/XWayland backend when a display is available.
+    Auto,
+    /// Force X11/XWayland.
+    X11,
+    /// Leave the environment alone (winit prefers Wayland when available).
+    Wayland,
+}
+
 #[derive(clap::Args)]
 struct ConnectArgs {
     /// ssh target (user@host): runs `xcomd serve --json` over ssh.
@@ -86,6 +97,10 @@ struct ConnectArgs {
     /// local selection, so it can be switched off.
     #[arg(long)]
     no_clipboard_sync: bool,
+    /// Windowing backend. `auto` prefers X11/XWayland because per-window
+    /// placement and clipboard mirroring depend on it.
+    #[arg(long, value_enum, default_value = "auto")]
+    backend: Backend,
     /// Test aid: type this text (Latin-1) after the session comes up.
     #[arg(long, allow_hyphen_values = true)]
     type_text: Option<String>,
@@ -119,6 +134,53 @@ fn json_field(line: &str, key: &str) -> Option<String> {
     let rest = &line[start..];
     let end = rest.find('"')?;
     Some(rest[..end].to_string())
+}
+
+/// Choose the windowing backend and apply it to the environment.
+///
+/// The X11/XWayland backend is preferred because Wayland has no global window
+/// positions (`xdg_popup` is not available in winit 0.30) and its clipboard can
+/// only be observed through XWayland. `--backend wayland` keeps native Wayland.
+///
+/// Returns the chosen backend and, when `WAYLAND_DISPLAY` was hidden, its old
+/// value so a failed X11 start can fall back.
+fn apply_backend(choice: Backend) -> Result<(Backend, Option<std::ffi::OsString>)> {
+    let wayland = std::env::var_os("WAYLAND_DISPLAY");
+    let x11 = std::env::var_os("DISPLAY").is_some();
+    let chosen = match choice {
+        Backend::X11 => {
+            if !x11 {
+                bail!("--backend x11 needs DISPLAY (is XWayland running?)");
+            }
+            Backend::X11
+        }
+        Backend::Wayland => Backend::Wayland,
+        Backend::Auto => {
+            if x11 {
+                Backend::X11
+            } else {
+                Backend::Wayland
+            }
+        }
+    };
+    let mut saved = None;
+    if chosen == Backend::X11 {
+        if let Some(w) = wayland {
+            // Called before the event loop or any threads exist.
+            std::env::remove_var("WAYLAND_DISPLAY");
+            saved = Some(w);
+        }
+        logln!(
+            "[xcom] backend: X11/XWayland (popup placement and clipboard mirroring need it; \
+             --backend wayland opts out)"
+        );
+    } else {
+        logln!(
+            "[xcom] backend: Wayland (popups are compositor-placed; local clipboard changes are \
+             only visible through XWayland while it is focused)"
+        );
+    }
+    Ok((chosen, saved))
 }
 
 /// Numeric JSON field (`"proto":6`), unlike `json_field` which expects a
@@ -244,6 +306,10 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let Cmd::Connect(args) = cli.cmd;
 
+    // Must run before the event loop (and before any thread) reads the
+    // environment.
+    let (backend, saved_wayland) = apply_backend(args.backend)?;
+
     let mut handshake = match (&args.ssh, &args.direct) {
         (Some(target), _) => {
             bootstrap_ssh(target, args.ssh_args.as_deref(), args.exec.as_deref())?
@@ -298,9 +364,28 @@ fn main() -> Result<()> {
     .context("bulk channel")?;
     logln!("[xcom] secure channel established");
 
-    let event_loop = EventLoop::<UserEvent>::with_user_event()
-        .build()
-        .context("creating the event loop (a display server is required for the client)")?;
+    let event_loop = match EventLoop::<UserEvent>::with_user_event().build() {
+        Ok(el) => el,
+        Err(e) => {
+            // We may have hidden a perfectly good Wayland session behind a
+            // stale DISPLAY; retry there before giving up.
+            if backend == Backend::X11 {
+                if let Some(wayland) = saved_wayland {
+                    logln!("[xcom] X11 backend unavailable ({e}); retrying on Wayland");
+                    std::env::set_var("WAYLAND_DISPLAY", wayland);
+                    EventLoop::<UserEvent>::with_user_event()
+                        .build()
+                        .context("creating the event loop (a display server is required for the client)")?
+                } else {
+                    return Err(e)
+                        .context("creating the event loop (a display server is required for the client)");
+                }
+            } else {
+                return Err(e)
+                    .context("creating the event loop (a display server is required for the client)");
+            }
+        }
+    };
     let proxy = event_loop.create_proxy();
     // Every message carries its enqueue time: the writer measures how long it
     // waited before reaching the socket (the HUD's queue_ms).

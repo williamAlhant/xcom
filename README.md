@@ -43,7 +43,8 @@ containers); `--seconds N` exits after N seconds (0 = until the windows close);
 `xcomd serve --spawn 1600x1200` sets the virtual display size; `--hud` shows
 the metrics overlay (fps, bandwidth, compression ratio, RTT, capture/encode
 time), toggled in-session with Ctrl+Shift+M; `--no-clipboard-sync` turns off
-clipboard mirroring.
+clipboard mirroring; `--backend auto|x11|wayland` picks the client backend
+(`auto` prefers X11/XWayland, see below).
 
 Builds:
 
@@ -71,6 +72,12 @@ Tests: `cargo test --workspace`, plus `scripts/e2e-direct.sh`,
   (CLIPBOARD only; no PRIMARY/middle-click). Disable with
   `--no-clipboard-sync`, since mirroring lets the remote read your local
   selection.
+- **Wayland client defaults to X11/XWayland.** Wayland has no global window
+  positions (`xdg_popup` is not available in winit 0.30), so menus and tooltips
+  land wherever the compositor puts them, and the clipboard can only be
+  observed through XWayland. `--backend auto` therefore uses XWayland when
+  `DISPLAY` is set; `--backend wayland` keeps native Wayland (useful for
+  fractional scaling and input methods) with those limitations.
 - **Single remote screen**: no multi-monitor, no audio, no file transfer.
 - **Not security-audited.** Tokens and the ephemeral certificate are
   regenerated on every run.
