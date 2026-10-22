@@ -3,6 +3,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+#[cfg(feature = "m0")]
 mod m0;
 mod serve;
 
@@ -18,6 +19,7 @@ enum Cmd {
     /// Serve a session over the dedicated secure channel (SSH bootstrap).
     Serve(serve::ServeArgs),
     /// M0 spike harness (capture pipeline, latency, input injection).
+    #[cfg(feature = "m0")]
     M0(m0::Args),
 }
 
@@ -25,6 +27,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Serve(args) => serve::run(args),
+        #[cfg(feature = "m0")]
         Cmd::M0(args) => m0::run(args),
     }
 }

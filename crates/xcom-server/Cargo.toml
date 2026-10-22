@@ -9,6 +9,13 @@ description = "xcom session daemon (xcomd)"
 name = "xcomd"
 path = "src/main.rs"
 
+[features]
+# The M0 spike harness (anim, wm-demo, selftest, sink) is a development tool.
+# On by default so the dev loop and the e2e scripts can use `xcomd m0`; the
+# shipping artifact is built with --no-default-features.
+default = ["m0"]
+m0 = []
+
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true }

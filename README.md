@@ -49,6 +49,7 @@ Builds:
 ```sh
 cargo build --release                 # dev binaries (target/release)
 scripts/build-static.sh xcomd xcom    # static musl       (dist/)
+scripts/build-static.sh --dev xcomd   # + M0 harness, for the test container
 scripts/build-windows.sh              # Windows client    (target/x86_64-pc-windows-msvc)
 ```
 

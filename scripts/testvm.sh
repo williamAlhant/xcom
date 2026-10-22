@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Manage the xcom test VM container (Debian + sshd + Xvfb + test apps).
 #
-#   scripts/testvm.sh up        build + start (also installs the static xcomd)
+#   scripts/testvm.sh up        build + start (installs the dev static xcomd)
 #   scripts/testvm.sh down      stop + remove
 #   scripts/testvm.sh status    show state
 #
@@ -25,20 +25,23 @@ case "${1:-up}" in
         cp "$KEY.pub" "$BUILDCTX/authorized_keys"
         cp "$REPO/deploy/testvm/Dockerfile" "$BUILDCTX/Dockerfile"
 
+        # The container needs the *dev* artifact: the e2e scripts run
+        # `xcomd m0 anim|wm-demo|selftest`, which the shipping build drops.
+        DEVBIN="$REPO/dist/xcomd-dev-linux-x86_64"
         # Rebuild when sources changed: the container runs the static artifact
         # and a stale one silently invalidates the test (that bug already bit
         # us once), but a rebuild per run is needless waiting.
-        NEWER=$(find "$REPO/crates" "$REPO/Cargo.toml" "$REPO/Cargo.lock" -newer "$REPO/dist/xcomd-linux-x86_64" -name '*.rs' -o -newer "$REPO/dist/xcomd-linux-x86_64" -name 'Cargo.*' 2>/dev/null | head -1)
-        if [ ! -x "$REPO/dist/xcomd-linux-x86_64" ] || [ -n "$NEWER" ]; then
-            "$REPO/scripts/build-static.sh" xcomd
+        NEWER=$(find "$REPO/crates" "$REPO/Cargo.toml" "$REPO/Cargo.lock" -newer "$DEVBIN" -name '*.rs' -o -newer "$DEVBIN" -name 'Cargo.*' 2>/dev/null | head -1)
+        if [ ! -x "$DEVBIN" ] || [ -n "$NEWER" ]; then
+            "$REPO/scripts/build-static.sh" --dev xcomd
         else
-            echo "static xcomd up to date"
+            echo "static dev xcomd up to date"
         fi
 
         podman build -t xcom-testvm "$BUILDCTX"
         podman rm -f "$NAME" >/dev/null 2>&1 || true
         podman run -d --name "$NAME" --network host \
-            -v "$REPO/dist/xcomd-linux-x86_64:/usr/local/bin/xcomd:ro" \
+            -v "$DEVBIN:/usr/local/bin/xcomd:ro" \
             xcom-testvm
         echo "waiting for sshd..."
         for _ in $(seq 1 50); do

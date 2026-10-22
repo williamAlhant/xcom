@@ -114,6 +114,18 @@ fn json_field(line: &str, key: &str) -> Option<String> {
     Some(rest[..end].to_string())
 }
 
+/// Numeric JSON field (`"proto":6`), unlike `json_field` which expects a
+/// quoted string value.
+fn json_number(line: &str, key: &str) -> Option<u64> {
+    let pat = format!("\"{key}\":");
+    let start = line.find(&pat)? + pat.len();
+    let rest = &line[start..];
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    rest[..end].parse().ok()
+}
+
 fn token32(bytes: Vec<u8>) -> Result<[u8; 32]> {
     bytes
         .try_into()
@@ -185,8 +197,8 @@ fn bootstrap_ssh(
             // remote binary is from a different build: say so plainly instead of
             // failing later on an unknown message type. (The TLS hello checks it
             // too; this is the friendlier early error.)
-            match json_field(&line, "proto").and_then(|p| p.parse::<u16>().ok()) {
-                Some(p) if p == xcom_proto::PROTO_VERSION => {}
+            match json_number(&line, "proto") {
+                Some(p) if p == xcom_proto::PROTO_VERSION as u64 => {}
                 Some(p) => bail!(
                     "remote speaks protocol {p}, this client speaks {} (update the other side)",
                     xcom_proto::PROTO_VERSION
