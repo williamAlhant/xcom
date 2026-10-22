@@ -130,6 +130,13 @@ fn main() -> Result<()> {
                 std::thread::sleep(std::time::Duration::from_secs(hold));
             }
         }
+        "focus-none" => {
+            // Test aid: drop X input focus entirely, like clicking the desktop.
+            conn.set_input_focus(InputFocus::NONE, 0u32, Timestamp::from(0u32))?
+                .check()?;
+            conn.flush()?;
+            println!("focus cleared");
+        }
         "focus-get" => {
             let r = conn.get_input_focus()?.reply()?;
             println!("focus={:#x} revert={:?}", r.focus, r.revert_to);

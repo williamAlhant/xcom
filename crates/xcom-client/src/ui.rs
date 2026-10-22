@@ -206,6 +206,8 @@ struct Attached {
     cursor: (i16, i16),
     /// Override-redirect popups must not move the remote input focus.
     override_redirect: bool,
+    /// Hidden by an unmap (the store is kept).
+    visible: bool,
     /// Position we asked the compositor for (and the last known one). Wayland
     /// has no global positions, so parent-relative placement uses this.
     placed: (i32, i32),
@@ -237,6 +239,9 @@ pub struct App {
     debug_tools: bool,
     /// Rates, RTT, server counters and the HUD overlay.
     metrics: Metrics,
+    /// A popup lost local focus: dismiss the remote menu if nothing of ours
+    /// regains focus by then.
+    dismiss_at: Option<Instant>,
     /// Modifier state from winit. The keysym map only knows about modifiers we
     /// saw a *press* for; Wayland reports modifiers held before (or while) the
     /// window got focus only through `ModifiersChanged`.
@@ -351,6 +356,7 @@ impl App {
             fullscreen,
             debug_tools,
             metrics: Metrics::new(hud, queue_us),
+            dismiss_at: None,
             mods: ModifiersState::empty(),
         }
     }
@@ -589,6 +595,7 @@ impl App {
                 remote: (pix.w, pix.h),
                 cursor: (0, 0),
                 override_redirect,
+                visible: true,
                 placed,
             },
         );
@@ -810,15 +817,17 @@ impl ApplicationHandler<UserEvent> for App {
                 self.present(id);
             }
             UserEvent::Unmap { id } => {
-                if let Some(att) = self.attached.get(&id) {
+                if let Some(att) = self.attached.get_mut(&id) {
                     logln!("[ui] window {id:#x} unmapped (hidden, store kept)");
                     att.window.set_visible(false);
+                    att.visible = false;
                 }
             }
             UserEvent::Map { id } => {
-                if let Some(att) = self.attached.get(&id) {
+                if let Some(att) = self.attached.get_mut(&id) {
                     logln!("[ui] window {id:#x} mapped again");
                     att.window.set_visible(true);
+                    att.visible = true;
                     self.present(id);
                     self.send(Message::FullRequest { id });
                 } else if self.pixels.contains_key(&id) {
@@ -1038,6 +1047,18 @@ impl ApplicationHandler<UserEvent> for App {
                 if xcom_proto::debug() {
                     logln!("[ui] focused={focused} (win {remote:#x})");
                 }
+                // A remote menu dismisses itself via its X pointer grab, which
+                // only sees clicks we forward. If focus leaves the session
+                // (click on the desktop or another app) the menu would stay
+                // mapped, so schedule a dismiss; anything of ours regaining
+                // focus cancels it. Only a *popup* losing focus triggers this,
+                // so opening a menu (which focuses the popup) cannot close it.
+                if focused {
+                    self.dismiss_at = None;
+                } else if self.is_popup(remote) && self.attached.get(&remote).is_some_and(|a| a.visible)
+                {
+                    self.dismiss_at = Some(Instant::now() + POPUP_DISMISS_DELAY);
+                }
                 if !focused {
                     // Releases may never arrive after losing OS focus; never
                     // leave a remote key held (the X server would autorepeat it).
@@ -1119,20 +1140,31 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
         self.metrics.tick(false);
-        if self.metrics.hud_on() {
+        self.dismiss_if_unfocused();
+        let hud_next = if self.metrics.hud_on() {
             // Repaint so the HUD (rates, sparkline) stays live even when the
             // remote window is static and produces no frames.
             for att in self.attached.values() {
                 att.window.request_redraw();
             }
-            el.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
-                Instant::now() + crate::metrics::INTERVAL,
-            ));
+            Some(Instant::now() + crate::metrics::INTERVAL)
         } else {
-            el.set_control_flow(winit::event_loop::ControlFlow::Wait);
-        }
+            None
+        };
+        let next = match (hud_next, self.dismiss_at) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        el.set_control_flow(match next {
+            Some(at) => winit::event_loop::ControlFlow::WaitUntil(at),
+            None => winit::event_loop::ControlFlow::Wait,
+        });
     }
 }
+
+/// Grace period after a popup loses focus: focus moving between our windows
+/// (e.g. the parent reacting to a click) must not dismiss the menu.
+const POPUP_DISMISS_DELAY: std::time::Duration = std::time::Duration::from_millis(150);
 
 fn x11_button(b: MouseButton) -> u8 {
     match b {
@@ -1146,6 +1178,47 @@ fn x11_button(b: MouseButton) -> u8 {
 }
 
 impl App {
+    /// True for menu/tooltip-like windows (they behave as popups locally).
+    fn is_popup(&self, id: u32) -> bool {
+        self.attached.get(&id).is_some_and(|a| a.override_redirect)
+            || self
+                .pixels
+                .get(&id)
+                .is_some_and(|p| matches!(p.kind, xcom_proto::KIND_MENU | xcom_proto::KIND_TOOLTIP))
+    }
+
+    /// Escape closes a remote menu: its grab receives the injected key even
+    /// though our windows no longer have local focus.
+    fn dismiss_if_unfocused(&mut self) {
+        let Some(at) = self.dismiss_at else {
+            return;
+        };
+        if Instant::now() < at {
+            return;
+        }
+        self.dismiss_at = None;
+        if self.attached.values().any(|a| a.window.has_focus()) {
+            return; // focus stayed inside the session
+        }
+        let popup_open = self
+            .attached
+            .iter()
+            .any(|(id, a)| a.visible && self.is_popup(*id));
+        if !popup_open {
+            return;
+        }
+        logln!("[ui] focus left the session; dismissing the remote popup");
+        const XK_ESCAPE: u32 = 0xff1b;
+        self.send(Message::InputKey {
+            sym: XK_ESCAPE,
+            pressed: true,
+        });
+        self.send(Message::InputKey {
+            sym: XK_ESCAPE,
+            pressed: false,
+        });
+    }
+
     /// Debug aid: print the alpha mask and write a PPM of a received cursor.
     fn dump_cursor(&mut self, w: u16, h: u16, xhot: u16, yhot: u16, pixels: &[u32]) {
         let mut art = String::new();
