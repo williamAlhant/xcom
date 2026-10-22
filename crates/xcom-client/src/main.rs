@@ -444,6 +444,9 @@ fn control_loop(
             next_ping = std::time::Instant::now() + Duration::from_secs(5);
         }
 
+        // Short timeout so queued input is written promptly; the reader keeps
+        // partial frames across timeouts. See the server's control_loop for why
+        // this is not split into reader/writer threads (single rustls stream).
         control.set_read_timeout(Some(Duration::from_millis(5)))?;
         match control.recv() {
             Ok(Some((ty, payload))) => {

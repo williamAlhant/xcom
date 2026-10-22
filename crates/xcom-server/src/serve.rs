@@ -401,6 +401,13 @@ fn control_loop(
         // Poll for inbound input; the short timeout is what lets us service
         // `outbound` promptly. The frame reader keeps partial frames, so this
         // is safe mid-message.
+        //
+        // A blocking reader thread is not an option: Channel wraps a single
+        // rustls stream whose recv() and send() both need &mut, so a reader
+        // blocked in recv() would hold the stream and starve writers. The cost
+        // here is one recv syscall per 5 ms (0% CPU when idle); if that ever
+        // matters, the clean fix is poll(2) on the socket fd plus a self-pipe
+        // written by outbound producers, as capture.rs already does for X11.
         control.set_read_timeout(Some(Duration::from_millis(5)))?;
         match control.recv() {
             Ok(Some((ty, payload))) => {
