@@ -25,6 +25,7 @@ use raw_window_handle::HasWindowHandle;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::keyboard::{Key, ModifiersState, PhysicalKey};
 use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
 use winit::window::{Window, WindowId};
 
@@ -266,6 +267,10 @@ pub struct App {
     last_log: Instant,
     /// Window and time of the last input we sent, for input -> present latency.
     last_input: Option<(u32, Instant)>,
+    /// Modifier state from winit. The keysym map below only knows about
+    /// modifiers we saw a *press* for; Wayland reports modifiers held before
+    /// (or while) the window got focus only through `ModifiersChanged`.
+    mods: ModifiersState,
 }
 
 /// Refuse absurd window sizes from the wire: the store is `w*h*4` bytes, and
@@ -337,6 +342,7 @@ impl App {
             last_rx: 0,
             last_log: Instant::now(),
             last_input: None,
+            mods: ModifiersState::empty(),
         }
     }
 
@@ -890,6 +896,12 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn window_event(&mut self, _el: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        // Modifier state is global and must be tracked even for events that
+        // arrive before/without a mapped remote window.
+        if let WindowEvent::ModifiersChanged(m) = &event {
+            self.mods = m.state();
+            return;
+        }
         let Some(remote) = self.remote_id(id) else {
             return;
         };
@@ -1067,33 +1079,36 @@ impl ApplicationHandler<UserEvent> for App {
                         .values()
                         .any(|s| syms.contains(s))
                 };
-                let ctrl = held_any(CTRL);
-                let shift = held_any(SHIFT);
-                let alt_super = held_any(ALT) || held_any(SUPER);
+                let ctrl = self.mods.control_key() || held_any(CTRL);
+                let shift = self.mods.shift_key() || held_any(SHIFT);
+                let alt_super = self.mods.alt_key()
+                    || self.mods.super_key()
+                    || held_any(ALT)
+                    || held_any(SUPER);
                 let ctrl_alt = ctrl || alt_super;
 
                 // Local clipboard shortcuts (not forwarded): copy the remote
                 // selection locally, or push the local clipboard remotely.
                 if ctrl && shift && !alt_super {
+                    // HUD toggle: accept the physical key or the logical
+                    // character (non-QWERTY layouts, Wine's bogus virtual
+                    // keys). Checked before the clipboard keys.
+                    if is_hud_toggle(&event.logical_key, &event.physical_key, ctrl, shift, alt_super)
+                    {
+                        self.hud_on = !self.hud_on;
+                        eprintln!("[ui] HUD {}", if self.hud_on { "on" } else { "off" });
+                        self.tick_metrics(true);
+                        for att in self.attached.values() {
+                            att.window.request_redraw();
+                        }
+                        return;
+                    }
                     match event.physical_key {
                         winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyC) => {
                             eprintln!("[ui] clipboard: requesting the remote selection");
                             self.send(Message::ClipboardGet {
                                 target: xcom_proto::CLIPBOARD_CLIPBOARD,
                             });
-                            return;
-                        }
-                        winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyM) => {
-                            // Local HUD toggle (never forwarded).
-                            self.hud_on = !self.hud_on;
-                            eprintln!(
-                                "[ui] HUD {}",
-                                if self.hud_on { "on" } else { "off" }
-                            );
-                            self.tick_metrics(true);
-                            for att in self.attached.values() {
-                                att.window.request_redraw();
-                            }
                             return;
                         }
                         winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyV) => {
@@ -1219,6 +1234,21 @@ impl ApplicationHandler<UserEvent> for App {
             el.set_control_flow(winit::event_loop::ControlFlow::Wait);
         }
     }
+}
+
+/// True when a key event should toggle the metrics HUD (Ctrl+Shift+M).
+///
+/// The physical key covers the common case; the logical character covers
+/// layouts where `m` is not at `KeyCode::KeyM` and Wine, which reports bogus
+/// virtual keys (the same reason the Ctrl/Alt shortcuts use the logical key).
+fn is_hud_toggle(logical: &Key, physical: &PhysicalKey, ctrl: bool, shift: bool, alt_super: bool) -> bool {
+    if !ctrl || !shift || alt_super {
+        return false;
+    }
+    if matches!(physical, PhysicalKey::Code(winit::keyboard::KeyCode::KeyM)) {
+        return true;
+    }
+    matches!(logical, Key::Character(c) if c.eq_ignore_ascii_case("m"))
 }
 
 /// Human-readable byte rate (B/s, kB/s, MB/s).
@@ -1453,6 +1483,24 @@ mod tests {
         assert!(!sane_size(800, 0));
         assert!(!sane_size(65535, 65535));
         assert!(!sane_size(8193, 100));
+    }
+
+    #[test]
+    fn hud_toggle_binding() {
+        use winit::keyboard::{Key, KeyCode, NamedKey};
+        let m = PhysicalKey::Code(KeyCode::KeyM);
+        let other = PhysicalKey::Code(KeyCode::KeyN);
+        // Physical key with Ctrl+Shift (the common case).
+        assert!(is_hud_toggle(&Key::Character("m".into()), &m, true, true, false));
+        assert!(is_hud_toggle(&Key::Character("M".into()), &m, true, true, false));
+        // Logical fallback: `m` on a different physical key (non-QWERTY).
+        assert!(is_hud_toggle(&Key::Character("m".into()), &other, true, true, false));
+        // Modifiers are required, and Alt/Super must be excluded.
+        assert!(!is_hud_toggle(&Key::Character("m".into()), &m, false, true, false));
+        assert!(!is_hud_toggle(&Key::Character("m".into()), &m, true, false, false));
+        assert!(!is_hud_toggle(&Key::Character("m".into()), &m, true, true, true));
+        // Any other key must not toggle.
+        assert!(!is_hud_toggle(&Key::Named(NamedKey::F5), &PhysicalKey::Code(KeyCode::F5), true, true, false));
     }
 
     #[test]

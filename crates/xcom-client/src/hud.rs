@@ -112,10 +112,14 @@ const LINE_H: usize = 9;
 const GRAPH_H: usize = 22;
 
 const PANEL: u32 = 0x0000_0000;
-const PANEL_ALPHA: u32 = 205;
-const FG: u32 = 0x00e6e6e6;
-const DIM: u32 = 0x00a0a0a0;
-const GRAPH_FG: u32 = 0x0060c060;
+/// Opaque enough to read over any content, including a black terminal.
+const PANEL_ALPHA: u32 = 230;
+/// Colours carry an explicit opaque alpha: the overlay lives in an ARGB
+/// surface, so an alpha-0 pixel is transparent on Wayland/Windows (only X11's
+/// 24-bit visual ignores the byte) and the text disappears.
+const FG: u32 = 0xffe6e6e6;
+const DIM: u32 = 0xffa0a0a0;
+const GRAPH_FG: u32 = 0xff60c060;
 
 /// Text lines plus a bandwidth history for the metrics overlay.
 #[derive(Default, Clone)]
@@ -157,7 +161,7 @@ fn text(buf: &mut [u32], w: usize, h: usize, x: usize, y: usize, s: &str, color:
                     }
                     let px = cx + col;
                     if px < w {
-                        buf[py * w + px] = color;
+                        buf[py * w + px] = color | 0xff00_0000;
                     }
                 }
             }
@@ -193,7 +197,7 @@ fn graph(
             for col in 0..bar_w {
                 let px = x + i * bar_w + col;
                 if px < buf_w {
-                    buf[py * buf_w + px] = GRAPH_FG;
+                    buf[py * buf_w + px] = GRAPH_FG | 0xff00_0000;
                 }
             }
         }
@@ -285,6 +289,37 @@ mod tests {
         draw(&mut one, 1, 1, &hud);
         let mut short = vec![0u32; 3];
         draw(&mut short, 4, 4, &hud);
+    }
+
+    #[test]
+    fn every_written_pixel_is_opaque() {
+        // The overlay is composited in an ARGB surface (Wayland, Windows): an
+        // alpha-0 pixel there is invisible/half-blended, which is exactly the
+        // "glitchy unreadable HUD" bug. X11's 24-bit visual hides it, so this
+        // must be asserted directly, not only through the X11 e2e readback.
+        let (w, h) = (200usize, 80usize);
+        let mut buf = vec![0xff00_0000u32; w * h];
+        let hud = Hud {
+            lines: vec![
+                "xcom v6  rtt 3ms  win 2".into(),
+                "fps 60.0/60.0  rx 1.2MB/s".into(),
+                "x228.6  cap 136us  enc 10us  rects 63".into(),
+                "in->px 8.2ms  pres 17883".into(),
+            ],
+            graph: vec![1, 5, 3, 9, 2, 7],
+        };
+        draw(&mut buf, w, h, &hud);
+        let bad: Vec<(usize, u32)> = buf
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(_, p)| (p >> 24) as u8 != 0xff)
+            .take(4)
+            .collect();
+        assert!(bad.is_empty(), "non-opaque pixels written: {bad:?}");
+        // Text and graph must actually be visible (not the panel only).
+        assert!(buf.contains(&FG), "label pixels missing");
+        assert!(buf.contains(&GRAPH_FG), "graph pixels missing");
     }
 
     #[test]
