@@ -13,6 +13,11 @@
 
 pub const PROTO_VERSION: u16 = 6;
 
+/// Build identifier (`git describe --always --dirty`, or the crate version
+/// when git is unavailable). Advertised in the handshake so a stale daemon is
+/// noticed instead of silently behaving like an old version.
+pub const BUILD: &str = env!("XCOM_BUILD");
+
 // Window kinds (server -> client), derived from _NET_WM_WINDOW_TYPE,
 // WM_TRANSIENT_FOR and override_redirect.
 pub const KIND_NORMAL: u8 = 0;

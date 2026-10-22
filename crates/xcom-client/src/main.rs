@@ -271,6 +271,20 @@ fn bootstrap_ssh(
             )?;
             let fingerprint =
                 json_field(&line, "cert_sha256").context("handshake line: cert_sha256")?;
+            // A daemon from another revision can look like a bug (e.g. a
+            // missing feature that exists in this client).
+            match json_field(&line, "build") {
+                Some(remote) if remote != xcom_proto::BUILD => logln!(
+                    "[xcom] warning: remote xcomd build {remote} differs from this client \
+                     ({}); update the remote binary",
+                    xcom_proto::BUILD
+                ),
+                Some(_) => {}
+                None => logln!(
+                    "[xcom] warning: remote xcomd does not report its build (older version); \
+                     update it if something misbehaves"
+                ),
+            }
             // The JSON is informational, but a version mismatch here means the
             // remote binary is from a different build: say so plainly instead of
             // failing later on an unknown message type. (The TLS hello checks it
@@ -349,7 +363,8 @@ fn main() -> Result<()> {
     }
 
     logln!(
-        "[xcom] connecting to {} (fingerprint {}…)",
+        "[xcom] {} connecting to {} (fingerprint {}…)",
+        xcom_proto::BUILD,
         handshake.addr,
         &handshake.fingerprint[..16.min(handshake.fingerprint.len())]
     );

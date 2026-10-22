@@ -205,10 +205,12 @@ pub fn run(args: ServeArgs) -> Result<()> {
     // The single handshake line: everything the client needs to authenticate
     // us (fingerprint) and itself (one token per role), plus where to dial.
     let line = format!(
-        "{{\"proto\":{},\"session\":\"{session_id:016x}\",\"display\":\"{display}\",\
-         \"connect\":\"{addr}\",\"token_control\":\"{}\",\"token_bulk\":\"{}\",\
+        "{{\"proto\":{},\"build\":\"{}\",\"session\":\"{session_id:016x}\",\
+         \"display\":\"{display}\",\"connect\":\"{addr}\",\
+         \"token_control\":\"{}\",\"token_bulk\":\"{}\",\
          \"cert_sha256\":\"{}\"}}",
         xcom_proto::PROTO_VERSION,
+        xcom_proto::BUILD,
         xcom_transport::hex(&control_token),
         xcom_transport::hex(&bulk_token),
         identity.fingerprint(),

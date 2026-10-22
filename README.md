@@ -58,6 +58,10 @@ scripts/build-windows.sh              # Windows client    (target/x86_64-pc-wind
 Tests: `cargo test --workspace`, plus `scripts/e2e-direct.sh`,
 `scripts/e2e-ssh.sh` and `scripts/e2e-clipboard.sh` (short end-to-end runs).
 
+The client warns when the remote daemon reports a different build id: a stale
+`xcomd` silently behaves like an old version, which is easy to mistake for a
+client bug.
+
 ## Limitations
 
 - **X11 capture only.** The server renders into Xvfb (or XWayland); apps that
@@ -84,9 +88,10 @@ Tests: `cargo test --workspace`, plus `scripts/e2e-direct.sh`,
 
 ## Untested / unverified
 
-The Windows client has only been exercised under Wine, not on real Windows
-(DPI behaviour in particular), and not on macOS; client multi-monitor setups
-have not been tested.
+The Windows client has been validated on real Windows (window rendering,
+menus/popup placement, clipboard in both directions, keyboard), but not at
+display scaling above 100%, with client multi-monitor setups, on long sessions,
+or on macOS.
 
 ## Docs
 

@@ -273,9 +273,10 @@ fn clipboard_loop(
                                     xcom_proto::MAX_CLIPBOARD_TEXT
                                 );
                             } else {
-                                if xcom_proto::debug() {
-                                    logln!("[clipboard] remote selection -> client ({} bytes)", text.len());
-                                }
+                                logln!(
+                                    "[clipboard] remote selection -> client ({} bytes)",
+                                    text.len()
+                                );
                                 outbound
                                     .send(xcom_proto::Message::ClipboardData {
                                         target: Target::Clipboard.as_u8(),

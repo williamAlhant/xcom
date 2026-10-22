@@ -24,6 +24,7 @@ podman run --rm \
   -v "$HOME/.cargo":/cargo -e CARGO_HOME=/cargo \
   -v "$HOME/.cache/xwin":/cache/xwin -e XWIN_CACHE_DIR=/cache/xwin \
   -e RUSTFLAGS="-C target-feature=+crt-static" \
+  -e XCOM_BUILD="${XCOM_BUILD:-$(git -C "$REPO" describe --always --dirty 2>/dev/null || echo unknown)}" \
   -e CARGO_PROFILE_RELEASE_DEBUG=${XCOM_WIN_DEBUG:-false} \
   "$IMAGE" \
   cargo xwin build --release --target x86_64-pc-windows-msvc -p xcom-client

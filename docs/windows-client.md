@@ -108,3 +108,28 @@ cargo run -p xcom-x11 --example x11_input -- up 50
   what makes the produced characters match the physical keyboard.
 - DPI/scaling, real Windows window manager quirks, signing/Defender: real
   Windows (M3).
+
+## Validated on real Windows
+
+Date: 2026-10-23. The static `xcom.exe` was run on real Windows against the
+Linux VM (the Wine notes above remain the way to test builds locally).
+
+What was checked:
+
+- windows render at the remote size and present correctly; resize/reflow works;
+- **menus/popups**: an override-redirect context menu appeared one title bar
+  too high. The client anchored content-relative remote coordinates to the
+  parent window's *frame* (`outer_position`, which includes the title bar and
+  the DWM border). Undecorated children now anchor to the parent's client area
+  (`inner_position`); menus land at the pointer. A menu whose window is not
+  focused also stays dismissable: Escape is forwarded when focus leaves the
+  session (see `docs/m2.md`);
+- **clipboard mirrors both ways** (text, 60 KB cap). One failure looked like a
+  one-way clipboard bug but was a stale daemon on the VM; the client now warns
+  when the handshake's build id differs (or is absent);
+- `--backend` is Linux-only: on Windows the flag is ignored (it previously
+  printed a misleading XWayland line when `DISPLAY` happened to be set).
+
+Still untested on Windows: display scaling above 100% (remote pixels map 1:1 to
+physical pixels, so text may look small), multi-monitor setups, and long
+sessions.

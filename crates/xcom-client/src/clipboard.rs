@@ -79,31 +79,33 @@ fn read_and_push(
     suppress_until: &Mutex<Instant>,
 ) {
     if Instant::now() < *suppress_until.lock().unwrap() {
+        if xcom_proto::debug() {
+            logln!("[ui] clipboard: skip (this is the write we just applied)");
+        }
         return; // our own write echoing back
     }
     // Fails for non-text content and while another process holds the clipboard.
     let Ok(text) = cb.get_text() else {
+        if xcom_proto::debug() {
+            logln!("[ui] clipboard: no text in the local selection");
+        }
         return;
     };
     if text.is_empty() {
         return;
     }
     if text.len() > xcom_proto::MAX_CLIPBOARD_TEXT {
-        if xcom_proto::debug() {
-            logln!(
-                "[ui] clipboard: {}-byte local selection not mirrored (cap {})",
-                text.len(),
-                xcom_proto::MAX_CLIPBOARD_TEXT
-            );
-        }
+        logln!(
+            "[ui] clipboard: {}-byte local selection not mirrored (cap {})",
+            text.len(),
+            xcom_proto::MAX_CLIPBOARD_TEXT
+        );
         return;
     }
-    if xcom_proto::debug() {
-        logln!(
-            "[ui] clipboard: mirroring {} bytes to the remote",
-            text.len()
-        );
-    }
+    logln!(
+        "[ui] clipboard: mirroring {} bytes to the remote",
+        text.len()
+    );
     tx.send((
         Message::ClipboardSet {
             target: CLIPBOARD_CLIPBOARD,

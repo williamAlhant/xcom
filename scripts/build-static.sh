@@ -46,6 +46,7 @@ podman run --rm \
     -v xcom-cargo-target:/build/target \
     -w /src \
     -e CARGO_TARGET_DIR=/build/target \
+    -e XCOM_BUILD="${XCOM_BUILD:-$(git -C "$REPO" describe --always --dirty 2>/dev/null || echo unknown)}" \
     -e CARGO_PROFILE_RELEASE_DEBUG=false \
     -e CARGO_PROFILE_RELEASE_STRIP=debuginfo \
     "$IMAGE" \
