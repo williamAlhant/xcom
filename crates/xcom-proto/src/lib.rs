@@ -11,7 +11,7 @@
 //! (the M0 harness and the e2e key-latency check rely on that); other targets
 //! fall back to the system clock so this crate still builds for Windows.
 
-pub const PROTO_VERSION: u16 = 5;
+pub const PROTO_VERSION: u16 = 6;
 
 // Window kinds (server -> client), derived from _NET_WM_WINDOW_TYPE,
 // WM_TRANSIENT_FOR and override_redirect.
@@ -71,6 +71,9 @@ pub const MSG_CLIPBOARD_DATA: u8 = 32;
 
 /// Server -> client: the remote pointer image changed.
 pub const MSG_CURSOR: u8 = 33;
+
+/// Server -> client: metrics for the last interval (client HUD).
+pub const MSG_STATS: u8 = 34;
 
 /// Selection text is length-prefixed with u16; keep a margin below the limit.
 pub const MAX_CLIPBOARD_TEXT: usize = 60_000;
@@ -375,6 +378,25 @@ pub enum Message {
         h: u16,
         pixels: Vec<u32>,
     },
+    /// Server-side metrics for the last interval (drives the client HUD).
+    Stats {
+        /// Length of the interval these counters cover, in milliseconds.
+        interval_ms: u32,
+        /// Damage frames sent in the interval.
+        frames: u32,
+        /// Damage rectangles sent in the interval.
+        rects: u32,
+        /// Uncompressed bytes those rectangles represent.
+        raw_bytes: u64,
+        /// Bytes actually put on the wire (LZ4-compressed).
+        comp_bytes: u64,
+        /// Mean capture time per frame (microseconds).
+        capture_us: u32,
+        /// Mean compression time per frame (microseconds).
+        encode_us: u32,
+        /// Windows currently tracked by the server.
+        windows: u16,
+    },
     Bye,
 }
 
@@ -446,6 +468,7 @@ impl Message {
             Message::ClipboardSet { .. } => MSG_CLIPBOARD_SET,
             Message::ClipboardData { .. } => MSG_CLIPBOARD_DATA,
             Message::Cursor { .. } => MSG_CURSOR,
+            Message::Stats { .. } => MSG_STATS,
             Message::Bye => MSG_BYE,
         }
     }
@@ -537,13 +560,31 @@ impl Message {
                     put_u32(&mut out, *px);
                 }
             }
+            Message::Stats {
+                interval_ms,
+                frames,
+                rects,
+                raw_bytes,
+                comp_bytes,
+                capture_us,
+                encode_us,
+                windows,
+            } => {
+                put_u32(&mut out, *interval_ms);
+                put_u32(&mut out, *frames);
+                put_u32(&mut out, *rects);
+                put_u64(&mut out, *raw_bytes);
+                put_u64(&mut out, *comp_bytes);
+                put_u32(&mut out, *capture_us);
+                put_u32(&mut out, *encode_us);
+                put_u16(&mut out, *windows);
+            }
             Message::Bye => {}
         }
         out
     }
 
-    pub fn decode(msg_type: u8, payload: &[u8]) -> Result<Message, ProtoError> {
-        let mut p = payload;
+    pub fn decode(msg_type: u8, payload: &[u8]) -> Result<Message, ProtoError> {        let mut p = payload;
         let msg = match msg_type {
             MSG_WINDOW_CREATE => Message::WindowCreate {
                 id: take_u32(&mut p)?,
@@ -638,6 +679,16 @@ impl Message {
                 }
             }
             MSG_BYE => Message::Bye,
+            MSG_STATS => Message::Stats {
+                interval_ms: take_u32(&mut p)?,
+                frames: take_u32(&mut p)?,
+                rects: take_u32(&mut p)?,
+                raw_bytes: take_u64(&mut p)?,
+                comp_bytes: take_u64(&mut p)?,
+                capture_us: take_u32(&mut p)?,
+                encode_us: take_u32(&mut p)?,
+                windows: take_u16(&mut p)?,
+            },
             _ => return Err(ProtoError::BadMessage("unknown message type")),
         };
         if !p.is_empty() {
@@ -930,6 +981,16 @@ mod tests {
                 w: 2,
                 h: 2,
                 pixels: vec![0xff00_0000, 0xffff_ffff, 0x0000_0000, 0x80ff_0000],
+            },
+            Message::Stats {
+                interval_ms: 1000,
+                frames: 60,
+                rects: 123,
+                raw_bytes: 4_000_000,
+                comp_bytes: 250_000,
+                capture_us: 2800,
+                encode_us: 400,
+                windows: 3,
             },
             Message::Bye,
         ];

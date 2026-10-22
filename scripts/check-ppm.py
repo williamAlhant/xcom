@@ -59,6 +59,33 @@ def main() -> None:
     elif mode == "content":
         if len(colors) < 2:
             fail("image is a single color (no real content)")
+    elif mode == "hud":
+        # The metrics overlay sits in the top-left corner of the *presented*
+        # surface (screen readback) and adds grays and green that the box
+        # pattern cannot produce. The panel is translucent, so the check is on
+        # where non-pattern pixels appear, not on exact colors.
+        box_w, box_h = min(320, w), min(90, h)
+        inside = outside = green = 0
+        for y in range(h):
+            row = y * w * 3
+            for x in range(w):
+                c = pixels[row + x * 3 : row + x * 3 + 3]
+                if c == b"\x00\x00\x00" or c == b"\xff\xff\xff":
+                    continue
+                r, g, b = c[0], c[1], c[2]
+                if g > r + 16 and g > b + 16 and g > 80:
+                    green += 1
+                if x < box_w and y < box_h:
+                    inside += 1
+                else:
+                    outside += 1
+        if inside < 50:
+            fail(f"HUD overlay missing: only {inside} non-pattern pixels in the corner")
+        if outside:
+            fail(f"HUD overlay leaked outside the corner: {outside} pixels")
+        if green < 10:
+            fail(f"bandwidth sparkline missing (green pixels={green})")
+        print(f"check-ppm: hud pixels={inside}, graph pixels={green}")
     elif mode == "xterm":
         # A terminal with text: white background with black glyph rows. Empty
         # or wiped content shows as an all-white window.

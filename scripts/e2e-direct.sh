@@ -47,7 +47,7 @@ FP=$(sed -n 's/.*"cert_sha256":"\([^"]*\)".*/\1/p' <<< "$LINE")
 
 DISPLAY=${CLIENT_DISPLAY:-:0} "$XCOM" connect --direct "$ADDR" \
     --token-control "$TOKEN_CONTROL" --token-bulk "$TOKEN_BULK" \
-    --fingerprint "$FP" --seconds "$SECS" --dump-ppm "$OUT/frame.ppm" \
+    --fingerprint "$FP" --seconds "$SECS" --dump-ppm "$OUT/frame.ppm" --hud \
     > "$OUT/client.log" 2>&1 || true
 
 echo "--- client ---"
@@ -64,7 +64,13 @@ if grep -q 'shm_get_image failed' "$OUT/serve.log"; then
 fi
 grep -qE '[1-9][0-9]* frames blitted' "$OUT/client.log" || PASS=0
 grep -q 'window .* opened' "$OUT/client.log" || PASS=0
+# Metrics HUD: server Stats arrived (srv-fps) and a ping round-trip was measured.
+grep -E '\[ui\] metrics:' "$OUT/client.log" | tail -1
+grep -qE '\[ui\] metrics: .*srv-fps' "$OUT/client.log" || PASS=0
+grep -qE '\[ui\] metrics: .*rtt [0-9]+ms' "$OUT/client.log" || PASS=0
 python3 "$REPO/scripts/check-ppm.py" "$OUT/frame.ppm" box || PASS=0
+# The overlay must be in the presented surface (screen readback), not the store.
+python3 "$REPO/scripts/check-ppm.py" "$OUT/frame.screen.ppm" hud || PASS=0
 if [ "$PASS" = 1 ]; then
     echo "=== e2e-direct: PASS ==="
 else

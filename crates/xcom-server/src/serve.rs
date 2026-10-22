@@ -20,7 +20,7 @@ use x11rb::protocol::xproto::{self, ConnectionExt as _, Window};
 
 use xcom_proto::{logln, Message, MSG_DAMAGE};
 use xcom_transport::{random_token, Channel, ChannelAcceptor, Identity, Role};
-use xcom_x11::capture::{CaptureConfig, CaptureSession, PumpEvent};
+use xcom_x11::capture::{CaptureConfig, CaptureSession, FrameStats, PumpEvent};
 use xcom_x11::clipboard::{Clipboard, Target};
 use xcom_x11::input::Injector;
 use xcom_x11::keymap::Keymap;
@@ -628,6 +628,37 @@ struct SyncState {
     attempts: u8,
 }
 
+/// Interval counters for the client metrics HUD (`Message::Stats`).
+#[derive(Default)]
+struct Tally {
+    frames: u32,
+    rects: u32,
+    raw: u64,
+    comp: u64,
+    capture_ns: u64,
+    encode_ns: u64,
+}
+
+impl Tally {
+    fn add(&mut self, st: &FrameStats) {
+        self.frames += 1;
+        self.rects += st.nrects as u32;
+        self.raw += st.raw_bytes as u64;
+        self.comp += st.comp_bytes as u64;
+        self.capture_ns += st.capture_ns;
+        self.encode_ns += st.encode_ns;
+    }
+
+    /// Mean per-frame times in microseconds (0 when the interval was empty).
+    fn means_us(&self) -> (u32, u32) {
+        if self.frames == 0 {
+            return (0, 0);
+        }
+        let n = self.frames as u64;
+        ((self.capture_ns / n / 1000) as u32, (self.encode_ns / n / 1000) as u32)
+    }
+}
+
 #[allow(clippy::too_many_arguments)] // main loop state, one owner per parameter
 fn serve_loop(
     session: &mut CaptureSession,
@@ -661,6 +692,8 @@ fn serve_loop(
     let mut stats_comp = 0u64;
     let mut last_report = Instant::now();
     let mut last_frame = Instant::now() - Duration::from_secs(1);
+    let mut tally = Tally::default();
+    let mut last_stats = Instant::now();
 
     loop {
         if shutdown.load(Ordering::SeqCst) {
@@ -676,7 +709,8 @@ fn serve_loop(
 
         // Full-refresh requests (attach, resizes, client-side repair).
         while let Ok(win) = full_rx.try_recv() {
-            if let Some((frame, _)) = session.capture_full(win)? {
+            if let Some((frame, st)) = session.capture_full(win)? {
+                tally.add(&st);
                 let payload = frame.encode();
                 if bulk.send(MSG_DAMAGE, &payload).is_err() {
                     shutdown.store(true, Ordering::SeqCst);
@@ -704,7 +738,8 @@ fn serve_loop(
                 st.attempts += 1;
                 st.last_full = Instant::now();
             }
-            if let Some((frame, _)) = session.capture_full(win)? {
+            if let Some((frame, st)) = session.capture_full(win)? {
+                tally.add(&st);
                 let payload = frame.encode();
                 if bulk.send(MSG_DAMAGE, &payload).is_err() {
                     shutdown.store(true, Ordering::SeqCst);
@@ -740,6 +775,7 @@ fn serve_loop(
                 stats_frames += 1;
                 stats_raw += stats.raw_bytes as u64;
                 stats_comp += stats.comp_bytes as u64;
+                tally.add(&stats);
                 last_frame = Instant::now();
             }
             Some(PumpEvent::Mapped(win)) => {
@@ -821,7 +857,8 @@ fn serve_loop(
                         },
                     );
                     match session.capture_full(win)? {
-                        Some((frame, _)) => {
+                        Some((frame, st)) => {
+                            tally.add(&st);
                             logln!("[serve] mapped: full frame {win:#x} ({} rects)", frame.rects.len());
                             let payload = frame.encode();
                             if bulk.send(MSG_DAMAGE, &payload).is_err() {
@@ -892,6 +929,25 @@ fn serve_loop(
                 );
             }
             None => {}
+        }
+
+        // ~1 Hz metrics for the client HUD. Sent even when idle so the client
+        // can show capture latency and the server's window count.
+        if last_stats.elapsed() >= Duration::from_secs(1) {
+            let (capture_us, encode_us) = tally.means_us();
+            let msg = Message::Stats {
+                interval_ms: last_stats.elapsed().as_millis().min(u32::MAX as u128) as u32,
+                frames: tally.frames,
+                rects: tally.rects,
+                raw_bytes: tally.raw,
+                comp_bytes: tally.comp,
+                capture_us,
+                encode_us,
+                windows: session.windows().count() as u16,
+            };
+            ctrl_tx.send(msg).ok();
+            tally = Tally::default();
+            last_stats = Instant::now();
         }
 
         if last_report.elapsed() >= Duration::from_secs(5) && stats_frames > 0 {

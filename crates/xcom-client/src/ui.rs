@@ -14,11 +14,12 @@
 //!    local window size; a mismatch (WM constraints, DPI rounding) letterboxes
 //!    instead of corrupting rows.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use raw_window_handle::HasWindowHandle;
 use winit::application::ApplicationHandler;
@@ -30,7 +31,26 @@ use winit::window::{Window, WindowId};
 use xcom_codec::decompress;
 use xcom_proto::{DamageFrame, Message};
 
+use crate::hud::Hud;
 use crate::keys::{keysym_for, keysym_for_physical};
+
+/// Server-side metrics for the last interval, as reported by `Message::Stats`.
+#[derive(Default, Clone, Copy)]
+pub struct ServerStats {
+    pub interval_ms: u32,
+    pub frames: u32,
+    pub rects: u32,
+    pub raw_bytes: u64,
+    pub comp_bytes: u64,
+    pub capture_us: u32,
+    pub encode_us: u32,
+    pub windows: u16,
+}
+
+/// How often the metrics snapshot (rates, HUD text) is recomputed.
+const METRICS_INTERVAL: Duration = Duration::from_millis(500);
+/// Samples kept for the bandwidth sparkline (one per metrics tick).
+const GRAPH_SAMPLES: usize = 48;
 
 /// Events from the network threads to the UI thread.
 pub enum UserEvent {
@@ -84,6 +104,12 @@ pub enum UserEvent {
         w: u16,
         h: u16,
         pixels: Vec<u32>,
+    },
+    /// Server-side metrics for the last interval.
+    Stats(ServerStats),
+    /// Ping round-trip time measured on the control channel.
+    Rtt {
+        ms: u32,
     },
 }
 
@@ -219,6 +245,27 @@ pub struct App {
     fullscreen: bool,
     /// Test aids (F12 store dump) are opt-in: F12 belongs to the app otherwise.
     debug_tools: bool,
+    /// Metrics HUD shown over every window (toggle: Ctrl+Shift+M).
+    hud_on: bool,
+    hud: Hud,
+    stats: ServerStats,
+    /// Monotonic totals used to derive the rates below.
+    rx_bytes: u64,
+    raw_bytes: u64,
+    frames_seen: u64,
+    /// Rate snapshot, refreshed every `METRICS_INTERVAL`.
+    rate_fps: f32,
+    rate_rx: f64,
+    ratio: f32,
+    rtt_ms: Option<u32>,
+    input_ms: Option<f32>,
+    rx_history: VecDeque<u32>,
+    last_tick: Instant,
+    last_frames: u64,
+    last_rx: u64,
+    last_log: Instant,
+    /// Window and time of the last input we sent, for input -> present latency.
+    last_input: Option<(u32, Instant)>,
 }
 
 /// Refuse absurd window sizes from the wire: the store is `w*h*4` bytes, and
@@ -245,6 +292,7 @@ impl App {
         dump: Option<PathBuf>,
         fullscreen: bool,
         debug_tools: bool,
+        hud: bool,
     ) -> App {
         let clipboard = match arboard::Clipboard::new() {
             Ok(c) => Some(c),
@@ -272,10 +320,28 @@ impl App {
             dump_seq: 0,
             fullscreen,
             debug_tools,
+            hud_on: hud,
+            hud: Hud::default(),
+            stats: ServerStats::default(),
+            rx_bytes: 0,
+            raw_bytes: 0,
+            frames_seen: 0,
+            rate_fps: 0.0,
+            rate_rx: 0.0,
+            ratio: 0.0,
+            rtt_ms: None,
+            input_ms: None,
+            rx_history: VecDeque::new(),
+            last_tick: Instant::now(),
+            last_frames: 0,
+            last_rx: 0,
+            last_log: Instant::now(),
+            last_input: None,
         }
     }
 
     fn report(&mut self) {
+        self.tick_metrics(true);
         eprintln!(
             "[ui] {} window(s) open, {} frames blitted",
             self.attached.len(),
@@ -285,6 +351,7 @@ impl App {
             "[ui] presents={}, present_errors={}",
             self.presents, self.present_errors
         );
+        eprintln!("[ui] metrics: {}", self.metrics_line());
         self.dump("");
     }
 
@@ -535,14 +602,20 @@ impl App {
         buf.fill(0xff00_0000); // opaque black, never transparent
         let lw = att.local.0 as usize;
         let (rw, rh) = (pix.w as usize, pix.h as usize);
+        let lh = buf.len().checked_div(lw).unwrap_or(0);
         if lw > 0 {
             let copy_w = lw.min(rw);
-            let copy_h = (buf.len() / lw).min(rh);
+            let copy_h = lh.min(rh);
             for row in 0..copy_h {
                 let dst = row * lw..row * lw + copy_w;
                 let src = row * rw..row * rw + copy_w;
                 buf[dst].copy_from_slice(&pix.buf[src]);
             }
+        }
+        // The HUD is an overlay on the presented surface, never in the store:
+        // it must not be mistaken for remote content.
+        if self.hud_on {
+            crate::hud::draw(&mut buf, lw, lh, &self.hud);
         }
         if let Err(e) = buf.present() {
             self.present_errors += 1;
@@ -577,11 +650,27 @@ impl App {
             .or_insert_with(|| Pixels::new(frame.win_w, frame.win_h));
         pix.blit(frame, &mut self.decode_buf);
         self.frames_blitted += 1;
+        self.frames_seen += 1;
+        self.rx_bytes += frame.encoded_len() as u64;
+        self.raw_bytes += frame.rects.iter().map(|r| r.raw_len as u64).sum::<u64>();
+        if let Some((win, at)) = self.last_input {
+            if win == id {
+                self.input_ms = Some(at.elapsed().as_secs_f32() * 1000.0);
+                self.last_input = None;
+            }
+        }
+        self.tick_metrics(false);
         self.present(id);
     }
 
     fn send(&self, msg: Message) {
         self.input_tx.send(msg).ok();
+    }
+
+    /// Send input and remember when, for the input -> present latency readout.
+    fn send_input(&mut self, window: u32, msg: Message) {
+        self.last_input = Some((window, Instant::now()));
+        self.send(msg);
     }
 
     fn remote_id(&self, id: WindowId) -> Option<u32> {
@@ -769,6 +858,16 @@ impl ApplicationHandler<UserEvent> for App {
                     Err(e) => eprintln!("[ui] cursor rejected: {e:?}"),
                 }
             }
+            UserEvent::Stats(s) => {
+                self.stats = s;
+                // A fresh interval arrived: refresh the readouts right away.
+                if self.hud_on {
+                    self.tick_metrics(false);
+                }
+            }
+            UserEvent::Rtt { ms } => {
+                self.rtt_ms = Some(ms);
+            }
             UserEvent::Dump => self.dump("mid."),
             UserEvent::CloseOne => {
                 if let Some((&id, _)) = self.attached.iter().next() {
@@ -852,11 +951,14 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Some(att) = self.attached.get_mut(&remote) {
                     att.cursor = (x, y);
                 }
-                self.send(Message::InputMotion {
-                    window: remote,
-                    x,
-                    y,
-                });
+                self.send_input(
+                    remote,
+                    Message::InputMotion {
+                        window: remote,
+                        x,
+                        y,
+                    },
+                );
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 let (x, y) = self
@@ -867,13 +969,16 @@ impl ApplicationHandler<UserEvent> for App {
                 if xcom_proto::debug() {
                     eprintln!("[ui] button {button:?} {state:?} at ({x},{y})");
                 }
-                self.send(Message::InputButton {
-                    window: remote,
-                    button: x11_button(button),
-                    pressed: state == ElementState::Pressed,
-                    x,
-                    y,
-                });
+                self.send_input(
+                    remote,
+                    Message::InputButton {
+                        window: remote,
+                        button: x11_button(button),
+                        pressed: state == ElementState::Pressed,
+                        x,
+                        y,
+                    },
+                );
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let dy = match delta {
@@ -891,13 +996,16 @@ impl ApplicationHandler<UserEvent> for App {
                 // X core wheel buttons: 4 = up, 5 = down.
                 let button = if dy > 0.0 { 4 } else { 5 };
                 for pressed in [true, false] {
-                    self.send(Message::InputButton {
-                        window: remote,
-                        button,
-                        pressed,
-                        x,
-                        y,
-                    });
+                    self.send_input(
+                        remote,
+                        Message::InputButton {
+                            window: remote,
+                            button,
+                            pressed,
+                            x,
+                            y,
+                        },
+                    );
                 }
             }
             WindowEvent::Focused(focused) => {
@@ -975,6 +1083,19 @@ impl ApplicationHandler<UserEvent> for App {
                             });
                             return;
                         }
+                        winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyM) => {
+                            // Local HUD toggle (never forwarded).
+                            self.hud_on = !self.hud_on;
+                            eprintln!(
+                                "[ui] HUD {}",
+                                if self.hud_on { "on" } else { "off" }
+                            );
+                            self.tick_metrics(true);
+                            for att in self.attached.values() {
+                                att.window.request_redraw();
+                            }
+                            return;
+                        }
                         winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyV) => {
                             match self.clipboard.as_mut().map(|cb| cb.get_text()) {
                                 Some(Ok(text)) if !text.is_empty() => {
@@ -997,7 +1118,6 @@ impl ApplicationHandler<UserEvent> for App {
                         _ => {}
                     }
                 }
-
                 let text_sym = crate::keys::text_keysym(event.text.as_deref());
                 // Learn the layout's plain character. ASCII only and with no
                 // modifiers, so dead-key accents and shifted symbols can't
@@ -1071,17 +1191,45 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 if let Some(sym) = sym {
                     self.held.insert(event.physical_key, sym);
-                    self.send(Message::InputKey {
-                        sym,
-                        pressed: true,
-                    });
+                    self.send_input(
+                        remote,
+                        Message::InputKey {
+                            sym,
+                            pressed: true,
+                        },
+                    );
                 }
             }
             _ => {}
         }
     }
 
-    fn about_to_wait(&mut self, _el: &ActiveEventLoop) {}
+    fn about_to_wait(&mut self, el: &ActiveEventLoop) {
+        self.tick_metrics(false);
+        if self.hud_on {
+            // Repaint so the HUD (rates, sparkline) stays live even when the
+            // remote window is static and produces no frames.
+            for att in self.attached.values() {
+                att.window.request_redraw();
+            }
+            el.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
+                Instant::now() + METRICS_INTERVAL,
+            ));
+        } else {
+            el.set_control_flow(winit::event_loop::ControlFlow::Wait);
+        }
+    }
+}
+
+/// Human-readable byte rate (B/s, kB/s, MB/s).
+fn fmt_rate(bps: f64) -> String {
+    if bps >= 1e6 {
+        format!("{:.1}MB", bps / 1e6)
+    } else if bps >= 1e3 {
+        format!("{:.1}kB", bps / 1e3)
+    } else {
+        format!("{bps:.0}B")
+    }
 }
 
 fn x11_button(b: MouseButton) -> u8 {
@@ -1096,6 +1244,115 @@ fn x11_button(b: MouseButton) -> u8 {
 }
 
 impl App {
+    /// Recompute the rate snapshot and HUD text; log a line every 5 s.
+    ///
+    /// `force` bypasses the interval check (used at shutdown and on toggles).
+    fn tick_metrics(&mut self, force: bool) {
+        let now = Instant::now();
+        let dt = now.duration_since(self.last_tick);
+        if !force && dt < METRICS_INTERVAL {
+            return;
+        }
+        let secs = dt.as_secs_f64().max(1e-3);
+        let d_frames = self.frames_seen.saturating_sub(self.last_frames);
+        let d_rx = self.rx_bytes.saturating_sub(self.last_rx);
+        self.rate_fps = (d_frames as f64 / secs) as f32;
+        self.rate_rx = d_rx as f64 / secs;
+        self.ratio = if self.rx_bytes > 0 {
+            self.raw_bytes as f32 / self.rx_bytes as f32
+        } else {
+            0.0
+        };
+        self.rx_history
+            .push_back(self.rate_rx.min(u32::MAX as f64) as u32);
+        while self.rx_history.len() > GRAPH_SAMPLES {
+            self.rx_history.pop_front();
+        }
+        self.last_tick = now;
+        self.last_frames = self.frames_seen;
+        self.last_rx = self.rx_bytes;
+        self.rebuild_hud();
+        if now.duration_since(self.last_log) >= Duration::from_secs(5) {
+            self.last_log = now;
+            eprintln!("[ui] metrics: {}", self.metrics_line());
+        }
+    }
+
+    /// One compact, greppable metrics line (also used by the e2e checks).
+    fn metrics_line(&self) -> String {
+        let rtt = self
+            .rtt_ms
+            .map(|m| format!("{m}ms"))
+            .unwrap_or_else(|| "?".into());
+        format!(
+            "fps {:.1} srv-fps {:.1} rx {}/s ratio {:.1}x rtt {} cap {}us enc {}us win {}",
+            self.rate_fps,
+            self.server_fps(),
+            fmt_rate(self.rate_rx),
+            self.server_ratio(),
+            rtt,
+            self.stats.capture_us,
+            self.stats.encode_us,
+            self.stats.windows,
+        )
+    }
+
+    /// Server-reported frame rate for its last interval.
+    fn server_fps(&self) -> f32 {
+        if self.stats.interval_ms == 0 {
+            0.0
+        } else {
+            self.stats.frames as f32 * 1000.0 / self.stats.interval_ms as f32
+        }
+    }
+
+    /// Compression ratio from the server's byte counters (falls back to the
+    /// client's own wire accounting before the first `Stats` arrives).
+    fn server_ratio(&self) -> f32 {
+        if self.stats.comp_bytes > 0 {
+            self.stats.raw_bytes as f32 / self.stats.comp_bytes as f32
+        } else {
+            self.ratio
+        }
+    }
+
+    fn rebuild_hud(&mut self) {
+        let rtt = self
+            .rtt_ms
+            .map(|m| format!("{m}ms"))
+            .unwrap_or_else(|| "-".into());
+        let input = self
+            .input_ms
+            .map(|m| format!("{m:.1}ms"))
+            .unwrap_or_else(|| "-".into());
+        let lines = vec![
+            format!(
+                "xcom v{}  rtt {}  win {}",
+                xcom_proto::PROTO_VERSION,
+                rtt,
+                self.stats.windows
+            ),
+            format!(
+                "fps {:.1}/{:.1}  rx {}/s",
+                self.rate_fps,
+                self.server_fps(),
+                fmt_rate(self.rate_rx)
+            ),
+            format!(
+                "x{:.1}  cap {}us  enc {}us  rects {}",
+                self.server_ratio(),
+                self.stats.capture_us,
+                self.stats.encode_us,
+                self.stats.rects
+            ),
+            format!("in->px {}  pres {}", input, self.presents),
+        ];
+        self.hud = Hud {
+            lines,
+            graph: self.rx_history.iter().copied().collect(),
+        };
+    }
+
     /// Debug aid: print the alpha mask and write a PPM of a received cursor.
     fn dump_cursor(&mut self, w: u16, h: u16, xhot: u16, yhot: u16, pixels: &[u32]) {
         let mut art = String::new();

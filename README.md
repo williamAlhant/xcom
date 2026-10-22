@@ -40,7 +40,9 @@ xcom connect --direct "$(jq -r .connect handshake.json)" \
 
 Useful flags: `--connect HOST:PORT` overrides the address to dial (NAT,
 containers); `--seconds N` exits after N seconds (0 = until the windows close);
-`xcomd serve --spawn 1600x1200` sets the virtual display size.
+`xcomd serve --spawn 1600x1200` sets the virtual display size; `--hud` shows
+the metrics overlay (fps, bandwidth, compression ratio, RTT, capture/encode
+time), toggled in-session with Ctrl+Shift+M.
 
 Builds:
 
