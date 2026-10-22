@@ -6,6 +6,8 @@
 //! into the protocol.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use xcom_proto::logln;
@@ -43,6 +45,10 @@ pub struct Metrics {
     rate_fps: f32,
     rate_rx: f64,
     ratio: f32,
+    /// Max time a message spent between enqueue and hitting the socket (µs),
+    /// reset every tick. Proves the control channel is not poll-delayed.
+    queue_us: Arc<AtomicU32>,
+    queue_ms: f32,
     rtt_ms: Option<u32>,
     input_ms: Option<f32>,
     rx_history: VecDeque<u32>,
@@ -55,7 +61,7 @@ pub struct Metrics {
 }
 
 impl Metrics {
-    pub fn new(hud_on: bool) -> Self {
+    pub fn new(hud_on: bool, queue_us: Arc<AtomicU32>) -> Self {
         Metrics {
             hud_on,
             hud: Hud::default(),
@@ -67,6 +73,8 @@ impl Metrics {
             rate_fps: 0.0,
             rate_rx: 0.0,
             ratio: 0.0,
+            queue_us,
+            queue_ms: 0.0,
             rtt_ms: None,
             input_ms: None,
             rx_history: VecDeque::new(),
@@ -141,6 +149,7 @@ impl Metrics {
         let d_rx = self.rx_bytes.saturating_sub(self.last_rx);
         self.rate_fps = (d_frames as f64 / secs) as f32;
         self.rate_rx = d_rx as f64 / secs;
+        self.queue_ms = self.queue_us.swap(0, Ordering::Relaxed) as f32 / 1000.0;
         self.ratio = if self.rx_bytes > 0 {
             self.raw_bytes as f32 / self.rx_bytes as f32
         } else {
@@ -168,12 +177,13 @@ impl Metrics {
             .map(|m| format!("{m}ms"))
             .unwrap_or_else(|| "?".into());
         format!(
-            "fps {:.1} srv-fps {:.1} rx {}/s ratio {:.1}x rtt {} cap {}us enc {}us win {}",
+            "fps {:.1} srv-fps {:.1} rx {}/s ratio {:.1}x rtt {} queue {:.2}ms cap {}us enc {}us win {}",
             self.rate_fps,
             self.server_fps(),
             fmt_rate(self.rate_rx),
             self.server_ratio(),
             rtt,
+            self.queue_ms,
             self.stats.capture_us,
             self.stats.encode_us,
             self.stats.windows,
@@ -228,7 +238,7 @@ impl Metrics {
                 self.stats.encode_us,
                 self.stats.rects
             ),
-            format!("in->px {}  pres {}", input, self.presents),
+            format!("in->px {}  queue {:.1}ms  pres {}", input, self.queue_ms, self.presents),
         ];
         self.hud = Hud {
             lines,
@@ -262,7 +272,7 @@ mod tests {
 
     #[test]
     fn frame_accounting_and_input_latency() {
-        let mut m = Metrics::new(false);
+        let mut m = Metrics::new(false, Arc::new(AtomicU32::new(0)));
         m.on_input(7);
         m.on_frame(8, 100, 1000); // a different window must not close it
         assert!(m.input_ms.is_none());
@@ -275,7 +285,7 @@ mod tests {
 
     #[test]
     fn stats_and_rtt_feed_the_line() {
-        let mut m = Metrics::new(false);
+        let mut m = Metrics::new(false, Arc::new(AtomicU32::new(0)));
         m.on_stats(ServerStats {
             interval_ms: 1000,
             frames: 60,
@@ -297,7 +307,7 @@ mod tests {
 
     #[test]
     fn tick_swaps_the_hud_snapshot() {
-        let mut m = Metrics::new(true);
+        let mut m = Metrics::new(true, Arc::new(AtomicU32::new(0)));
         assert!(m.hud_on());
         assert!(!m.toggle_hud());
         m.on_frame(1, 10, 100);

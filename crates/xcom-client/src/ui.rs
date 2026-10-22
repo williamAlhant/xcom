@@ -17,6 +17,7 @@
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicU32;
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::time::Instant;
@@ -201,7 +202,7 @@ struct Attached {
 }
 
 pub struct App {
-    input_tx: Sender<Message>,
+    input_tx: Sender<(Message, Instant)>,
     pixels: HashMap<u32, Pixels>,
     attached: HashMap<u32, Attached>,
     by_winit: HashMap<WindowId, u32>,
@@ -286,11 +287,12 @@ fn place_window(
 impl App {
     pub fn new(
         _proxy: EventLoopProxy<UserEvent>,
-        input_tx: Sender<Message>,
+        input_tx: Sender<(Message, Instant)>,
         dump: Option<PathBuf>,
         fullscreen: bool,
         debug_tools: bool,
         hud: bool,
+        queue_us: Arc<AtomicU32>,
     ) -> App {
         let clipboard = match arboard::Clipboard::new() {
             Ok(c) => Some(c),
@@ -316,7 +318,7 @@ impl App {
             dump_seq: 0,
             fullscreen,
             debug_tools,
-            metrics: Metrics::new(hud),
+            metrics: Metrics::new(hud, queue_us),
             mods: ModifiersState::empty(),
         }
     }
@@ -636,7 +638,8 @@ impl App {
     }
 
     fn send(&self, msg: Message) {
-        self.input_tx.send(msg).ok();
+        // Enqueue with a timestamp: the writer thread measures the queue delay.
+        self.input_tx.send((msg, Instant::now())).ok();
     }
 
     /// Send input and remember when, for the input -> present latency readout.

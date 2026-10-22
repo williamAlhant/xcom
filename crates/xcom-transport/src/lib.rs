@@ -585,6 +585,254 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+// --- split control channel ---------------------------------------------
+//
+// The control channel carries input, which must reach the wire immediately. A
+// single thread alternating `recv` (with a short timeout) and writes delays
+// every event by up to that timeout — and on Windows socket timeouts are
+// rounded up to the system timer (~15 ms), so the delay is worst on the main
+// target platform.
+//
+// rustls has no `split()`: `StreamOwned` is one record-layer state machine and
+// a mutex held across a blocking read would starve writers. Instead the reader
+// blocks on the socket **without** the lock and only locks to feed bytes into
+// rustls; the writer locks to encrypt and write. The lock is never held across
+// a blocking syscall.
+
+/// The rustls side of a split channel (client or server role).
+enum Conn {
+    Client(ClientConnection),
+    Server(ServerConnection),
+}
+
+impl Conn {
+    fn read_tls(&mut self, rd: &mut dyn Read) -> std::io::Result<usize> {
+        match self {
+            Conn::Client(c) => c.read_tls(rd),
+            Conn::Server(c) => c.read_tls(rd),
+        }
+    }
+
+    fn write_tls(&mut self, wr: &mut dyn Write) -> std::io::Result<usize> {
+        match self {
+            Conn::Client(c) => c.write_tls(wr),
+            Conn::Server(c) => c.write_tls(wr),
+        }
+    }
+
+    fn process_new_packets(&mut self) -> Result<rustls::IoState, rustls::Error> {
+        match self {
+            Conn::Client(c) => c.process_new_packets(),
+            Conn::Server(c) => c.process_new_packets(),
+        }
+    }
+
+    fn wants_write(&self) -> bool {
+        match self {
+            Conn::Client(c) => c.wants_write(),
+            Conn::Server(c) => c.wants_write(),
+        }
+    }
+
+    fn send_close_notify(&mut self) {
+        match self {
+            Conn::Client(c) => c.send_close_notify(),
+            Conn::Server(c) => c.send_close_notify(),
+        }
+    }
+}
+
+/// Decrypted bytes, presented as a `Read`: `WouldBlock` while empty so
+/// `FrameState`'s resumable framing works, and a clean `Ok(0)` only once the
+/// peer closed.
+struct Plain {
+    buf: Vec<u8>,
+    eof: bool,
+}
+
+impl Read for Plain {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        if self.buf.is_empty() {
+            return if self.eof {
+                Ok(0)
+            } else {
+                Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+            };
+        }
+        let n = out.len().min(self.buf.len());
+        out[..n].copy_from_slice(&self.buf[..n]);
+        self.buf.drain(..n);
+        Ok(n)
+    }
+}
+
+/// Blocking reader half of a split channel.
+pub struct ChannelReader {
+    conn: Arc<std::sync::Mutex<Conn>>,
+    sock: TcpStream,
+    state: xcom_proto::FrameState,
+    plain: Plain,
+}
+
+impl ChannelReader {
+    /// Receive one framed message; `None` on clean EOF.
+    pub fn recv(&mut self) -> Result<Option<(u8, Vec<u8>)>, TransportError> {
+        loop {
+            match self.state.read_from(&mut self.plain) {
+                Ok(Some(frame)) => return Ok(Some(frame)),
+                Ok(None) => return Ok(None),
+                Err(xcom_proto::ProtoError::Io(e))
+                    if e.kind() == std::io::ErrorKind::WouldBlock =>
+                {
+                    // Nothing buffered: pull more from the socket below.
+                }
+                Err(e) => return Err(e.into()),
+            }
+            // rustls may already hold decrypted plaintext (a record can contain
+            // several frames); drain it before blocking on the socket.
+            if self.drain_plaintext()? {
+                continue;
+            }
+            if self.plain.eof {
+                return Ok(None);
+            }
+            let mut buf = [0u8; 16 * 1024];
+            let n = match self.sock.read(&mut buf) {
+                Ok(n) => n,
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            };
+            if n == 0 {
+                self.plain.eof = true;
+                continue;
+            }
+            let mut conn = self.conn.lock().unwrap();
+            let mut src = &buf[..n];
+            while !src.is_empty() {
+                // `read_tls` consumes one record's worth at a time.
+                let got = conn.read_tls(&mut src)?;
+                if got == 0 {
+                    break;
+                }
+                conn.process_new_packets()?;
+            }
+            drop(conn);
+        }
+    }
+
+    /// Move everything rustls has already decrypted into `plain`.
+    /// Returns true if any bytes were added.
+    fn drain_plaintext(&mut self) -> Result<bool, TransportError> {
+        let mut conn = self.conn.lock().unwrap();
+        let mut buf = [0u8; 16 * 1024];
+        let mut got = false;
+        loop {
+            let read = match &mut *conn {
+                Conn::Client(c) => c.reader().read(&mut buf),
+                Conn::Server(c) => c.reader().read(&mut buf),
+            };
+            match read {
+                Ok(0) => {
+                    // close_notify: no more application data.
+                    self.plain.eof = true;
+                    break;
+                }
+                Ok(n) => {
+                    self.plain.buf.extend_from_slice(&buf[..n]);
+                    got = true;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(got)
+    }
+}
+
+/// Writer half of a split channel. Independent of the reader: a blocked read
+/// can never delay an input event.
+pub struct ChannelWriter {
+    conn: Arc<std::sync::Mutex<Conn>>,
+    sock: TcpStream,
+}
+
+impl ChannelWriter {
+    /// Send one framed message (blocking only on the socket write).
+    pub fn send(&mut self, msg_type: u8, payload: &[u8]) -> Result<(), TransportError> {
+        let mut frame = Vec::with_capacity(payload.len() + 5);
+        xcom_proto::write_frame(&mut frame, msg_type, payload)?;
+        let mut conn = self.conn.lock().unwrap();
+        match &mut *conn {
+            Conn::Client(c) => c.writer().write_all(&frame)?,
+            Conn::Server(c) => c.writer().write_all(&frame)?,
+        }
+        loop {
+            if !conn.wants_write() {
+                break;
+            }
+            let wrote = match &mut *conn {
+                Conn::Client(c) => c.write_tls(&mut self.sock)?,
+                Conn::Server(c) => c.write_tls(&mut self.sock)?,
+            };
+            if wrote == 0 {
+                break;
+            }
+        }
+        drop(conn);
+        self.sock.flush()?;
+        Ok(())
+    }
+
+    /// Graceful TLS shutdown (close_notify) — polite peers log less.
+    pub fn shutdown(&mut self) {
+        let mut conn = self.conn.lock().unwrap();
+        conn.send_close_notify();
+        let _ = conn.write_tls(&mut self.sock);
+        drop(conn);
+        let _ = self.sock.flush();
+    }
+
+    /// Tear the socket down now, waking a reader blocked in `read()`.
+    pub fn force_close(&self) {
+        let _ = self.sock.shutdown(std::net::Shutdown::Both);
+    }
+}
+
+impl Channel {
+    /// Split into a blocking reader and an independent writer.
+    ///
+    /// The connection is shared behind a mutex that is never held across a
+    /// blocking syscall; see the module comments above.
+    pub fn split(self) -> Result<(ChannelReader, ChannelWriter), TransportError> {
+        let Channel { stream, state, role: _ } = self;
+        let (conn, sock) = match stream {
+            TlsStream::Client(s) => (Conn::Client(s.conn), s.sock),
+            TlsStream::Server(s) => (Conn::Server(s.conn), s.sock),
+        };
+        let read_sock = sock.try_clone()?;
+        // Blocking reads: liveness is the ping/pong's job, not a socket timeout.
+        read_sock.set_read_timeout(None)?;
+        read_sock.set_write_timeout(None)?;
+        let conn = Arc::new(std::sync::Mutex::new(conn));
+        let reader = ChannelReader {
+            conn: Arc::clone(&conn),
+            sock: read_sock,
+            state,
+            plain: Plain {
+                buf: Vec::new(),
+                eof: false,
+            },
+        };
+        let writer = ChannelWriter { conn, sock };
+        Ok((reader, writer))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -697,5 +945,54 @@ mod tests {
     fn hex_encodes_nibbles() {
         assert_eq!(hex(&[]), "");
         assert_eq!(hex(&[0x00, 0x0f, 0xa5, 0xff]), "000fa5ff");
+    }
+
+    #[test]
+    fn split_control_round_trip() {
+        use xcom_proto::Message;
+
+        let (id, fp, ctrl, bulk) = identity_and_tokens();
+        let acceptor = ChannelAcceptor::bind("127.0.0.1:0", &id, ctrl, bulk, None).unwrap();
+        let addr = acceptor.local_addr().unwrap().to_string();
+        let server = std::thread::spawn(move || {
+            acceptor
+                .accept(Role::Control, Duration::from_secs(5))
+                .unwrap()
+        });
+
+        let client =
+            connect(&addr, Role::Control, &fp, &ctrl, Duration::from_secs(3)).unwrap();
+        let server = server.join().unwrap();
+        let (mut cr, mut cw) = client.split().unwrap();
+        let (mut sr, mut sw) = server.split().unwrap();
+
+        // Client -> server, several frames back to back (the reader must drain
+        // plaintext before blocking on the socket).
+        for t in [1u64, 2, 3] {
+            let p = Message::Ping { t }.encode();
+            cw.send(xcom_proto::MSG_PING, &p).unwrap();
+        }
+        for t in [1u64, 2, 3] {
+            let (ty, payload) = sr.recv().unwrap().expect("frame");
+            assert_eq!(ty, xcom_proto::MSG_PING);
+            assert_eq!(
+                Message::decode(ty, &payload).unwrap(),
+                Message::Ping { t }
+            );
+        }
+
+        // Server -> client on the writer half.
+        let p = Message::Pong { t: 9 }.encode();
+        sw.send(xcom_proto::MSG_PONG, &p).unwrap();
+        let (ty, payload) = cr.recv().unwrap().expect("pong");
+        assert_eq!(
+            Message::decode(ty, &payload).unwrap(),
+            Message::Pong { t: 9 }
+        );
+
+        // close_notify surfaces as a clean EOF to the peer's reader.
+        cw.shutdown();
+        drop(cw);
+        assert!(sr.recv().unwrap().is_none());
     }
 }
