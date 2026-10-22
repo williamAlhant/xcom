@@ -97,8 +97,8 @@ struct ConnectArgs {
     /// local selection, so it can be switched off.
     #[arg(long)]
     no_clipboard_sync: bool,
-    /// Windowing backend. `auto` prefers X11/XWayland because per-window
-    /// placement and clipboard mirroring depend on it.
+    /// Windowing backend (Linux only). `auto` prefers X11/XWayland because
+    /// per-window placement and clipboard mirroring depend on it.
     #[arg(long, value_enum, default_value = "auto")]
     backend: Backend,
     /// Test aid: type this text (Latin-1) after the session comes up.
@@ -145,6 +145,15 @@ fn json_field(line: &str, key: &str) -> Option<String> {
 /// Returns the chosen backend and, when `WAYLAND_DISPLAY` was hidden, its old
 /// value so a failed X11 start can fall back.
 fn apply_backend(choice: Backend) -> Result<(Backend, Option<std::ffi::OsString>)> {
+    if !cfg!(target_os = "linux") {
+        // winit uses the native backend here (Win32, Cocoa). `DISPLAY` may be
+        // set by an unrelated X server or X forwarding, but it means nothing
+        // to winit on this platform.
+        if choice != Backend::Auto {
+            logln!("[xcom] --backend is Linux-only; using the native backend");
+        }
+        return Ok((Backend::Auto, None));
+    }
     let wayland = std::env::var_os("WAYLAND_DISPLAY");
     let x11 = std::env::var_os("DISPLAY").is_some();
     let chosen = match choice {

@@ -43,8 +43,8 @@ containers); `--seconds N` exits after N seconds (0 = until the windows close);
 `xcomd serve --spawn 1600x1200` sets the virtual display size; `--hud` shows
 the metrics overlay (fps, bandwidth, compression ratio, RTT, capture/encode
 time), toggled in-session with Ctrl+Shift+M; `--no-clipboard-sync` turns off
-clipboard mirroring; `--backend auto|x11|wayland` picks the client backend
-(`auto` prefers X11/XWayland, see below).
+clipboard mirroring; `--backend auto|x11|wayland` picks the Linux client
+backend (`auto` prefers X11/XWayland, see below; ignored on Windows).
 
 Builds:
 
