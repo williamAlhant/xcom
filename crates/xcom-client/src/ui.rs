@@ -135,7 +135,9 @@ struct Pixels {
 impl Pixels {
     fn new(w: u16, h: u16) -> Pixels {
         Pixels {
-            buf: vec![0; w as usize * h as usize],
+            // Opaque black, like `resize`: an unpainted window must never be
+            // transparent (Wayland/Windows composite the alpha byte).
+            buf: vec![0xff00_0000; w as usize * h as usize],
             w,
             h,
             title: String::new(),

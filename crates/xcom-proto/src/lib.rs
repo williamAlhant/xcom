@@ -697,7 +697,7 @@ impl Message {
         Ok(msg)
     }
 
-    /// Send on the channel and receive the decoded reply counterpart.
+    /// Write this message as one framed payload (no reply is read here).
     pub fn send<W: std::io::Write>(&self, w: &mut W) -> Result<(), ProtoError> {
         write_frame(w, self.msg_type(), &self.encode())
     }

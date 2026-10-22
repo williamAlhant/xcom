@@ -122,9 +122,11 @@ pub fn fingerprint_of(cert_der: &CertificateDer<'_>) -> String {
 }
 
 pub fn hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push_str(&format!("{b:02x}"));
+    for &b in bytes {
+        s.push(DIGITS[(b >> 4) as usize] as char);
+        s.push(DIGITS[(b & 0xf) as usize] as char);
     }
     s
 }
