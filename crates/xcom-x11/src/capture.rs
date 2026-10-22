@@ -39,6 +39,7 @@ use x11rb::rust_connection::RustConnection;
 
 use xcom_codec::{coalesce, Compressor, Rect};
 use xcom_proto::{now_ns, DamageFrame, WireRect};
+use xcom_proto::logln;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DamageMode {
@@ -192,7 +193,7 @@ impl CaptureSession {
         if cfg.root_arrow {
             // Must happen before the initial cursor is read below.
             set_root_arrow(&conn, root).unwrap_or_else(|e| {
-                eprintln!("[capture] root cursor: {e:#}");
+                logln!("[capture] root cursor: {e:#}");
             });
         }
 
@@ -263,7 +264,7 @@ impl CaptureSession {
             .context("window does not exist")?;
         if attrs.class == xproto::WindowClass::INPUT_ONLY {
             if xcom_proto::debug() {
-                eprintln!("[capture] ignoring input-only window {win:#x}");
+                logln!("[capture] ignoring input-only window {win:#x}");
             }
             return Ok(None);
         }
@@ -273,7 +274,7 @@ impl CaptureSession {
         const MIN_DIM: u16 = 8;
         if geom.width < MIN_DIM || geom.height < MIN_DIM {
             if xcom_proto::debug() {
-                eprintln!(
+                logln!(
                     "[capture] ignoring helper window {win:#x} ({}x{})",
                     geom.width, geom.height
                 );
@@ -471,7 +472,7 @@ impl CaptureSession {
                         // asks for a full frame.
                         if let Err(err) = self.rename_pixmap(e.window) {
                             if xcom_proto::debug() {
-                                eprintln!("[capture] remap {:#x}: {err}", e.window);
+                                logln!("[capture] remap {:#x}: {err}", e.window);
                             }
                             self.remove_window(e.window);
                         } else {
@@ -525,7 +526,7 @@ impl CaptureSession {
         }
         if reply.width > xcom_proto::MAX_CURSOR_DIM || reply.height > xcom_proto::MAX_CURSOR_DIM {
             if xcom_proto::debug() {
-                eprintln!(
+                logln!(
                     "[capture] cursor {}x{} exceeds the wire limit; ignored",
                     reply.width, reply.height
                 );
@@ -747,7 +748,7 @@ impl CaptureSession {
                     // is disappearing anyway, so this is benign.
                     Err(ReplyError::X11Error(x)) if x.error_kind == ErrorKind::Drawable => {
                         if xcom_proto::debug() {
-                            eprintln!(
+                            logln!(
                                 "[capture] {win:#x}: drawable gone mid-capture (rect {}x{}+{}+{}, skipped)",
                                 r.w, r.h, r.x, r.y
                             );
@@ -757,7 +758,7 @@ impl CaptureSession {
                     Err(e) => {
                         // Anything else is a real capture bug (e.g. BadMatch
                         // from an undersized segment).
-                        eprintln!(
+                        logln!(
                             "capture: shm_get_image failed for {win:#x} rect {}x{}+{}+{} offset={off} segment={} bytes: {e}",
                             r.w, r.h, r.x, r.y, self.shm.len
                         );

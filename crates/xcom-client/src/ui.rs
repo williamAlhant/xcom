@@ -31,6 +31,7 @@ use winit::window::{Window, WindowId};
 
 use xcom_codec::decompress;
 use xcom_proto::{DamageFrame, Message};
+use xcom_proto::logln;
 
 use crate::hud::Hud;
 use crate::keys::{keysym_for, keysym_for_physical};
@@ -302,7 +303,7 @@ impl App {
         let clipboard = match arboard::Clipboard::new() {
             Ok(c) => Some(c),
             Err(e) => {
-                eprintln!("[ui] clipboard unavailable: {e}");
+                logln!("[ui] clipboard unavailable: {e}");
                 None
             }
         };
@@ -348,16 +349,16 @@ impl App {
 
     fn report(&mut self) {
         self.tick_metrics(true);
-        eprintln!(
+        logln!(
             "[ui] {} window(s) open, {} frames blitted",
             self.attached.len(),
             self.frames_blitted
         );
-        eprintln!(
+        logln!(
             "[ui] presents={}, present_errors={}",
             self.presents, self.present_errors
         );
-        eprintln!("[ui] metrics: {}", self.metrics_line());
+        logln!("[ui] metrics: {}", self.metrics_line());
         self.dump("");
     }
 
@@ -379,7 +380,7 @@ impl App {
             .iter()
             .max_by_key(|(id, _)| self.pixels.get(id).map(|p| p.w as usize * p.h as usize).unwrap_or(0))
         else {
-            eprintln!("[ui] no attached window to dump");
+            logln!("[ui] no attached window to dump");
             return;
         };
         let pix = &self.pixels[&id];
@@ -391,11 +392,11 @@ impl App {
         }
         let mut alphas: Vec<(u8, u64)> = alphas.into_iter().collect();
         alphas.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
-        eprintln!("[ui] store alpha histogram: {:#04x?}", &alphas[..alphas.len().min(6)]);
+        logln!("[ui] store alpha histogram: {:#04x?}", &alphas[..alphas.len().min(6)]);
         let store = ppm_bytes(pix.w, pix.h, &pix.buf);
         match std::fs::write(&path, &store) {
-            Ok(()) => eprintln!("[ui] dumped store {}x{} to {}", pix.w, pix.h, path.display()),
-            Err(e) => eprintln!("[ui] cannot dump {}: {e}", path.display()),
+            Ok(()) => logln!("[ui] dumped store {}x{} to {}", pix.w, pix.h, path.display()),
+            Err(e) => logln!("[ui] cannot dump {}: {e}", path.display()),
         }
 
         let att = self.attached.get_mut(&id).unwrap();
@@ -420,13 +421,13 @@ impl App {
                 if same {
                     for (i, (a, b)) in screen.iter().zip(pix.buf.iter()).enumerate() {
                         if a & 0x00ff_ffff != b & 0x00ff_ffff {
-                            eprintln!("[ui] first diff at px {i}: screen={a:#010x} store={b:#010x}");
+                            logln!("[ui] first diff at px {i}: screen={a:#010x} store={b:#010x}");
                             same = false;
                             break;
                         }
                     }
                 }
-                eprintln!(
+                logln!(
                     "[ui] screen readback {}x{}: {} vs store ({}x{}) -> {}",
                     att.local.0,
                     att.local.1,
@@ -436,7 +437,7 @@ impl App {
                     if same { "MATCH" } else { "MISMATCH" }
                 );
             }
-            Err(e) => eprintln!("[ui] screen readback unavailable: {e}"),
+            Err(e) => logln!("[ui] screen readback unavailable: {e}"),
         }
     }
 
@@ -532,7 +533,7 @@ impl App {
         let mut target = match softbuffer::Surface::new(&context, Arc::clone(&window)) {
             Ok(t) => t,
             Err(e) => {
-                eprintln!("[ui] window {id:#x}: surface creation failed: {e}");
+                logln!("[ui] window {id:#x}: surface creation failed: {e}");
                 return;
             }
         };
@@ -540,9 +541,9 @@ impl App {
             NonZeroU32::new(w as u32).unwrap(),
             NonZeroU32::new(h as u32).unwrap(),
         ) {
-            eprintln!("[ui] window {id:#x}: surface resize {w}x{h} failed: {e}");
+            logln!("[ui] window {id:#x}: surface resize {w}x{h} failed: {e}");
         }
-        eprintln!(
+        logln!(
             "[ui] window {id:#x} opened {w}x{h} at ({x},{y}) kind={kind} parent={parent:#x} override={override_redirect} (backend: {:?})",
             window
                 .window_handle()
@@ -583,7 +584,7 @@ impl App {
             Err(e) => {
                 self.present_errors += 1;
                 if self.present_errors <= 3 {
-                    eprintln!(
+                    logln!(
                         "[ui] present {id:#x}: buffer_mut failed: {e} (local {:?}, remote {}x{})",
                         att.local, pix.w, pix.h
                     );
@@ -593,7 +594,7 @@ impl App {
         };
         self.presents += 1;
         if self.presents <= 3 {
-            eprintln!(
+            logln!(
                 "[ui] present #{}, win {id:#x}: buffer={}px local={:?} remote={}x{}",
                 self.presents,
                 buf.len(),
@@ -626,7 +627,7 @@ impl App {
         if let Err(e) = buf.present() {
             self.present_errors += 1;
             if self.present_errors <= 3 {
-                eprintln!("[ui] present {id:#x}: present failed: {e}");
+                logln!("[ui] present {id:#x}: present failed: {e}");
             }
         }
     }
@@ -634,14 +635,14 @@ impl App {
     fn blit_frame(&mut self, frame: &DamageFrame) {
         let id = frame.window;
         if !sane_size(frame.win_w, frame.win_h) {
-            eprintln!(
+            logln!(
                 "[ui] frame {id:#x} rejected: implausible window size {}x{}",
                 frame.win_w, frame.win_h
             );
             return;
         }
         if xcom_proto::debug() {
-            eprintln!(
+            logln!(
                 "[ui] frame {id:#x} {}x{} rects={:?}",
                 frame.win_w,
                 frame.win_h,
@@ -701,7 +702,7 @@ impl ApplicationHandler<UserEvent> for App {
                 override_redirect,
             } => {
                 if !sane_size(w, h) {
-                    eprintln!("[ui] window {id:#x} rejected: implausible size {w}x{h}");
+                    logln!("[ui] window {id:#x} rejected: implausible size {w}x{h}");
                     return;
                 }
                 self.ever_had_windows = true;
@@ -727,7 +728,7 @@ impl ApplicationHandler<UserEvent> for App {
             }
             UserEvent::Geometry { id, x, y, w, h } => {
                 if xcom_proto::debug() {
-                    eprintln!("[ui] geometry {id:#x} -> {w}x{h} at ({x},{y})");
+                    logln!("[ui] geometry {id:#x} -> {w}x{h} at ({x},{y})");
                 }
                 if let Some(pix) = self.pixels.get_mut(&id) {
                     pix.x = x;
@@ -783,7 +784,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 winit::dpi::PhysicalPosition::new(tx, ty),
                             );
                             att.placed = (tx, ty);
-                            eprintln!("[ui] moved {id:#x} -> local ({tx},{ty})");
+                            logln!("[ui] moved {id:#x} -> local ({tx},{ty})");
                         }
                     }
                 }
@@ -791,13 +792,13 @@ impl ApplicationHandler<UserEvent> for App {
             }
             UserEvent::Unmap { id } => {
                 if let Some(att) = self.attached.get(&id) {
-                    eprintln!("[ui] window {id:#x} unmapped (hidden, store kept)");
+                    logln!("[ui] window {id:#x} unmapped (hidden, store kept)");
                     att.window.set_visible(false);
                 }
             }
             UserEvent::Map { id } => {
                 if let Some(att) = self.attached.get(&id) {
-                    eprintln!("[ui] window {id:#x} mapped again");
+                    logln!("[ui] window {id:#x} mapped again");
                     att.window.set_visible(true);
                     self.present(id);
                     self.send(Message::FullRequest { id });
@@ -809,7 +810,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.pixels.remove(&id);
                 if let Some(att) = self.attached.remove(&id) {
                     self.by_winit.remove(&att.window.id());
-                    eprintln!("[ui] window {id:#x} closed");
+                    logln!("[ui] window {id:#x} closed");
                 }
                 if self.ever_had_windows && self.attached.is_empty() {
                     // The last remote window is gone: the session has nothing
@@ -827,13 +828,13 @@ impl ApplicationHandler<UserEvent> for App {
             }
             UserEvent::ClipboardData { text } => {
                 if text.is_empty() {
-                    eprintln!("[ui] clipboard: remote selection is empty");
+                    logln!("[ui] clipboard: remote selection is empty");
                 } else if let Some(cb) = self.clipboard.as_mut() {
                     match cb.set_text(text.clone()) {
                         Ok(()) => {
-                            eprintln!("[ui] clipboard: copied {} bytes locally", text.len())
+                            logln!("[ui] clipboard: copied {} bytes locally", text.len())
                         }
-                        Err(e) => eprintln!("[ui] clipboard write failed: {e}"),
+                        Err(e) => logln!("[ui] clipboard write failed: {e}"),
                     }
                 }
             }
@@ -854,14 +855,14 @@ impl ApplicationHandler<UserEvent> for App {
                     Ok(source) => {
                         let cursor = el.create_custom_cursor(source);
                         if xcom_proto::debug() {
-                            eprintln!("[ui] cursor {w}x{h} hot=({hx},{hy})");
+                            logln!("[ui] cursor {w}x{h} hot=({hx},{hy})");
                         }
                         for att in self.attached.values() {
                             att.window.set_cursor(cursor.clone());
                         }
                         self.custom_cursor = Some(cursor);
                     }
-                    Err(e) => eprintln!("[ui] cursor rejected: {e:?}"),
+                    Err(e) => logln!("[ui] cursor rejected: {e:?}"),
                 }
             }
             UserEvent::Stats(s) => {
@@ -877,18 +878,18 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::Dump => self.dump("mid."),
             UserEvent::CloseOne => {
                 if let Some((&id, _)) = self.attached.iter().next() {
-                    eprintln!("[ui] test aid: closing window {id:#x}");
+                    logln!("[ui] test aid: closing window {id:#x}");
                     self.send(Message::WindowClose { id });
                 }
             }
             UserEvent::ResizeLocal { w, h } => {
                 if let Some((id, att)) = self.attached.iter_mut().next() {
-                    eprintln!("[ui] test resize {id:#x} -> {w}x{h}");
+                    logln!("[ui] test resize {id:#x} -> {w}x{h}");
                     let _ = att.window.request_inner_size(PhysicalSize::new(w, h));
                 }
             }
             UserEvent::ConnectionLost => {
-                eprintln!("[ui] connection lost, closing {} window(s)", self.attached.len());
+                logln!("[ui] connection lost, closing {} window(s)", self.attached.len());
                 self.report();
                 el.exit();
             }
@@ -914,13 +915,13 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::CloseRequested => {
                 // Close just this remote window (WM_DELETE_REQUEST); the
                 // session ends when the last one is destroyed.
-                eprintln!("[ui] close requested for win {remote:#x}");
+                logln!("[ui] close requested for win {remote:#x}");
                 self.send(Message::WindowClose { id: remote });
             }
             WindowEvent::RedrawRequested => self.present(remote),
             WindowEvent::Resized(size) => {
                 if xcom_proto::debug() {
-                    eprintln!("[ui] resized {:?} (win {remote:#x})", size);
+                    logln!("[ui] resized {:?} (win {remote:#x})", size);
                 }
                 let mut reflow = None;
                 if let Some(att) = self.attached.get_mut(&remote) {
@@ -955,7 +956,7 @@ impl ApplicationHandler<UserEvent> for App {
                 let x = (position.x.round() as i32).clamp(0, pix.w.max(1) as i32 - 1) as i16;
                 let y = (position.y.round() as i32).clamp(0, pix.h.max(1) as i32 - 1) as i16;
                 if xcom_proto::debug() {
-                    eprintln!("[ui] motion ({x},{y}) local={:?}", {
+                    logln!("[ui] motion ({x},{y}) local={:?}", {
                         let a = self.attached.get(&remote);
                         a.map(|a| a.local)
                     });
@@ -979,7 +980,7 @@ impl ApplicationHandler<UserEvent> for App {
                     .map(|a| a.cursor)
                     .unwrap_or((0, 0));
                 if xcom_proto::debug() {
-                    eprintln!("[ui] button {button:?} {state:?} at ({x},{y})");
+                    logln!("[ui] button {button:?} {state:?} at ({x},{y})");
                 }
                 self.send_input(
                     remote,
@@ -1022,7 +1023,7 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::Focused(focused) => {
                 if xcom_proto::debug() {
-                    eprintln!("[ui] focused={focused} (win {remote:#x})");
+                    logln!("[ui] focused={focused} (win {remote:#x})");
                 }
                 if !focused {
                     // Releases may never arrive after losing OS focus; never
@@ -1096,7 +1097,7 @@ impl ApplicationHandler<UserEvent> for App {
                     if is_hud_toggle(&event.logical_key, &event.physical_key, ctrl, shift, alt_super)
                     {
                         self.hud_on = !self.hud_on;
-                        eprintln!("[ui] HUD {}", if self.hud_on { "on" } else { "off" });
+                        logln!("[ui] HUD {}", if self.hud_on { "on" } else { "off" });
                         self.tick_metrics(true);
                         for att in self.attached.values() {
                             att.window.request_redraw();
@@ -1105,7 +1106,7 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     match event.physical_key {
                         winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyC) => {
-                            eprintln!("[ui] clipboard: requesting the remote selection");
+                            logln!("[ui] clipboard: requesting the remote selection");
                             self.send(Message::ClipboardGet {
                                 target: xcom_proto::CLIPBOARD_CLIPBOARD,
                             });
@@ -1115,7 +1116,7 @@ impl ApplicationHandler<UserEvent> for App {
                             match self.clipboard.as_mut().map(|cb| cb.get_text()) {
                                 Some(Ok(text)) if !text.is_empty() => {
                                     let text = xcom_proto::truncate_clipboard(text);
-                                    eprintln!(
+                                    logln!(
                                         "[ui] clipboard: pushing {} bytes to the remote",
                                         text.len()
                                     );
@@ -1124,9 +1125,9 @@ impl ApplicationHandler<UserEvent> for App {
                                         text,
                                     });
                                 }
-                                Some(Ok(_)) => eprintln!("[ui] clipboard: local clipboard is empty"),
-                                Some(Err(e)) => eprintln!("[ui] clipboard read failed: {e}"),
-                                None => eprintln!("[ui] clipboard: no local clipboard"),
+                                Some(Ok(_)) => logln!("[ui] clipboard: local clipboard is empty"),
+                                Some(Err(e)) => logln!("[ui] clipboard read failed: {e}"),
+                                None => logln!("[ui] clipboard: no local clipboard"),
                             }
                             return;
                         }
@@ -1152,7 +1153,7 @@ impl ApplicationHandler<UserEvent> for App {
                         winit::keyboard::NamedKey::F12
                     ))
                 {
-                    eprintln!("[ui] F12: dumping store and requesting full refresh");
+                    logln!("[ui] F12: dumping store and requesting full refresh");
                     self.dump("mid.");
                     if let Some(&id) = self.attached.keys().next() {
                         self.send(Message::FullRequest { id });
@@ -1195,7 +1196,7 @@ impl ApplicationHandler<UserEvent> for App {
                         })
                 };
                 if xcom_proto::debug_keys() {
-                    eprintln!(
+                    logln!(
                         "[ui] key {:?} -> sym={} pressed={} text={:?}",
                         event.logical_key,
                         sym.map(|s| format!("{s:#x}"))
@@ -1304,7 +1305,7 @@ impl App {
         self.rebuild_hud();
         if now.duration_since(self.last_log) >= Duration::from_secs(5) {
             self.last_log = now;
-            eprintln!("[ui] metrics: {}", self.metrics_line());
+            logln!("[ui] metrics: {}", self.metrics_line());
         }
     }
 
@@ -1399,7 +1400,7 @@ impl App {
             }
             art.push('\n');
         }
-        eprintln!("[ui] cursor image {w}x{h} hot=({xhot},{yhot}):\n{art}");
+        logln!("[ui] cursor image {w}x{h} hot=({xhot},{yhot}):\n{art}");
         let rgba = cursor_rgba(pixels);
         let mut ppm = Vec::with_capacity(w as usize * h as usize * 3 + 32);
         ppm.extend_from_slice(format!("P6\n{w} {h}\n255\n").as_bytes());
@@ -1415,8 +1416,8 @@ impl App {
             .unwrap_or_else(|| PathBuf::from("/tmp/xcom-cursor.ppm"));
         let path = base.with_extension(format!("cursor{}.ppm", self.cursor_seq));
         match std::fs::write(&path, &ppm) {
-            Ok(()) => eprintln!("[ui] cursor dumped to {}", path.display()),
-            Err(e) => eprintln!("[ui] cannot dump cursor: {e}"),
+            Ok(()) => logln!("[ui] cursor dumped to {}", path.display()),
+            Err(e) => logln!("[ui] cannot dump cursor: {e}"),
         }
     }
 }

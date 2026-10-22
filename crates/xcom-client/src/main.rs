@@ -20,6 +20,7 @@ use clap::{Parser, Subcommand};
 use winit::event_loop::EventLoop;
 
 use xcom_proto::{Message, MSG_DAMAGE};
+use xcom_proto::logln;
 use xcom_transport::{Channel, Role};
 use ui::{App, UserEvent};
 
@@ -201,7 +202,7 @@ fn bootstrap_ssh(
             });
         }
         // Anything else is daemon log output; show it.
-        eprintln!("[remote] {line}");
+        logln!("[remote] {line}");
     }
 }
 
@@ -230,7 +231,7 @@ fn main() -> Result<()> {
         }
         (None, Some(addr)) => {
             if args.token_control.is_some() || args.token_bulk.is_some() {
-                eprintln!(
+                logln!(
                     "[xcom] warning: tokens on the command line are visible to local users (ps); use --ssh"
                 );
             }
@@ -253,7 +254,7 @@ fn main() -> Result<()> {
         handshake.addr = override_addr.clone();
     }
 
-    eprintln!(
+    logln!(
         "[xcom] connecting to {} (fingerprint {}…)",
         handshake.addr,
         &handshake.fingerprint[..16.min(handshake.fingerprint.len())]
@@ -276,7 +277,7 @@ fn main() -> Result<()> {
         timeout,
     )
     .context("bulk channel")?;
-    eprintln!("[xcom] secure channel established");
+    logln!("[xcom] secure channel established");
 
     let event_loop = EventLoop::<UserEvent>::with_user_event()
         .build()
@@ -288,7 +289,7 @@ fn main() -> Result<()> {
     let proxy_ctrl = proxy.clone();
     std::thread::spawn(move || {
         if let Err(e) = control_loop(control, proxy_ctrl.clone(), input_rx) {
-            eprintln!("[xcom] control channel: {e}");
+            logln!("[xcom] control channel: {e}");
         }
         // EOF or error: the session is gone — make the UI close its windows
         // instead of leaving stale content on screen.
@@ -305,7 +306,7 @@ fn main() -> Result<()> {
         let delay = args.type_delay;
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_secs(delay));
-            eprintln!("[xcom] typing {text:?} t_ns={}", xcom_proto::now_ns());
+            logln!("[xcom] typing {text:?} t_ns={}", xcom_proto::now_ns());
             for c in text.chars() {
                 // Control characters map to their X keysyms, not their codes.
                 let sym = match c {
@@ -375,7 +376,7 @@ fn main() -> Result<()> {
     let proxy_bulk = proxy.clone();
     std::thread::spawn(move || {
         if let Err(e) = bulk_loop(bulk, proxy_bulk.clone()) {
-            eprintln!("[xcom] bulk channel: {e}");
+            logln!("[xcom] bulk channel: {e}");
         }
         proxy_bulk.send_event(UserEvent::ConnectionLost).ok();
     });
@@ -435,7 +436,7 @@ fn control_loop(
             Ok(Some((ty, payload))) => {
                 last_rx = std::time::Instant::now();
                 let Ok(msg) = Message::decode(ty, &payload) else {
-                    eprintln!("[xcom] control: undecodable message type {ty}");
+                    logln!("[xcom] control: undecodable message type {ty}");
                     continue;
                 };
                 let event = match msg {
@@ -538,7 +539,7 @@ fn bulk_loop(mut bulk: Channel, proxy: winit::event_loop::EventLoopProxy<UserEve
                 let frame = xcom_proto::DamageFrame::decode(&payload)?;
                 proxy.send_event(UserEvent::Frame(frame)).ok();
             }
-            Ok(Some((ty, _))) => eprintln!("[xcom] bulk: unexpected msg type {ty}"),
+            Ok(Some((ty, _))) => logln!("[xcom] bulk: unexpected msg type {ty}"),
             Ok(None) => return Ok(()),
             Err(e) => return Err(e.into()),
         }

@@ -22,6 +22,7 @@ use x11rb::protocol::Event;
 
 use xcom_codec::decompress;
 use xcom_proto::{now_ns, DamageFrame, FrameReader, FrameWriter, MSG_DAMAGE, MSG_HELLO, PROTO_VERSION};
+use xcom_proto::logln;
 use xcom_x11::capture::{CaptureConfig, CaptureSession, DamageMode, PumpEvent};
 use xcom_x11::input::Injector;
 use xcom_x11::keymap::{Keymap, XK_ESCAPE, XK_RETURN};
@@ -396,7 +397,7 @@ fn capture(args: CaptureArgs) -> Result<()> {
     hello.extend_from_slice(&win.to_le_bytes());
     w.write(MSG_HELLO, &hello)?;
 
-    eprintln!("capturing {win:#010x} ({win_w}x{win_h}) -> {}", args.target);
+    logln!("capturing {win:#010x} ({win_w}x{win_h}) -> {}", args.target);
 
     let deadline =
         (args.seconds > 0).then(|| Instant::now() + Duration::from_secs(args.seconds));
@@ -420,7 +421,7 @@ fn capture(args: CaptureArgs) -> Result<()> {
         };
         let payload = frame.encode();
         if w.write(MSG_DAMAGE, &payload).is_err() {
-            eprintln!("sink closed the connection");
+            logln!("sink closed the connection");
             break;
         }
 
@@ -434,7 +435,7 @@ fn capture(args: CaptureArgs) -> Result<()> {
         if interval.elapsed() >= Duration::from_secs(1) {
             let secs = interval.elapsed().as_secs_f64();
             let n = frames.max(1);
-            eprintln!(
+            logln!(
                 "[cap] fps={:.1} frames={frames} rects={} raw={:.1}MB comp={:.1}MB ratio={:.1}x capture_avg={:.2}ms encode_avg={:.2}ms out={:.2}MB/s",
                 frames as f64 / start.elapsed().as_secs_f64(),
                 rect_total,
@@ -496,7 +497,7 @@ fn is_modifier_sym(sym: u32) -> bool {
 fn sink(args: SinkArgs) -> Result<()> {
     let listener = TcpListener::bind(&args.listen)
         .with_context(|| format!("binding {}", args.listen))?;
-    eprintln!("[sink] listening on {}", args.listen);
+    logln!("[sink] listening on {}", args.listen);
 
     // Bound the wait for a connection too: --seconds is a wall-clock limit for
     // the whole run, not just for the connected phase.
@@ -506,7 +507,7 @@ fn sink(args: SinkArgs) -> Result<()> {
     let sock = loop {
         match listener.accept() {
             Ok((sock, peer)) => {
-                eprintln!("[sink] connection from {peer}");
+                logln!("[sink] connection from {peer}");
                 break sock;
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -557,14 +558,14 @@ fn sink(args: SinkArgs) -> Result<()> {
             Ok(Some(frame)) => frame,
             Ok(None) => break, // EOF
             Err(e) => {
-                eprintln!("[sink] read ended: {e}");
+                logln!("[sink] read ended: {e}");
                 break;
             }
         };
         match ty {
             MSG_HELLO if payload.len() >= 6 => {
                 let ver = u16::from_le_bytes(payload[..2].try_into().unwrap());
-                eprintln!("[sink] hello: proto v{ver}");
+                logln!("[sink] hello: proto v{ver}");
             }
             MSG_HELLO => {}
             MSG_DAMAGE => {
@@ -631,7 +632,7 @@ fn print_interval(
     let mut sd = std::mem::take(lat_send).into_boxed_slice();
     ev.sort_unstable();
     sd.sort_unstable();
-    eprintln!(
+    logln!(
         "[sink] frames={frames} rects={rects} fps={:.1} in={:.2}MB/s ratio={:.1}x decode_avg={:.2}ms | lat(ev->arr) p50={}µs p90={}µs p99={}µs max={}µs | lat(enc->arr) p50={}µs p99={}µs",
         frames as f64 / secs,
         wire_total as f64 / 1e6 / secs,
@@ -670,7 +671,7 @@ fn selftest(args: SelftestArgs) -> Result<()> {
                 Ok(c) => break c,
                 Err(e) if Instant::now() < deadline => {
                     if xcom_proto::debug() {
-                        eprintln!("[selftest] retrying connect to {display}: {e}");
+                        logln!("[selftest] retrying connect to {display}: {e}");
                     }
                     std::thread::sleep(Duration::from_millis(50));
                 }
@@ -1235,7 +1236,7 @@ fn wm_demo(args: WmDemoArgs) -> Result<()> {
     conn.poly_fill_rectangle(menu, gc3, &[Rectangle { x: 10, y: 10, width: 140, height: 20 }])?;
     conn.flush()?;
 
-    eprintln!(
+    logln!(
         "[wm-demo] main={main:#x} dialog={dialog:#x} menu={menu:#x} helper={helper:#x} input-only={helper_in:#x} display={display}"
     );
     // Move the menu after mapping, like toolkits do when they keep a popup on
@@ -1243,7 +1244,7 @@ fn wm_demo(args: WmDemoArgs) -> Result<()> {
     std::thread::sleep(Duration::from_millis(1500));
     conn.configure_window(menu, &ConfigureWindowAux::new().x(190).y(140))?;
     conn.flush()?;
-    eprintln!("[wm-demo] menu moved to 190,140");
+    logln!("[wm-demo] menu moved to 190,140");
     std::thread::sleep(Duration::from_secs(args.seconds));
     Ok(())
 }

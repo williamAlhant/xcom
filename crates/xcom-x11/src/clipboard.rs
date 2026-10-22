@@ -20,6 +20,7 @@ use x11rb::protocol::xproto::{
     SelectionRequestEvent, Timestamp, Window, WindowClass, SELECTION_NOTIFY_EVENT,
 };
 use x11rb::protocol::Event;
+use xcom_proto::logln;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Target {
@@ -73,7 +74,7 @@ impl Clipboard {
             Ok((conn, screen)) => {
                 ready_tx.send(Ok(())).ok();
                 if let Err(e) = clipboard_loop(conn, screen, rx) {
-                    eprintln!("[clipboard] stopped: {e:#}");
+                    logln!("[clipboard] stopped: {e:#}");
                 }
             }
             Err(e) => {
@@ -189,7 +190,7 @@ fn clipboard_loop(
                             let _ = reply.send(text);
                         }
                         Err(e) => {
-                            eprintln!("[clipboard] get {:?} failed: {e:#}", target);
+                            logln!("[clipboard] get {:?} failed: {e:#}", target);
                             let _ = reply.send(None);
                         }
                     }
