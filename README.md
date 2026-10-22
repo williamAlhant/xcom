@@ -42,7 +42,8 @@ Useful flags: `--connect HOST:PORT` overrides the address to dial (NAT,
 containers); `--seconds N` exits after N seconds (0 = until the windows close);
 `xcomd serve --spawn 1600x1200` sets the virtual display size; `--hud` shows
 the metrics overlay (fps, bandwidth, compression ratio, RTT, capture/encode
-time), toggled in-session with Ctrl+Shift+M.
+time), toggled in-session with Ctrl+Shift+M; `--no-clipboard-sync` turns off
+clipboard mirroring.
 
 Builds:
 
@@ -66,7 +67,10 @@ Tests: `cargo test --workspace`, plus `scripts/e2e-direct.sh`,
   disconnects; there is no reconnect or resume.
 - **SSH is bootstrap-only.** After authentication the client reaches the
   daemon's advertised address directly; there is no `ssh -L` fallback yet.
-- **Clipboard is text only**, capped at 60 KB.
+- **Clipboard is text only**, capped at 60 KB, and mirrored in the background
+  (CLIPBOARD only; no PRIMARY/middle-click). Disable with
+  `--no-clipboard-sync`, since mirroring lets the remote read your local
+  selection.
 - **Single remote screen**: no multi-monitor, no audio, no file transfer.
 - **Not security-audited.** Tokens and the ephemeral certificate are
   regenerated on every run.

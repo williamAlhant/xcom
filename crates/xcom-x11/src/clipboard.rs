@@ -19,6 +19,8 @@ use x11rb::protocol::xproto::{
     Atom, AtomEnum, ConnectionExt, CreateWindowAux, EventMask, PropMode, SelectionNotifyEvent,
     SelectionRequestEvent, Timestamp, Window, WindowClass, SELECTION_NOTIFY_EVENT,
 };
+use x11rb::protocol::xfixes;
+use x11rb::protocol::xfixes::ConnectionExt as _;
 use x11rb::protocol::Event;
 use xcom_proto::logln;
 
@@ -66,14 +68,17 @@ pub struct Clipboard {
 impl Clipboard {
     /// Start the worker on `display` (e.g. ":3"). Fails if the display cannot
     /// be opened.
-    pub fn spawn(display: &str) -> Result<Clipboard> {
+    ///
+    /// Selections changed by remote applications are pushed to `outbound` as
+    /// `ClipboardData`, so the client can mirror them without polling.
+    pub fn spawn(display: &str, outbound: mpsc::Sender<xcom_proto::Message>) -> Result<Clipboard> {
         let (tx, rx) = mpsc::channel();
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let display = display.to_string();
         std::thread::spawn(move || match x11rb::connect(Some(&display)) {
             Ok((conn, screen)) => {
                 ready_tx.send(Ok(())).ok();
-                if let Err(e) = clipboard_loop(conn, screen, rx) {
+                if let Err(e) = clipboard_loop(conn, screen, rx, outbound) {
                     logln!("[clipboard] stopped: {e:#}");
                 }
             }
@@ -158,6 +163,7 @@ fn clipboard_loop(
     conn: x11rb::rust_connection::RustConnection,
     screen: usize,
     rx: mpsc::Receiver<Cmd>,
+    outbound: mpsc::Sender<xcom_proto::Message>,
 ) -> Result<()> {
     let root = conn.setup().roots[screen].root;
     let atoms = Atoms::intern(&conn)?;
@@ -176,6 +182,42 @@ fn clipboard_loop(
         x11rb::COPY_FROM_PARENT,
         &CreateWindowAux::new().event_mask(EventMask::PROPERTY_CHANGE),
     )?;
+    // Watch ownership of CLIPBOARD so a copy inside the session can be
+    // mirrored to the client. Missing XFixes only disables that mirroring.
+    // The extension requires a QueryVersion before other requests.
+    let versioned = match conn.xfixes_query_version(5, 0) {
+        Ok(cookie) => match cookie.reply() {
+            Ok(v) => Some(v),
+            Err(e) => {
+                logln!("[clipboard] XFixes query failed: {e}");
+                None
+            }
+        },
+        Err(e) => {
+            logln!("[clipboard] XFixes query failed: {e}");
+            None
+        }
+    };
+    let watching = match versioned {
+        Some(_) => match conn.xfixes_select_selection_input(
+            root,
+            atoms.clipboard,
+            xfixes::SelectionEventMask::SET_SELECTION_OWNER,
+        ) {
+            Ok(cookie) => match cookie.check() {
+                Ok(()) => true,
+                Err(e) => {
+                    logln!("[clipboard] selection notifications unavailable: {e}");
+                    false
+                }
+            },
+            Err(e) => {
+                logln!("[clipboard] selection notifications unavailable: {e}");
+                false
+            }
+        },
+        None => false,
+    };
     conn.flush()?;
 
     let mut owned: HashMap<Atom, String> = HashMap::new();
@@ -213,7 +255,41 @@ fn clipboard_loop(
             }
         }
         while let Some(ev) = conn.poll_for_event()? {
-            handle_event(&conn, &atoms, &mut owned, ev)?;
+            match ev {
+                Event::XfixesSelectionNotify(e)
+                    if watching
+                        && e.subtype == xfixes::SelectionEvent::SET_SELECTION_OWNER
+                        && e.selection == atoms.clipboard
+                        && e.owner != x11rb::NONE
+                        // We set it ourselves when the client pushes text.
+                        && e.owner != win =>
+                {
+                    match get_selection(&conn, win, &atoms, Target::Clipboard, &mut owned) {
+                        Ok(Some(text)) if !text.is_empty() => {
+                            if text.len() > xcom_proto::MAX_CLIPBOARD_TEXT {
+                                logln!(
+                                    "[clipboard] {}-byte remote selection not mirrored (cap {})",
+                                    text.len(),
+                                    xcom_proto::MAX_CLIPBOARD_TEXT
+                                );
+                            } else {
+                                if xcom_proto::debug() {
+                                    logln!("[clipboard] remote selection -> client ({} bytes)", text.len());
+                                }
+                                outbound
+                                    .send(xcom_proto::Message::ClipboardData {
+                                        target: Target::Clipboard.as_u8(),
+                                        text,
+                                    })
+                                    .ok();
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(e) => logln!("[clipboard] mirroring failed: {e:#}"),
+                    }
+                }
+                other => handle_event(&conn, &atoms, &mut owned, other)?,
+            }
         }
         std::thread::sleep(Duration::from_millis(10));
     }

@@ -170,16 +170,6 @@ pub fn run(args: ServeArgs) -> Result<()> {
 
     let keymap = Keymap::query(session.connection().as_ref())?;
 
-    // Clipboard worker: own connection, separate thread; the session still
-    // works without it (e.g. if the display refuses another connection).
-    let clipboard = match Clipboard::spawn(&display) {
-        Ok(c) => Some(c),
-        Err(e) => {
-            logln!("[serve] clipboard disabled: {e:#}");
-            None
-        }
-    };
-
     // --- identity, tokens, listener --------------------------------------
     let identity = Identity::generate()?;
     // One single-use token per role: burning the control token cannot make the
@@ -253,6 +243,17 @@ pub fn run(args: ServeArgs) -> Result<()> {
 
     // --- control thread: input in, window events out ---------------------
     let (ctrl_tx, ctrl_rx) = mpsc::channel::<Message>();
+
+    // Clipboard worker: own connection, separate thread; the session still
+    // works without it (e.g. if the display refuses another connection). It
+    // pushes remote selection changes to the client through `ctrl_tx`.
+    let clipboard = match Clipboard::spawn(&display, ctrl_tx.clone()) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            logln!("[serve] clipboard disabled: {e:#}");
+            None
+        }
+    };
     let (full_tx, full_rx) = mpsc::channel::<Window>();
     let conn_for_input = session.connection();
     let shutdown_ctrl = Arc::clone(&shutdown);

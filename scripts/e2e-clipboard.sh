@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
-# Clipboard end-to-end: remote selection -> local clipboard, and back.
-#
-# The client runs on a private Xvfb (X11 backend) so XTEST can drive the
-# Ctrl+Shift+C/V shortcuts without desktop input permissions. The daemon runs
-# in the test container; a small helper owns/reads selections on both sides.
+# Clipboard end-to-end: the selection is mirrored in both directions with no
+# client shortcut. The client runs on a private Xvfb (X11 backend); the daemon
+# runs in the test container with gtk3-widget-factory. A small helper owns and
+# reads selections on both sides.
 #
 # Usage: scripts/e2e-clipboard.sh [seconds]
 set -euo pipefail
@@ -61,49 +60,48 @@ env -u WAYLAND_DISPLAY DISPLAY=$DISP XCOM_DEBUG=1 "$XCOM" connect \
     > "$OUT/client.log" 2>&1 &
 CPID=$!
 
-# Wait until the client window is viewable before focusing it: an unmapped
-# window accepts set_input_focus without error but never receives the keys.
-for _ in $(seq 1 80); do
-    DISPLAY=$DISP "$X11I" list 2>/dev/null | grep -q 'VIEWABLE.*xcom' && break
-    sleep 0.25
-done
-DISPLAY=$DISP "$X11I" focus xcom >/dev/null 2>&1 || true
-sleep 0.5
-# A click gives winit its FocusIn; XTEST keys otherwise go to PointerRoot.
-DISPLAY=$DISP "$X11I" clickat 80 80 1 >/dev/null 2>&1 || true
-sleep 0.5
-FOCUS=$(DISPLAY=$DISP "$X11I" focus-get 2>/dev/null || true)
-case "$FOCUS" in
-    *focus=0x1*) echo "warning: window never took focus ($FOCUS)" >&2 ;;
-esac
-
-shortcut() {
-    DISPLAY=$DISP "$X11I" down 37
-    DISPLAY=$DISP "$X11I" down 50
-    DISPLAY=$DISP "$X11I" keys "$1"
-    DISPLAY=$DISP "$X11I" up 50
-    DISPLAY=$DISP "$X11I" up 37
+local_get() {
+    DISPLAY=$DISP "$X11I" clipboard-get 2>/dev/null || true
+}
+remote_get() {
+    podman exec -e XAUTHORITY="$AUTH" xcom-testvm sh -c \
+        "DISPLAY=$RDISPLAY /usr/local/bin/x11_input clipboard-get" 2>/dev/null || true
 }
 
-echo "== remote -> local (Ctrl+Shift+C) =="
+# Poll a reader until it prints the expected value (the mirror is event driven,
+# but allow for helper startup and the round trip).
+wait_for() {
+    local reader=$1 expect=$2
+    for _ in $(seq 1 40); do
+        local got
+        got=$($reader)
+        if [ "$got" = "$expect" ]; then
+            echo "$got"
+            return 0
+        fi
+        sleep 0.1
+    done
+    echo "${got:-<empty>}"
+    return 1
+}
+
+echo "== remote -> local (no shortcut) =="
 (podman exec -e XAUTHORITY="$AUTH" xcom-testvm sh -c \
     "DISPLAY=$RDISPLAY /usr/local/bin/x11_input clipboard-set REMOTE-CLIP 12" \
     > "$OUT/remote-set.log" 2>&1) &
 RPID=$!
-sleep 0.8
-shortcut 54 # C
-sleep 1
-GOT_LOCAL=$(DISPLAY=$DISP "$X11I" clipboard-get 2>/dev/null || true)
+# Give the client's initial seed Get time to settle before the push.
+sleep 0.5
+GOT_LOCAL=$(wait_for local_get REMOTE-CLIP) || true
 echo "local clipboard: ${GOT_LOCAL:-<empty>}"
 
-echo "== local -> remote (Ctrl+Shift+V) =="
+# Stay outside the client's echo-suppression window before writing locally.
+sleep 0.7
+
+echo "== local -> remote (no shortcut) =="
 (DISPLAY=$DISP "$X11I" clipboard-set LOCAL-CLIP 12 > "$OUT/local-set.log" 2>&1) &
 LPID=$!
-sleep 0.8
-shortcut 55 # V
-sleep 1
-GOT_REMOTE=$(podman exec -e XAUTHORITY="$AUTH" xcom-testvm sh -c \
-    "DISPLAY=$RDISPLAY /usr/local/bin/x11_input clipboard-get" 2>/dev/null || true)
+GOT_REMOTE=$(wait_for remote_get LOCAL-CLIP) || true
 echo "remote clipboard: ${GOT_REMOTE:-<empty>}"
 
 PASS=1
@@ -113,8 +111,8 @@ if [ "$PASS" = 1 ]; then
     echo "=== e2e-clipboard: PASS ==="
 else
     echo "=== e2e-clipboard: FAIL ==="
-    echo "--- client ---"; grep -iE "clipboard|key" "$OUT/client.log" | tail -20
-    echo "--- daemon ---"; tail -20 "$OUT/daemon.log"
+    echo "--- client ---"; grep -iE "clipboard" "$OUT/client.log" | tail -20
+    echo "--- daemon ---"; grep -iE "clipboard" "$OUT/daemon.log" | tail -20
     echo "--- remote set ---"; cat "$OUT/remote-set.log" 2>/dev/null
 fi
 exit $((PASS == 1 ? 0 : 1))

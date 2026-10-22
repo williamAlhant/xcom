@@ -226,10 +226,6 @@ pub enum KeyAction {
     Press(u32),
     /// Forward this keysym as a release.
     Release(u32),
-    /// Local shortcut: ask the server for its selection.
-    ClipboardGet,
-    /// Local shortcut: push our selection to the server (the UI reads it).
-    PushClipboard,
     /// Local shortcut: show/hide the metrics HUD.
     ToggleHud,
 }
@@ -293,17 +289,9 @@ impl KeyState {
         let alt_super = mods.alt_key() || mods.super_key() || held_any(ALT) || held_any(SUPER);
         let ctrl_alt = ctrl || alt_super;
 
-        // Local shortcuts (never forwarded).
-        if ctrl && shift && !alt_super {
-            if is_hud_toggle(logical, physical, ctrl, shift, alt_super) {
-                return KeyAction::ToggleHud;
-            }
-            if is_shortcut(physical, logical, KeyCode::KeyC, "c") {
-                return KeyAction::ClipboardGet;
-            }
-            if is_shortcut(physical, logical, KeyCode::KeyV, "v") {
-                return KeyAction::PushClipboard;
-            }
+        // Local shortcut (never forwarded).
+        if is_hud_toggle(logical, physical, ctrl, shift, alt_super) {
+            return KeyAction::ToggleHud;
         }
 
         let text_sym = text_keysym(text);
@@ -502,21 +490,18 @@ mod tests {
     }
 
     #[test]
-    fn shortcuts_are_local_and_precede_text() {
+    fn ctrl_shift_c_and_v_are_forwarded() {
+        // The clipboard is mirrored in the background, so these must reach the
+        // application (xterm's own copy/paste bindings) instead of being eaten.
         let mut ks = KeyState::new();
         let mods = ModifiersState::CONTROL | ModifiersState::SHIFT;
         assert_eq!(
             ks.on_key(&code(KeyCode::KeyC), &ch("C"), None, true, false, mods),
-            KeyAction::ClipboardGet
+            KeyAction::Press(0x43)
         );
         assert_eq!(
             ks.on_key(&code(KeyCode::KeyV), &ch("V"), None, true, false, mods),
-            KeyAction::PushClipboard
-        );
-        // A plain 'c' is still forwarded.
-        assert_eq!(
-            ks.on_key(&code(KeyCode::KeyC), &ch("c"), Some("c"), true, false, ModifiersState::empty()),
-            KeyAction::Press(0x63)
+            KeyAction::Press(0x56)
         );
     }
 

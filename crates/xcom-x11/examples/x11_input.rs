@@ -106,7 +106,8 @@ fn main() -> Result<()> {
                 xcom_x11::clipboard::Target::Clipboard
             };
             let display = std::env::var("DISPLAY").unwrap_or_else(|_| ":0".into());
-            let cb = xcom_x11::clipboard::Clipboard::spawn(&display)?;
+            let (tx, _rx) = std::sync::mpsc::channel();
+            let cb = xcom_x11::clipboard::Clipboard::spawn(&display, tx)?;
             match cb.get(target, std::time::Duration::from_secs(2)) {
                 Some(text) => println!("{text}"),
                 None => bail!("selection is empty"),
@@ -122,7 +123,8 @@ fn main() -> Result<()> {
                 .transpose()?
                 .unwrap_or(0);
             let display = std::env::var("DISPLAY").unwrap_or_else(|_| ":0".into());
-            let cb = xcom_x11::clipboard::Clipboard::spawn(&display)?;
+            let (tx, _rx) = std::sync::mpsc::channel();
+            let cb = xcom_x11::clipboard::Clipboard::spawn(&display, tx)?;
             cb.set(xcom_x11::clipboard::Target::Clipboard, text)?;
             if hold > 0 {
                 std::thread::sleep(std::time::Duration::from_secs(hold));

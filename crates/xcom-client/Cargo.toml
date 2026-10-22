@@ -19,3 +19,11 @@ winit = "0.30"
 xcom-codec = { path = "../xcom-codec" }
 xcom-proto = { path = "../xcom-proto" }
 xcom-transport = { path = "../xcom-transport" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Only the XFixes selection notifications are needed for clipboard mirroring.
+x11rb = { version = "0.13", features = ["xfixes"] }
+
+[target.'cfg(windows)'.dependencies]
+# GetClipboardSequenceNumber: change detection without touching the clipboard.
+windows-sys = { version = "0.61", features = ["Win32_System_DataExchange"] }

@@ -37,6 +37,16 @@ use xcom_proto::logln;
 use crate::keys::{KeyAction, KeyState};
 use crate::metrics::{Metrics, ServerStats};
 
+/// Startup options for the UI (kept separate to keep `App::new` readable).
+pub struct AppOptions {
+    pub dump: Option<PathBuf>,
+    pub fullscreen: bool,
+    pub debug_tools: bool,
+    pub hud: bool,
+    pub queue_us: Arc<AtomicU32>,
+    pub clipboard_sync: bool,
+}
+
 /// Events from the network threads to the UI thread.
 pub enum UserEvent {
     Open {
@@ -214,8 +224,8 @@ pub struct App {
     ever_had_windows: bool,
     /// Keysym bookkeeping and the local key bindings (Ctrl+Shift+C/V/M).
     keys: KeyState,
-    /// Local (client) clipboard. None when the platform has no text clipboard.
-    clipboard: Option<arboard::Clipboard>,
+    /// Local clipboard: applies remote pushes and mirrors local changes.
+    clipboard: crate::clipboard::LocalClipboard,
     /// Cursor mirroring the remote pointer, applied to every window.
     custom_cursor: Option<winit::window::CustomCursor>,
     /// Numbered cursor dumps under XCOM_DEBUG.
@@ -312,19 +322,17 @@ impl App {
     pub fn new(
         _proxy: EventLoopProxy<UserEvent>,
         input_tx: Sender<(Message, Instant)>,
-        dump: Option<PathBuf>,
-        fullscreen: bool,
-        debug_tools: bool,
-        hud: bool,
-        queue_us: Arc<AtomicU32>,
+        opts: AppOptions,
     ) -> App {
-        let clipboard = match arboard::Clipboard::new() {
-            Ok(c) => Some(c),
-            Err(e) => {
-                logln!("[ui] clipboard unavailable: {e}");
-                None
-            }
-        };
+        let AppOptions {
+            dump,
+            fullscreen,
+            debug_tools,
+            hud,
+            queue_us,
+            clipboard_sync,
+        } = opts;
+        let clipboard = crate::clipboard::spawn(input_tx.clone(), clipboard_sync);
         App {
             input_tx,
             pixels: HashMap::new(),
@@ -840,13 +848,9 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::ClipboardData { text } => {
                 if text.is_empty() {
                     logln!("[ui] clipboard: remote selection is empty");
-                } else if let Some(cb) = self.clipboard.as_mut() {
-                    match cb.set_text(text.clone()) {
-                        Ok(()) => {
-                            logln!("[ui] clipboard: copied {} bytes locally", text.len())
-                        }
-                        Err(e) => logln!("[ui] clipboard write failed: {e}"),
-                    }
+                } else {
+                    self.clipboard.apply(&text);
+                    logln!("[ui] clipboard: mirrored {} bytes locally", text.len());
                 }
             }
             UserEvent::Cursor {
@@ -1099,30 +1103,6 @@ impl ApplicationHandler<UserEvent> for App {
                         sym,
                         pressed: false,
                     }),
-                    KeyAction::ClipboardGet => {
-                        logln!("[ui] clipboard: requesting the remote selection");
-                        self.send(Message::ClipboardGet {
-                            target: xcom_proto::CLIPBOARD_CLIPBOARD,
-                        });
-                    }
-                    KeyAction::PushClipboard => {
-                        match self.clipboard.as_mut().map(|cb| cb.get_text()) {
-                            Some(Ok(text)) if !text.is_empty() => {
-                                let text = xcom_proto::truncate_clipboard(text);
-                                logln!(
-                                    "[ui] clipboard: pushing {} bytes to the remote",
-                                    text.len()
-                                );
-                                self.send(Message::ClipboardSet {
-                                    target: xcom_proto::CLIPBOARD_CLIPBOARD,
-                                    text,
-                                });
-                            }
-                            Some(Ok(_)) => logln!("[ui] clipboard: local clipboard is empty"),
-                            Some(Err(e)) => logln!("[ui] clipboard read failed: {e}"),
-                            None => logln!("[ui] clipboard: no local clipboard"),
-                        }
-                    }
                     KeyAction::ToggleHud => {
                         let on = self.metrics.toggle_hud();
                         logln!("[ui] HUD {}", if on { "on" } else { "off" });

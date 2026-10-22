@@ -140,7 +140,8 @@ fn clipboard_roundtrip() {
     };
     let display = server.display.clone();
 
-    let clipboard = Clipboard::spawn(&display).expect("clipboard worker");
+    let (push_tx, push_rx) = mpsc::channel();
+    let clipboard = Clipboard::spawn(&display, push_tx).expect("clipboard worker");
 
     // --- 1. external owner -> worker.get ---------------------------------
     let (stop_tx, stop_rx) = mpsc::channel::<()>();
@@ -166,6 +167,16 @@ fn clipboard_roundtrip() {
         }
     });
 
+    // The owner change is mirrored to the client without polling.
+    let pushed = push_rx.recv_timeout(Duration::from_secs(2));
+    match pushed {
+        Ok(xcom_proto::Message::ClipboardData { target, text }) => {
+            assert_eq!(target, 0);
+            assert_eq!(text, "hello from helper");
+        }
+        other => panic!("expected a mirrored ClipboardData, got {other:?}"),
+    }
+
     let got = clipboard.get(Target::Clipboard, Duration::from_secs(2));
     assert_eq!(got.as_deref(), Some("hello from helper"));
     let _ = stop_tx.send(());
@@ -180,4 +191,11 @@ fn clipboard_roundtrip() {
     let win = create_window(&conn, screen);
     let got = read_selection(&conn, win, &atoms, Duration::from_secs(2));
     assert_eq!(got.as_deref(), Some("from worker"));
+
+    // The worker became the owner itself: that must not be mirrored back
+    // (the owner-window guard).
+    assert!(
+        push_rx.recv_timeout(Duration::from_millis(300)).is_err(),
+        "our own selection change was mirrored back"
+    );
 }

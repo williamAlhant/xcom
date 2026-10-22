@@ -6,6 +6,7 @@
 //! pinned certificate fingerprint), after which all traffic flows over the
 //! dedicated TLS channel opened here.
 
+mod clipboard;
 mod hud;
 mod keys;
 mod metrics;
@@ -81,6 +82,10 @@ struct ConnectArgs {
     /// Show the metrics HUD (toggle in-session with Ctrl+Shift+M).
     #[arg(long)]
     hud: bool,
+    /// Do not mirror the clipboard. Mirroring means the remote can read your
+    /// local selection, so it can be switched off.
+    #[arg(long)]
+    no_clipboard_sync: bool,
     /// Test aid: type this text (Latin-1) after the session comes up.
     #[arg(long, allow_hyphen_values = true)]
     type_text: Option<String>,
@@ -332,6 +337,19 @@ fn main() -> Result<()> {
     // without any traffic from the server as a dead session, which is what
     // turns a sleep/wake or NAT-timeout half-open connection into a closed
     // window instead of a permanently frozen one.
+    // Seed the local clipboard from the remote's current selection; after this
+    // the daemon pushes changes and the watcher mirrors local ones.
+    if !args.no_clipboard_sync {
+        input_tx
+            .send((
+                Message::ClipboardGet {
+                    target: xcom_proto::CLIPBOARD_CLIPBOARD,
+                },
+                Instant::now(),
+            ))
+            .ok();
+    }
+
     if let Some(text) = args.type_text.clone() {
         let tx = input_tx.clone();
         let delay = args.type_delay;
@@ -416,11 +434,14 @@ fn main() -> Result<()> {
     let mut app = App::new(
         proxy,
         input_tx,
-        args.dump_ppm.clone(),
-        args.fullscreen,
-        args.debug_tools,
-        args.hud,
-        queue_us,
+        ui::AppOptions {
+            dump: args.dump_ppm.clone(),
+            fullscreen: args.fullscreen,
+            debug_tools: args.debug_tools,
+            hud: args.hud,
+            queue_us,
+            clipboard_sync: !args.no_clipboard_sync,
+        },
     );
     let result = event_loop.run_app(&mut app).context("event loop");
 
