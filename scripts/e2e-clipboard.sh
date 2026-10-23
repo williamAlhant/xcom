@@ -34,7 +34,7 @@ cargo build -q -p xcom-x11 --example x11_input
 podman cp "$X11I" xcom-testvm:/usr/local/bin/x11_input
 
 if ! DISPLAY=$DISP "$X11I" pointer >/dev/null 2>&1; then
-    XVFB=${XCOM_XVFB:-$(command -v Xvfb || echo $HOME/.local/xvfb/usr/bin/Xvfb)}
+    XVFB=${XCOM_XVFB:-$(command -v Xvfb || echo "$HOME/.local/xvfb/usr/bin/Xvfb")}
     "$XVFB" "$DISP" -screen 0 1920x1080x24 -nolisten tcp +extension XTEST \
         > "$OUT/xvfb.log" 2>&1 &
     XPID=$!

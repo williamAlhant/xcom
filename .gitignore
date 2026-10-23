@@ -1,3 +1,6 @@
 /target
 /target-static
 /dist
+*.swp
+*.kate-swp
+*~

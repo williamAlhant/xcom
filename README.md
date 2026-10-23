@@ -110,5 +110,3 @@ or on macOS.
 
 - `docs/m2.md` — window management, clipboard, cursor.
 - `docs/windows-client.md` — Windows build and Wine findings.
-- `docs/vm-smoke.md` — first run on a real cloud VM.
-- `docs/m0-report.md`, `docs/m1-review.md` — earlier milestones.

@@ -18,7 +18,7 @@ mkdir -p "$OUT"   # per-run: parallel runs must not share handshake files
 
 # Xvfb: PATH first, then the user-local install used on this dev box.
 if [ -z "${XCOM_XVFB:-}" ]; then
-    XCOM_XVFB=$(command -v Xvfb || echo $HOME/.local/xvfb/usr/bin/Xvfb)
+    XCOM_XVFB=$(command -v Xvfb || echo "$HOME/.local/xvfb/usr/bin/Xvfb")
 fi
 export XCOM_XVFB
 

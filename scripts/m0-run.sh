@@ -6,7 +6,8 @@
 # Uses the release build of xcomd against DISPLAY_NUM (default :9).
 set -u
 
-XCOMD=${XCOMD:-$HOME/code/xcom/target/release/xcomd}
+REPO=$(cd "$(dirname "$0")/.." && pwd)
+XCOMD=${XCOMD:-$REPO/target/release/xcomd}
 DISPLAY_NUM=${DISPLAY_NUM:-:9}
 MODE=${1:-box}
 DAMAGE=${2:-non-empty}
