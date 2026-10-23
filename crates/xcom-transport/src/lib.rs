@@ -310,11 +310,9 @@ impl Channel {
         let sock = socket2::SockRef::from(tcp);
         match idle {
             Some(d) => {
-                let mut ka = socket2::TcpKeepalive::new().with_time(d);
+                let ka = socket2::TcpKeepalive::new().with_time(d);
                 #[cfg(not(target_os = "windows"))]
-                {
-                    ka = ka.with_interval(Duration::from_secs(5));
-                }
+                let ka = ka.with_interval(Duration::from_secs(5));
                 sock.set_tcp_keepalive(&ka)?;
                 sock.set_keepalive(true)?;
             }
