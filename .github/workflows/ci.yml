@@ -30,6 +30,8 @@ jobs:
           toolchain: ${{ env.RUST_VERSION }}
           components: clippy
       - uses: Swatinem/rust-cache@v2
+      - name: ensure Xvfb (the clipboard integration test needs a display)
+        run: command -v Xvfb >/dev/null || (sudo apt-get update && sudo apt-get install -y xvfb)
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: tests

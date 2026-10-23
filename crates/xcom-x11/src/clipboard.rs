@@ -67,7 +67,10 @@ pub struct Clipboard {
 
 impl Clipboard {
     /// Start the worker on `display` (e.g. ":3"). Fails if the display cannot
-    /// be opened.
+    /// be opened or the worker cannot set itself up.
+    ///
+    /// Returns only once CLIPBOARD ownership changes are being watched, so a
+    /// selection created immediately afterwards is not missed.
     ///
     /// Selections changed by remote applications are pushed to `outbound` as
     /// `ClipboardData`, so the client can mirror them without polling.
@@ -77,8 +80,10 @@ impl Clipboard {
         let display = display.to_string();
         std::thread::spawn(move || match x11rb::connect(Some(&display)) {
             Ok((conn, screen)) => {
-                ready_tx.send(Ok(())).ok();
-                if let Err(e) = clipboard_loop(conn, screen, rx, outbound) {
+                // The readiness signal lives in clipboard_loop: returning before
+                // the XFixes subscription exists would let a selection change in
+                // the gap be missed (the daemon would silently stop mirroring).
+                if let Err(e) = clipboard_loop(conn, screen, rx, outbound, ready_tx) {
                     logln!("[clipboard] stopped: {e:#}");
                 }
             }
@@ -159,14 +164,17 @@ impl Atoms {
     }
 }
 
-fn clipboard_loop(
-    conn: x11rb::rust_connection::RustConnection,
+/// Intern the atoms, create the selection-owner window and subscribe to
+/// CLIPBOARD ownership changes.
+///
+/// A missing XFixes extension only disables mirroring (get/set still work), so
+/// it is logged rather than returned as an error.
+fn watch_setup(
+    conn: &x11rb::rust_connection::RustConnection,
     screen: usize,
-    rx: mpsc::Receiver<Cmd>,
-    outbound: mpsc::Sender<xcom_proto::Message>,
-) -> Result<()> {
+) -> Result<(Atoms, Window, bool)> {
     let root = conn.setup().roots[screen].root;
-    let atoms = Atoms::intern(&conn)?;
+    let atoms = Atoms::intern(conn)?;
     let win: Window = conn.generate_id()?;
     // Selection owner windows do not need to be mapped; it just has to exist.
     conn.create_window(
@@ -219,6 +227,27 @@ fn clipboard_loop(
         None => false,
     };
     conn.flush()?;
+    Ok((atoms, win, watching))
+}
+
+fn clipboard_loop(
+    conn: x11rb::rust_connection::RustConnection,
+    screen: usize,
+    rx: mpsc::Receiver<Cmd>,
+    outbound: mpsc::Sender<xcom_proto::Message>,
+    ready: mpsc::SyncSender<Result<(), String>>,
+) -> Result<()> {
+    let (atoms, win, watching) = match watch_setup(&conn, screen) {
+        Ok(setup) => setup,
+        Err(e) => {
+            ready.send(Err(format!("{e:#}"))).ok();
+            return Err(e);
+        }
+    };
+    // `select_selection_input(..).check()` is a server round trip, so the
+    // subscription is live by now: a selection change after this point cannot
+    // be missed.
+    ready.send(Ok(())).ok();
 
     let mut owned: HashMap<Atom, String> = HashMap::new();
     loop {

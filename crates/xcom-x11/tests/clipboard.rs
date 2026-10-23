@@ -135,6 +135,13 @@ fn read_selection(
 #[test]
 fn clipboard_roundtrip() {
     let Ok(server) = Xvfb::spawn(320, 240) else {
+        // Locally the test skips when Xvfb is not installed (set XCOM_XVFB when
+        // it lives outside PATH). CI must not skip silently: that would report
+        // a green clipboard test that never ran.
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "Xvfb is required in CI (install the xvfb package or set XCOM_XVFB)"
+        );
         eprintln!("skipping clipboard test: Xvfb not available");
         return;
     };
@@ -169,6 +176,17 @@ fn clipboard_roundtrip() {
 
     // The owner change is mirrored to the client without polling.
     let pushed = push_rx.recv_timeout(Duration::from_secs(2));
+    if pushed.is_err() {
+        // Distinguish "the event never arrived" from "the server died": the
+        // worker is subscribed by the time spawn returns, so show Xvfb's own
+        // log before failing.
+        match std::fs::read_to_string(&server.log) {
+            Ok(log) if !log.trim().is_empty() => {
+                eprintln!("Xvfb log ({}):\n{log}", server.log.display());
+            }
+            _ => eprintln!("Xvfb log ({}) is empty or unreadable", server.log.display()),
+        }
+    }
     match pushed {
         Ok(xcom_proto::Message::ClipboardData { target, text }) => {
             assert_eq!(target, 0);

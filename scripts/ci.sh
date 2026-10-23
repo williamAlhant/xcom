@@ -3,6 +3,9 @@
 # Windows client build; the e2e scripts stay here because they need an Xvfb
 # display and the test container.
 #
+# The clipboard integration test spawns its own Xvfb and skips itself when none
+# is on PATH; set XCOM_XVFB to point at one that is not.
+#
 #   scripts/ci.sh [e2e-seconds]
 #
 # Runs the same checks the review used, in the same order.
