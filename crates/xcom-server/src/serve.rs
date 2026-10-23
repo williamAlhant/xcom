@@ -960,18 +960,22 @@ fn serve_loop(
             last_stats = Instant::now();
         }
 
-        if last_report.elapsed() >= Duration::from_secs(5) && stats_frames > 0 {
-            logln!(
-                "[serve] frames={stats_frames} raw={:.0}MB comp={:.1}MB ratio={:.1}x",
-                stats_raw as f64 / 1e6,
-                stats_comp as f64 / 1e6,
-                if stats_comp > 0 {
-                    stats_raw as f64 / stats_comp as f64
-                } else {
-                    0.0
-                }
-            );
+        if last_report.elapsed() >= Duration::from_secs(5) {
             last_report = Instant::now();
+            // Periodic summary, debug only: the counters are cumulative since
+            // session start, so this is noise otherwise.
+            if xcom_proto::debug() && stats_frames > 0 {
+                logln!(
+                    "[serve] frames={stats_frames} raw={:.0}MB comp={:.1}MB ratio={:.1}x",
+                    stats_raw as f64 / 1e6,
+                    stats_comp as f64 / 1e6,
+                    if stats_comp > 0 {
+                        stats_raw as f64 / stats_comp as f64
+                    } else {
+                        0.0
+                    }
+                );
+            }
         }
     }
 }

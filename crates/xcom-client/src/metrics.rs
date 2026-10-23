@@ -166,7 +166,11 @@ impl Metrics {
         self.rebuild_hud();
         if now.duration_since(self.last_log) >= Duration::from_secs(5) {
             self.last_log = now;
-            logln!("[ui] metrics: {}", self.line());
+            // An idle session would print this every 5 s. The final report()
+            // still emits one line unconditionally (the e2e checks parse it).
+            if xcom_proto::debug() {
+                logln!("[ui] metrics: {}", self.line());
+            }
         }
     }
 
