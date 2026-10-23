@@ -7,6 +7,14 @@ with LZ4 and each remote window is rendered as a native window on the client,
 with input, resize and reflow. Requires the `xvfb` package on the server
 machine; everything else is a static binary.
 
+## AI assistance
+
+This project was developed with extensive use of AI coding assistants. A large
+share of the code, tests and documentation was generated with AI and then
+validated through the test suite and end-to-end runs against real X11 sessions.
+It has not been independently reviewed or security-audited; the limitations
+below are the ones known today.
+
 ## How it works
 
 - **SSH bootstrap** — the client runs `xcomd serve --json` over SSH and reads

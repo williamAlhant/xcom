@@ -33,6 +33,8 @@ so SmartScreen shows a warning the first time.
 
 ## Notes
 
+- This project was developed with extensive use of AI coding assistants; see
+  the README for details.
 - The client warns when the remote `xcomd` reports a different build id (or none
   at all, which means it predates build reporting). Replace the remote binary
   when it does: a stale daemon behaves like an old version, which is easy to
