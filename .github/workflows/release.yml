@@ -64,11 +64,6 @@ jobs:
         with:
           path: dist
           merge-multiple: true
-      - name: checksums
-        run: |
-          cd dist
-          sha256sum xcomd-linux-x86_64 xcom-linux-x86_64 xcom-windows-x86_64.exe > SHA256SUMS
-          cat SHA256SUMS
       - name: publish
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
