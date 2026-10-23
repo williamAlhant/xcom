@@ -45,6 +45,9 @@ pub struct AppOptions {
     pub hud: bool,
     pub queue_us: Arc<AtomicU32>,
     pub clipboard_sync: bool,
+    /// Largest local monitor, for the "session is smaller than this monitor"
+    /// note. `None` when it could not be queried.
+    pub monitor: Option<(u16, u16)>,
 }
 
 /// Events from the network threads to the UI thread.
@@ -64,6 +67,11 @@ pub enum UserEvent {
         id: u32,
         x: i16,
         y: i16,
+        w: u16,
+        h: u16,
+    },
+    /// Session display size (first control message). Windows are capped at it.
+    Display {
         w: u16,
         h: u16,
     },
@@ -249,6 +257,12 @@ pub struct App {
     /// saw a *press* for; Wayland reports modifiers held before (or while) the
     /// window got focus only through `ModifiersChanged`.
     mods: ModifiersState,
+    /// Session display size. The X pointer cannot leave the remote screen, so
+    /// a window larger than this would have a region that is visible but
+    /// unclickable; windows are capped at it.
+    screen: Option<(u16, u16)>,
+    /// Largest local monitor, for the startup note.
+    monitor: Option<(u16, u16)>,
 }
 
 /// Refuse absurd window sizes from the wire: the store is `w*h*4` bytes, and
@@ -266,6 +280,15 @@ const SIZE_TOLERANCE: u16 = 8;
 
 fn size_close(a: (u16, u16), b: (u16, u16)) -> bool {
     a.0.abs_diff(b.0) <= SIZE_TOLERANCE && a.1.abs_diff(b.1) <= SIZE_TOLERANCE
+}
+
+/// A window may not exceed the session display: the X pointer cannot leave the
+/// remote screen, so the excess would be visible but unclickable.
+fn cap_to_display(size: (u16, u16), display: Option<(u16, u16)>) -> (u16, u16) {
+    match display {
+        Some((dw, dh)) => (size.0.min(dw), size.1.min(dh)),
+        None => size,
+    }
 }
 
 /// (parent local position, parent local size, parent remote position).
@@ -339,6 +362,7 @@ impl App {
             hud,
             queue_us,
             clipboard_sync,
+            monitor,
         } = opts;
         let clipboard = crate::clipboard::spawn(input_tx.clone(), clipboard_sync);
         App {
@@ -362,6 +386,8 @@ impl App {
             dismiss_at: None,
             pointer_inside: false,
             mods: ModifiersState::empty(),
+            screen: None,
+            monitor,
         }
     }
 
@@ -558,6 +584,16 @@ impl App {
             return;
         };
         let window = Arc::new(window);
+        if let Some((sw, sh)) = self.screen {
+            window.set_max_inner_size(Some(PhysicalSize::new(sw as u32, sh as u32)));
+        }
+        // The remote display has no window manager, so nothing there gives the
+        // window keyboard focus: without this, XTEST keys go to the root (and
+        // a bare client X server never sends Focused(true)). Popups rely on
+        // the app's own grabs, so they are left alone.
+        if !override_redirect {
+            self.send(Message::Focus { window: id });
+        }
         if let Some(cursor) = &self.custom_cursor {
             window.set_cursor(cursor.clone());
         }
@@ -914,6 +950,25 @@ impl ApplicationHandler<UserEvent> for App {
                     let _ = att.window.request_inner_size(PhysicalSize::new(w, h));
                 }
             }
+            UserEvent::Display { w, h } => {
+                self.screen = Some((w, h));
+                logln!("[xcom] session display {w}x{h}");
+                if let Some((mw, mh)) = self.monitor {
+                    if w < mw || h < mh {
+                        logln!(
+                            "[xcom] note: the session display ({w}x{h}) is smaller than this \
+                             monitor ({mw}x{mh}); windows are capped at the session size. \
+                             Pass --spawn {mw}x{mh} to request a larger display."
+                        );
+                    }
+                }
+                // Normally the first message, before any window exists; apply
+                // to anything already open in case the order ever changes.
+                for att in self.attached.values() {
+                    att.window
+                        .set_max_inner_size(Some(PhysicalSize::new(w as u32, h as u32)));
+                }
+            }
             UserEvent::ConnectionLost => {
                 logln!("[ui] connection lost, closing {} window(s)", self.attached.len());
                 self.report();
@@ -962,20 +1017,27 @@ impl ApplicationHandler<UserEvent> for App {
                     logln!("[ui] resized {:?} (win {remote:#x})", size);
                 }
                 let mut reflow = None;
+                let local = (size.width as u16, size.height as u16);
+                let remote_size = cap_to_display(local, self.screen);
+                if remote_size != local && xcom_proto::debug() {
+                    logln!(
+                        "[ui] window {remote:#x} {local:?} exceeds the session display; capping to {remote_size:?}"
+                    );
+                }
                 if let Some(att) = self.attached.get_mut(&remote) {
-                    att.local = (size.width as u16, size.height as u16);
+                    att.local = local;
                     let _ = att.target.resize(
                         NonZeroU32::new(size.width.max(1)).unwrap(),
                         NonZeroU32::new(size.height.max(1)).unwrap(),
                     );
-                    if !size_close(att.local, att.remote) {
+                    if !size_close(remote_size, att.remote) {
                         // The user resized us: ask the app to reflow. Small
                         // deltas are WM/toolkit rounding, not user actions.
-                        att.remote = att.local;
+                        att.remote = remote_size;
                         reflow = Some(Message::Resize {
                             id: remote,
-                            w: att.local.0,
-                            h: att.local.1,
+                            w: remote_size.0,
+                            h: remote_size.1,
                         });
                     }
                 }
@@ -1348,6 +1410,16 @@ mod tests {
         assert!(!sane_size(800, 0));
         assert!(!sane_size(65535, 65535));
         assert!(!sane_size(8193, 100));
+    }
+
+    #[test]
+    fn display_cap_clamps_window_growth() {
+        // Interactive growth (maximize) stops at the session display.
+        assert_eq!(cap_to_display((1920, 1080), Some((1600, 1200))), (1600, 1080));
+        // A window that already fits is untouched.
+        assert_eq!(cap_to_display((800, 600), Some((1600, 1200))), (800, 600));
+        // No display information (old daemon): no cap.
+        assert_eq!(cap_to_display((1920, 1080), None), (1920, 1080));
     }
 
     #[test]

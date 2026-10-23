@@ -78,6 +78,9 @@ grep -vE '^\[serve\] (waiting|client)' "$OUT/client-ssh.log" | tail -12
 PASS=1
 grep -qE '[1-9][0-9]* frames blitted' "$OUT/client-ssh.log" || PASS=0
 grep -q 'window .* opened' "$OUT/client-ssh.log" || PASS=0
+# Display sizing: the client requests a size and the server reports the result.
+grep -qE '\[xcom\] requesting a [0-9]+x[0-9]+ session display' "$OUT/client-ssh.log" || PASS=0
+grep -qE '\[xcom\] session display [0-9]+x[0-9]+' "$OUT/client-ssh.log" || PASS=0
 
 if [ "${CHECK_BOX:-0}" = 1 ]; then
     python3 "$REPO/scripts/check-ppm.py" "$OUT/frame-ssh.ppm" box || PASS=0

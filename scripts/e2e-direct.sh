@@ -68,6 +68,8 @@ grep -q 'window .* opened' "$OUT/client.log" || PASS=0
 grep -E '\[ui\] metrics:' "$OUT/client.log" | tail -1
 grep -qE '\[ui\] metrics: .*srv-fps' "$OUT/client.log" || PASS=0
 grep -qE '\[ui\] metrics: .*rtt [0-9]+ms' "$OUT/client.log" || PASS=0
+# The server announces the display size the window cap depends on.
+grep -qE '\[xcom\] session display [0-9]+x[0-9]+' "$OUT/client.log" || PASS=0
 python3 "$REPO/scripts/check-ppm.py" "$OUT/frame.ppm" box || PASS=0
 # The overlay must be in the presented surface (screen readback), not the store.
 python3 "$REPO/scripts/check-ppm.py" "$OUT/frame.screen.ppm" hud || PASS=0

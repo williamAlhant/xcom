@@ -26,4 +26,8 @@ x11rb = { version = "0.13", features = ["xfixes"] }
 
 [target.'cfg(windows)'.dependencies]
 # GetClipboardSequenceNumber: change detection without touching the clipboard.
-windows-sys = { version = "0.61", features = ["Win32_System_DataExchange"] }
+# GetSystemMetrics: session display size from the monitor layout.
+windows-sys = { version = "0.61", features = [
+    "Win32_System_DataExchange",
+    "Win32_UI_WindowsAndMessaging",
+] }

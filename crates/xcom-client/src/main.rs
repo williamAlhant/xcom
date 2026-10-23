@@ -80,6 +80,11 @@ struct ConnectArgs {
     /// Command to launch in the remote session (e.g. "xterm").
     #[arg(long, allow_hyphen_values = true)]
     exec: Option<String>,
+    /// Session display size to request when bootstrapping over ssh, as WxH
+    /// (default: the largest monitor attached to this client). The session
+    /// cannot grow later, and windows are capped at it.
+    #[arg(long, value_parser = parse_spawn)]
+    spawn: Option<(u16, u16)>,
     /// Write the largest window's final frame to this PPM file (test aid).
     #[arg(long)]
     dump_ppm: Option<std::path::PathBuf>,
@@ -225,11 +230,94 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// Parse a `WxH` display size (clap value parser for `--spawn`).
+fn parse_spawn(s: &str) -> Result<(u16, u16), String> {
+    let (w, h) = s
+        .split_once('x')
+        .ok_or_else(|| format!("expected WxH, got {s:?}"))?;
+    let w: u16 = w.parse().map_err(|_| format!("bad width in {s:?}"))?;
+    let h: u16 = h.parse().map_err(|_| format!("bad height in {s:?}"))?;
+    if w == 0 || h == 0 {
+        return Err(format!("width and height must be non-zero, got {s:?}"));
+    }
+    Ok((w, h))
+}
+
+/// Build the event loop (with the X11 -> Wayland fallback used by `--backend`).
+fn create_event_loop(
+    backend: Backend,
+    saved_wayland: Option<std::ffi::OsString>,
+) -> Result<EventLoop<UserEvent>> {
+    match EventLoop::<UserEvent>::with_user_event().build() {
+        Ok(el) => Ok(el),
+        Err(e) => {
+            // We may have hidden a perfectly good Wayland session behind a
+            // stale DISPLAY; retry there before giving up.
+            if backend == Backend::X11 {
+                if let Some(wayland) = saved_wayland {
+                    logln!("[xcom] X11 backend unavailable ({e}); retrying on Wayland");
+                    std::env::set_var("WAYLAND_DISPLAY", wayland);
+                    EventLoop::<UserEvent>::with_user_event()
+                        .build()
+                        .context("creating the event loop (a display server is required for the client)")
+                } else {
+                    Err(e).context("creating the event loop (a display server is required for the client)")
+                }
+            } else {
+                Err(e).context("creating the event loop (a display server is required for the client)")
+            }
+        }
+    }
+}
+
+/// Size of the local desktop in physical pixels.
+///
+/// Queried from the OS rather than winit: monitors are only available from
+/// `ActiveEventLoop`, which is too late (the session is bootstrapped before the
+/// loop runs). `None` disables the size request, leaving the daemon default.
+#[cfg(target_os = "linux")]
+fn display_size() -> Option<(u16, u16)> {
+    use x11rb::connection::Connection as _;
+    // The X root window is the whole desktop (the union of monitors), and on
+    // Wayland this goes through XWayland when it is there.
+    let (conn, screen) = x11rb::connect(None).ok()?;
+    let root = &conn.setup().roots[screen];
+    Some((root.width_in_pixels, root.height_in_pixels))
+}
+
+#[cfg(target_os = "windows")]
+fn display_size() -> Option<(u16, u16)> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
+    };
+    // Physical pixels for a DPI-aware process: winit sets per-monitor v2 when
+    // the event loop is created (which runs before this).
+    let (w, h) = unsafe {
+        (
+            GetSystemMetrics(SM_CXVIRTUALSCREEN),
+            GetSystemMetrics(SM_CYVIRTUALSCREEN),
+        )
+    };
+    if w <= 0 || h <= 0 {
+        return None;
+    }
+    Some((
+        (w as u32).min(u16::MAX as u32) as u16,
+        (h as u32).min(u16::MAX as u32) as u16,
+    ))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+fn display_size() -> Option<(u16, u16)> {
+    None
+}
+
 /// Run `xcomd serve --json` over ssh and parse the handshake line.
 fn bootstrap_ssh(
     target: &str,
     ssh_args: Option<&str>,
     exec: Option<&str>,
+    spawn: Option<(u16, u16)>,
 ) -> Result<Handshake> {
     // Let XCOM_DEBUG follow the session so the daemon traces too.
     let dbg = if xcom_proto::debug() {
@@ -237,9 +325,16 @@ fn bootstrap_ssh(
     } else {
         ""
     };
-    let remote = match exec {
-        Some(cmd) => format!("{dbg}xcomd serve --json --exec {}", shell_quote(cmd)),
-        None => format!("{dbg}xcomd serve --json"),
+    let remote = {
+        let mut cmd = String::from("xcomd serve --json");
+        if let Some((w, h)) = spawn {
+            logln!("[xcom] requesting a {w}x{h} session display");
+            cmd.push_str(&format!(" --spawn {w}x{h}"));
+        }
+        if let Some(exec) = exec {
+            cmd.push_str(&format!(" --exec {}", shell_quote(exec)));
+        }
+        format!("{dbg}{cmd}")
     };
     let mut cmd = Command::new("ssh");
     cmd.arg("-o").arg("BatchMode=yes");
@@ -333,11 +428,24 @@ fn main() -> Result<()> {
     // environment.
     let (backend, saved_wayland) = apply_backend(args.backend)?;
 
+    // Monitors must be known before the bootstrap: the session display is
+    // sized from them and Xvfb cannot grow afterwards.
+    let event_loop = create_event_loop(backend, saved_wayland)?;
+    let monitor = display_size();
+
     let mut handshake = match (&args.ssh, &args.direct) {
-        (Some(target), _) => {
-            bootstrap_ssh(target, args.ssh_args.as_deref(), args.exec.as_deref())?
-        }
+        (Some(target), _) => bootstrap_ssh(
+            target,
+            args.ssh_args.as_deref(),
+            args.exec.as_deref(),
+            args.spawn.or(monitor),
+        )?,
         (None, Some(addr)) => {
+            if args.spawn.is_some() {
+                logln!(
+                    "[xcom] note: --spawn only applies to the ssh bootstrap; the direct daemon is already running"
+                );
+            }
             if args.token_control.is_some() || args.token_bulk.is_some() {
                 logln!(
                     "[xcom] warning: tokens on the command line are visible to local users (ps); use --ssh"
@@ -388,28 +496,6 @@ fn main() -> Result<()> {
     .context("bulk channel")?;
     logln!("[xcom] secure channel established");
 
-    let event_loop = match EventLoop::<UserEvent>::with_user_event().build() {
-        Ok(el) => el,
-        Err(e) => {
-            // We may have hidden a perfectly good Wayland session behind a
-            // stale DISPLAY; retry there before giving up.
-            if backend == Backend::X11 {
-                if let Some(wayland) = saved_wayland {
-                    logln!("[xcom] X11 backend unavailable ({e}); retrying on Wayland");
-                    std::env::set_var("WAYLAND_DISPLAY", wayland);
-                    EventLoop::<UserEvent>::with_user_event()
-                        .build()
-                        .context("creating the event loop (a display server is required for the client)")?
-                } else {
-                    return Err(e)
-                        .context("creating the event loop (a display server is required for the client)");
-                }
-            } else {
-                return Err(e)
-                    .context("creating the event loop (a display server is required for the client)");
-            }
-        }
-    };
     let proxy = event_loop.create_proxy();
     // Every message carries its enqueue time: the writer measures how long it
     // waited before reaching the socket (the HUD's queue_ms).
@@ -550,6 +636,7 @@ fn main() -> Result<()> {
             hud: args.hud,
             queue_us,
             clipboard_sync: !args.no_clipboard_sync,
+            monitor,
         },
     );
     let result = event_loop.run_app(&mut app).context("event loop");
@@ -651,6 +738,7 @@ fn control_reader_loop(
                     Message::WindowUnmapped { id } => Some(UserEvent::Unmap { id }),
                     Message::WindowMapped { id } => Some(UserEvent::Map { id }),
                     Message::WindowDestroy { id } => Some(UserEvent::Close { id }),
+                    Message::Display { w, h } => Some(UserEvent::Display { w, h }),
                     _ => None,
                 };
                 if let Some(ev) = event {
@@ -739,5 +827,19 @@ fn bulk_loop(mut bulk: Channel, proxy: winit::event_loop::EventLoopProxy<UserEve
             Ok(None) => return Ok(()),
             Err(e) => return Err(e.into()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_spawn;
+
+    #[test]
+    fn spawn_sizes_parse() {
+        assert_eq!(parse_spawn("1920x1080"), Ok((1920, 1080)));
+        assert!(parse_spawn("1920").is_err());
+        assert!(parse_spawn("1920x").is_err());
+        assert!(parse_spawn("0x1080").is_err());
+        assert!(parse_spawn("axb").is_err());
     }
 }

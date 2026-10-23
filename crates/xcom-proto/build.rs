@@ -7,6 +7,9 @@
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    // Commits and checkouts change the index without touching any source file;
+    // without this the advertised id stays at whatever the last build saw.
+    println!("cargo:rerun-if-changed=../../.git/index");
     println!("cargo:rerun-if-env-changed=XCOM_BUILD");
 
     let id = std::env::var("XCOM_BUILD")

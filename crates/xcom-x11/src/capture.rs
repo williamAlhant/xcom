@@ -232,6 +232,15 @@ impl CaptureSession {
         self.windows.contains_key(&win)
     }
 
+    /// Size of the X screen: the coordinate space and the pointer bounds.
+    ///
+    /// Windows are capped at this: the X pointer cannot leave the screen, so a
+    /// larger window has a region that can be seen but never clicked.
+    pub fn screen_size(&self) -> (u16, u16) {
+        let root = &self.conn.setup().roots[self.screen];
+        (root.width_in_pixels, root.height_in_pixels)
+    }
+
     pub fn windows(&self) -> impl Iterator<Item = Window> + '_ {
         self.windows.keys().copied()
     }

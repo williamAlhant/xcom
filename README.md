@@ -45,7 +45,10 @@ pinned `windows-2022` runner with a pinned Rust version.
 
 Useful flags: `--connect HOST:PORT` overrides the address to dial (NAT,
 containers); `--seconds N` exits after N seconds (0 = until the windows close);
-`xcomd serve --spawn 1600x1200` sets the virtual display size; `--hud` shows
+`--spawn WxH` requests the session display size (default: this machine's
+desktop; it cannot grow later, so windows are capped at it);
+`xcomd serve --spawn 1600x1200` sets the virtual display size directly; `--hud`
+shows
 the metrics overlay (fps, bandwidth, compression ratio, RTT, capture/encode
 time), toggled in-session with Ctrl+Shift+M; `--no-clipboard-sync` turns off
 clipboard mirroring; `--backend auto|x11|wayland` picks the Linux client
@@ -72,7 +75,12 @@ client bug.
 - **X11 capture only.** The server renders into Xvfb (or XWayland); apps that
   only speak Wayland are not captured.
 - **No scaling (deferred).** A remote window larger than the local work area is
-  shown oversized; resize the remote window to fit.
+  shown oversized; resize the remote window to fit. In the other direction,
+  windows are capped at the session display: the X pointer cannot leave that
+  screen, so a larger window would have a region that is visible but
+  unclickable. The client sizes the session from this machine's desktop when it
+  connects (`--spawn WxH` overrides it); a monitor attached afterwards needs a
+  new session to be fully usable.
 - **No persistent session.** The daemon and its Xvfb exit when the client
   disconnects; there is no reconnect or resume.
 - **SSH is bootstrap-only.** After authentication the client reaches the

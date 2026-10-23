@@ -129,6 +129,11 @@ What was checked:
   when the handshake's build id differs (or is absent);
 - `--backend` is Linux-only: on Windows the flag is ignored (it previously
   printed a misleading XWayland line when `DISPLAY` happened to be set).
+- **Display size**: an external monitor exposed a window that could be seen but
+  not clicked on its right side — a maximized window was wider than the
+  session's 1600x1200 virtual display, and the X pointer cannot leave the
+  screen. The client now requests a display sized to the local desktop and caps
+  windows at the session size (`docs/m2.md`).
 
 Still untested on Windows: display scaling above 100% (remote pixels map 1:1 to
 physical pixels, so text may look small), multi-monitor setups, and long

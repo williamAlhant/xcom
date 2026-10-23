@@ -169,6 +169,7 @@ pub fn run(args: ServeArgs) -> Result<()> {
     }
 
     let keymap = Keymap::query(session.connection().as_ref())?;
+    let (screen_w, screen_h) = session.screen_size();
 
     // --- identity, tokens, listener --------------------------------------
     let identity = Identity::generate()?;
@@ -230,8 +231,10 @@ pub fn run(args: ServeArgs) -> Result<()> {
         args.accept_timeout
     });
 
-    logln!("[serve] waiting for client on {addr} (display {display})");
-    let control = acceptor
+    logln!(
+        "[serve] waiting for client on {addr} (display {display}, {screen_w}x{screen_h})"
+    );
+    let mut control = acceptor
         .accept(Role::Control, timeout)
         .context("accepting control channel")?;
     let mut bulk = acceptor
@@ -240,6 +243,15 @@ pub fn run(args: ServeArgs) -> Result<()> {
     // Both roles are bound to their tokens; no further connections are needed.
     drop(acceptor);
     logln!("[serve] client connected");
+
+    // Announce the display first: the client caps windows at it. The X pointer
+    // cannot leave the screen, so a larger window would have a region that is
+    // visible but unclickable (XTEST clamps at the screen edge).
+    let display_msg = Message::Display {
+        w: screen_w,
+        h: screen_h,
+    };
+    control.send(display_msg.msg_type(), &display_msg.encode())?;
 
     let shutdown = Arc::new(AtomicBool::new(false));
 
@@ -278,6 +290,7 @@ pub fn run(args: ServeArgs) -> Result<()> {
             full_tx,
             shutdown_ctrl,
             geo_ctrl,
+            (screen_w, screen_h),
             clipboard,
         ) {
             logln!("[serve] control loop ended with error: {e:#}");
@@ -386,10 +399,13 @@ fn control_loop(
     full_requests: mpsc::Sender<Window>,
     shutdown: Arc<AtomicBool>,
     geo: GeometryMap,
+    screen: (u16, u16),
     clipboard: Option<Clipboard>,
 ) -> Result<()> {
     let _guard = ShutdownGuard(Arc::clone(&shutdown));
     let injector = Injector::new(&*conn, root, keymap);
+    // Windows already warned about, so a drag past the edge logs once.
+    let mut size_warned: std::collections::HashSet<Window> = std::collections::HashSet::new();
     let mut last_rx = Instant::now();
     loop {
         if shutdown.load(Ordering::SeqCst) {
@@ -480,6 +496,19 @@ fn control_loop(
                     }
                     if xcom_proto::debug() {
                         logln!("[serve] recv resize {id:#x} -> {w}x{h}");
+                    }
+                    // The screen is the pointer's universe: a window larger
+                    // than it has a region no click can reach. Clamp for old
+                    // clients; the current client caps itself.
+                    let (req_w, req_h) = (w, h);
+                    let (w, h) = (req_w.min(screen.0), req_h.min(screen.1));
+                    if (w, h) != (req_w, req_h) && size_warned.insert(id) {
+                        logln!(
+                            "[serve] resize {id:#x} {req_w}x{req_h} exceeds the display {}x{}; \
+                             clamped (pass --spawn to enlarge it)",
+                            screen.0,
+                            screen.1
+                        );
                     }
                     conn.configure_window(
                         id,
