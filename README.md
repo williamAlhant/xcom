@@ -5,7 +5,8 @@ handshake only, then the session runs over a dedicated TLS channel. The server
 owns a virtual Xvfb display plus a small window manager; damage is streamed
 with LZ4 and each remote window is rendered as a native window on the client,
 with input, resize and reflow. Requires the `xvfb` package on the server
-machine; everything else is a static binary.
+machine; the server ships as a static binary, while the client uses the
+desktop's own X11/Wayland libraries.
 
 ## AI assistance
 
@@ -31,8 +32,9 @@ below are the ones known today.
 
 ## Quick start
 
-Server side: install `xvfb`, put `xcomd` in `PATH`. Client side: a static
-`xcom` binary; it uses the system `ssh` for the bootstrap.
+Server side: install `xvfb`, put `xcomd` in `PATH`. Client side: the `xcom`
+binary (it loads the desktop's X11 or Wayland libraries at runtime) plus the
+system `ssh` for the bootstrap.
 
 ```sh
 # ssh mode: the client launches the daemon on the remote host
@@ -46,10 +48,11 @@ xcom connect --direct "$(jq -r .connect handshake.json)" \
     --fingerprint "$(jq -r .cert_sha256 handshake.json)"
 ```
 
-Prebuilt binaries (static Linux `xcomd`/`xcom`, Windows `xcom.exe`) are attached
-to GitHub releases. CI builds the Linux artifacts in the same Alpine Rust
-container as `scripts/build-static.sh` and the Windows client natively on a
-pinned `windows-2022` runner with a pinned Rust version.
+Prebuilt binaries (static Linux `xcomd`, glibc Linux `xcom`, Windows
+`xcom.exe`) are attached to GitHub releases. CI builds the static Linux server
+in the same Alpine Rust container as `scripts/build-static.sh`, the Linux
+client on a glibc runner, and the Windows client natively on a pinned
+`windows-2022` runner with a pinned Rust version.
 
 Useful flags: `--connect HOST:PORT` overrides the address to dial (NAT,
 containers); `--seconds N` exits after N seconds (0 = until the windows close);
@@ -65,11 +68,16 @@ backend (`auto` prefers X11/XWayland, see below; ignored on Windows).
 Builds:
 
 ```sh
-cargo build --release                 # dev binaries (target/release)
-scripts/build-static.sh xcomd xcom    # static musl       (dist/)
-scripts/build-static.sh --dev xcomd   # + M0 harness, for the test container
-scripts/build-windows.sh              # Windows client    (target/x86_64-pc-windows-msvc)
+cargo build --release                       # dev binaries (target/release)
+scripts/build-static.sh xcomd               # static musl server (dist/)
+cargo build --profile dist -p xcom-client   # glibc client (target/dist)
+scripts/build-static.sh --dev xcomd         # + M0 harness, for the test container
+scripts/build-windows.sh                    # Windows client    (target/x86_64-pc-windows-msvc)
 ```
+
+The client cannot be built fully static: winit and softbuffer load
+`libX11`/`libwayland` at runtime with `dlopen`, which static musl does not
+support.
 
 Tests: `cargo test --workspace`, plus `scripts/e2e-direct.sh`,
 `scripts/e2e-ssh.sh` and `scripts/e2e-clipboard.sh` (short end-to-end runs).

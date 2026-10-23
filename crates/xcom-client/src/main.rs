@@ -51,6 +51,12 @@ enum Backend {
     Wayland,
 }
 
+/// Internal marker set right before a failed X11 start re-execs this process on
+/// Wayland. winit allows a single event loop per process and does not clear its
+/// "already created" flag when initialization fails, so the retry must happen in
+/// a fresh process.
+const BACKEND_RESTART_ENV: &str = "XCOM_BACKEND_RESTART";
+
 #[derive(clap::Args)]
 struct ConnectArgs {
     /// ssh target (user@host): runs `xcomd serve --json` over ssh.
@@ -159,21 +165,33 @@ fn apply_backend(choice: Backend) -> Result<(Backend, Option<std::ffi::OsString>
         }
         return Ok((Backend::Auto, None));
     }
+    // A failed X11 start re-execs this process with this marker set; the parent
+    // already restored WAYLAND_DISPLAY. Consume it so a child of the child (or a
+    // later run in the same environment) is not affected. An explicit
+    // `--backend x11` is overridden: the whole point of the restart is Wayland.
+    let restarted = std::env::var_os(BACKEND_RESTART_ENV).is_some();
+    if restarted {
+        std::env::remove_var(BACKEND_RESTART_ENV);
+    }
     let wayland = std::env::var_os("WAYLAND_DISPLAY");
     let x11 = std::env::var_os("DISPLAY").is_some();
-    let chosen = match choice {
-        Backend::X11 => {
-            if !x11 {
-                bail!("--backend x11 needs DISPLAY (is XWayland running?)");
-            }
-            Backend::X11
-        }
-        Backend::Wayland => Backend::Wayland,
-        Backend::Auto => {
-            if x11 {
+    let chosen = if restarted {
+        Backend::Wayland
+    } else {
+        match choice {
+            Backend::X11 => {
+                if !x11 {
+                    bail!("--backend x11 needs DISPLAY (is XWayland running?)");
+                }
                 Backend::X11
-            } else {
-                Backend::Wayland
+            }
+            Backend::Wayland => Backend::Wayland,
+            Backend::Auto => {
+                if x11 {
+                    Backend::X11
+                } else {
+                    Backend::Wayland
+                }
             }
         }
     };
@@ -244,6 +262,11 @@ fn parse_spawn(s: &str) -> Result<(u16, u16), String> {
 }
 
 /// Build the event loop (with the X11 -> Wayland fallback used by `--backend`).
+///
+/// The fallback cannot rebuild the event loop in this process: winit allows one
+/// event loop per process and leaves its "already created" flag set even when
+/// initialization fails. Instead the process re-execs itself with Wayland
+/// forced, which is invisible because this runs before the session starts.
 fn create_event_loop(
     backend: Backend,
     saved_wayland: Option<std::ffi::OsString>,
@@ -256,18 +279,67 @@ fn create_event_loop(
             if backend == Backend::X11 {
                 if let Some(wayland) = saved_wayland {
                     logln!("[xcom] X11 backend unavailable ({e}); retrying on Wayland");
-                    std::env::set_var("WAYLAND_DISPLAY", wayland);
-                    EventLoop::<UserEvent>::with_user_event()
-                        .build()
-                        .context("creating the event loop (a display server is required for the client)")
-                } else {
-                    Err(e).context("creating the event loop (a display server is required for the client)")
+                    let restart = restart_on_wayland(wayland);
+                    return Err(e).with_context(|| {
+                        format!(
+                            "creating the event loop (a display server is required for the \
+                             client); restarting on Wayland also failed: {restart}{}",
+                            static_build_hint()
+                        )
+                    });
                 }
-            } else {
-                Err(e).context("creating the event loop (a display server is required for the client)")
             }
+            Err(e).with_context(|| {
+                format!(
+                    "creating the event loop (a display server is required for the client){}",
+                    static_build_hint()
+                )
+            })
         }
     }
+}
+
+/// Extra explanation for the one build that can never load a windowing library.
+fn static_build_hint() -> &'static str {
+    // winit and softbuffer load libX11/libwayland with dlopen. A fully static
+    // musl binary has no dynamic loader, so both backends are unusable.
+    if cfg!(all(
+        target_os = "linux",
+        target_env = "musl",
+        target_feature = "crt-static"
+    )) {
+        "; this xcom build is statically linked, and winit loads libX11/libwayland \
+         with dlopen, which static musl does not support: use the dynamically linked \
+         Linux client"
+    } else {
+        ""
+    }
+}
+
+/// Replace this process with an identical command forced onto Wayland.
+///
+/// Called before any threads, windows or ssh child exist, so `exec` is safe.
+/// Returns only if the restart failed (on success this function never returns).
+#[cfg(unix)]
+fn restart_on_wayland(wayland: std::ffi::OsString) -> std::io::Error {
+    use std::os::unix::process::CommandExt as _;
+
+    // Put back what apply_backend() hid and tell the new process to skip X11.
+    std::env::set_var("WAYLAND_DISPLAY", wayland);
+    std::env::set_var(BACKEND_RESTART_ENV, "wayland");
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(e) => return e,
+    };
+    Command::new(exe).args(std::env::args_os().skip(1)).exec()
+}
+
+#[cfg(not(unix))]
+fn restart_on_wayland(_wayland: std::ffi::OsString) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "restarting on Wayland is only supported on Unix",
+    )
 }
 
 /// Size of the local desktop in physical pixels.

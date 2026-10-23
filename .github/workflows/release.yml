@@ -12,8 +12,8 @@ env:
   RUST_VERSION: "1.95.0"
 
 jobs:
-  linux-static:
-    name: linux static (musl)
+  linux-server:
+    name: linux server (static musl)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -22,11 +22,37 @@ jobs:
       # The same pinned Alpine container as local builds; runners have docker,
       # not podman. Xvfb/app spawning is runtime-only, so no system packages.
       - name: build
-        run: CONTAINER=docker scripts/build-static.sh xcomd xcom
+        run: CONTAINER=docker scripts/build-static.sh xcomd
       - uses: actions/upload-artifact@v4
         with:
-          name: linux
+          name: linux-server
           path: dist/*
+          if-no-files-found: error
+
+  linux-client:
+    name: linux client (glibc)
+    # The client cannot be static: winit loads X11/Wayland with dlopen. Build on
+    # the oldest still-supported runner so the binary needs no newer glibc than
+    # 2.35; the desktop supplies libX11/libwayland/libxkbcommon.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # git describe -> the advertised build id
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - uses: Swatinem/rust-cache@v2
+      - name: build
+        run: cargo build --profile dist -p xcom-client
+      - name: stage the artifact
+        run: |
+          mkdir -p dist
+          cp target/dist/xcom dist/xcom-linux-x86_64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-client
+          path: dist/xcom-linux-x86_64
           if-no-files-found: error
 
   windows:
@@ -56,7 +82,7 @@ jobs:
 
   publish:
     name: publish
-    needs: [linux-static, windows]
+    needs: [linux-server, linux-client, windows]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4 # for .github/release-notes.md

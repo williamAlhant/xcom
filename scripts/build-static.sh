@@ -8,6 +8,11 @@
 #
 # Usage: scripts/build-static.sh [--dev] [bin ...]     (default: xcomd)
 #        CONTAINER=docker scripts/build-static.sh ...  (CI runners use docker)
+#
+# The client (xcom) cannot be built fully static: winit and softbuffer load
+# libX11/libwayland at runtime with dlopen, which a static musl binary has no
+# support for. Build it on a glibc host instead:
+#     cargo build --profile dist -p xcom-client
 # Output:
 #   default   dist/<bin>-linux-x86_64       shipping: no M0 spike harness
 #   --dev     dist/<bin>-dev-linux-x86_64   development: M0 harness enabled
@@ -28,6 +33,16 @@ if [ "${1:-}" = "--dev" ]; then
     shift
 fi
 BINS=${*:-xcomd}
+
+for b in $BINS; do
+    if [ "$b" = xcom ]; then
+        echo "error: the client cannot be built fully static." >&2
+        echo "winit loads libX11/libwayland with dlopen, which static musl does not" >&2
+        echo "support. Build it on a glibc host instead:" >&2
+        echo "    cargo build --profile dist -p xcom-client" >&2
+        exit 1
+    fi
+done
 
 FEATURES="--no-default-features"
 SUFFIX=""
