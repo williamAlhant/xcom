@@ -7,6 +7,7 @@
 # Alpine provides natively.
 #
 # Usage: scripts/build-static.sh [--dev] [bin ...]     (default: xcomd)
+#        CONTAINER=docker scripts/build-static.sh ...  (CI runners use docker)
 # Output:
 #   default   dist/<bin>-linux-x86_64       shipping: no M0 spike harness
 #   --dev     dist/<bin>-dev-linux-x86_64   development: M0 harness enabled
@@ -18,6 +19,8 @@ set -euo pipefail
 
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 IMAGE=${XCOM_BUILD_IMAGE:-docker.io/library/rust:alpine}
+# podman locally, docker on CI runners: same image, same named volumes.
+CONTAINER=${CONTAINER:-podman}
 
 DEV=0
 if [ "${1:-}" = "--dev" ]; then
@@ -40,13 +43,13 @@ for b in $BINS; do
     BIN_FLAGS="$BIN_FLAGS --bin $b"
 done
 
-podman run --rm \
+"$CONTAINER" run --rm \
     -v "$REPO":/src \
     -v xcom-cargo-registry:/usr/local/cargo/registry \
     -v xcom-cargo-target:/build/target \
     -w /src \
     -e CARGO_TARGET_DIR=/build/target \
-    -e XCOM_BUILD="${XCOM_BUILD:-$(git -C "$REPO" describe --always --dirty 2>/dev/null || echo unknown)}" \
+    -e XCOM_BUILD="${XCOM_BUILD:-$(git -C "$REPO" describe --always --dirty --tags 2>/dev/null || echo unknown)}" \
     -e CARGO_PROFILE_RELEASE_DEBUG=false \
     -e CARGO_PROFILE_RELEASE_STRIP=debuginfo \
     "$IMAGE" \

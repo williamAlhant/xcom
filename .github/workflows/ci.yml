@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+# Pinned so a runner image update cannot silently change what we build.
+# Keep in sync with release.yml.
+env:
+  RUST_VERSION: "1.95.0"
+
+jobs:
+  linux:
+    name: linux (clippy, tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # git describe -> the advertised build id
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: tests
+        run: cargo test --workspace --release
+
+  windows:
+    name: windows client (native)
+    runs-on: windows-2022
+    env:
+      # Static CRT: no vcruntime140/ucrt dependency, same as build-windows.sh.
+      # Native on a Windows runner, so no cargo-xwin / MS SDK download is needed.
+      RUSTFLAGS: "-C target-feature=+crt-static"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # git describe -> the advertised build id
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - uses: Swatinem/rust-cache@v2
+      - name: build the client
+        run: cargo build --release -p xcom-client
+      - name: smoke test
+        run: ./target/release/xcom.exe --version

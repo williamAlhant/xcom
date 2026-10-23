@@ -14,7 +14,9 @@ fn main() {
         .filter(|s| !s.trim().is_empty())
         .or_else(|| {
             let out = std::process::Command::new("git")
-                .args(["describe", "--always", "--dirty"])
+                // `--tags` so a lightweight release tag (git tag v1.2.3) is
+                // advertised instead of the bare commit hash.
+                .args(["describe", "--always", "--dirty", "--tags"])
                 .current_dir(env!("CARGO_MANIFEST_DIR"))
                 .output()
                 .ok()?;

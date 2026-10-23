@@ -38,6 +38,11 @@ xcom connect --direct "$(jq -r .connect handshake.json)" \
     --fingerprint "$(jq -r .cert_sha256 handshake.json)"
 ```
 
+Prebuilt binaries (static Linux `xcomd`/`xcom`, Windows `xcom.exe`) are attached
+to GitHub releases. CI builds the Linux artifacts in the same Alpine Rust
+container as `scripts/build-static.sh` and the Windows client natively on a
+pinned `windows-2022` runner with a pinned Rust version.
+
 Useful flags: `--connect HOST:PORT` overrides the address to dial (NAT,
 containers); `--seconds N` exits after N seconds (0 = until the windows close);
 `xcomd serve --spawn 1600x1200` sets the virtual display size; `--hud` shows

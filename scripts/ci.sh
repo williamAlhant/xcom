@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Local quality gate (there is no CI service configured for this repo yet).
+# Local quality gate. GitHub Actions runs clippy, the unit tests and the native
+# Windows client build; the e2e scripts stay here because they need an Xvfb
+# display and the test container.
 #
 #   scripts/ci.sh [e2e-seconds]
 #

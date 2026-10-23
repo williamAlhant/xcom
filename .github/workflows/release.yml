@@ -1,0 +1,85 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  # Keep in sync with ci.yml.
+  RUST_VERSION: "1.95.0"
+
+jobs:
+  linux-static:
+    name: linux static (musl)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # git describe -> the advertised build id
+      # The same pinned Alpine container as local builds; runners have docker,
+      # not podman. Xvfb/app spawning is runtime-only, so no system packages.
+      - name: build
+        run: CONTAINER=docker scripts/build-static.sh xcomd xcom
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: dist/*
+          if-no-files-found: error
+
+  windows:
+    name: windows client (native)
+    runs-on: windows-2022
+    env:
+      RUSTFLAGS: "-C target-feature=+crt-static"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - uses: Swatinem/rust-cache@v2
+      - name: build
+        run: cargo build --release -p xcom-client
+      - name: stage the artifact
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/release/xcom.exe dist/xcom-windows-x86_64.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/xcom-windows-x86_64.exe
+          if-no-files-found: error
+
+  publish:
+    name: publish
+    needs: [linux-static, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4 # for .github/release-notes.md
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: checksums
+        run: |
+          cd dist
+          sha256sum xcomd-linux-x86_64 xcom-linux-x86_64 xcom-windows-x86_64.exe > SHA256SUMS
+          cat SHA256SUMS
+      - name: publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="$GITHUB_REF_NAME"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            # Re-running a failed workflow must not fail on "already exists".
+            gh release upload "$tag" dist/* --clobber
+          else
+            gh release create "$tag" dist/* \
+              --title "xcom $tag" \
+              --notes-file .github/release-notes.md \
+              --verify-tag
+          fi
