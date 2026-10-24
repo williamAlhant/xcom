@@ -9,7 +9,7 @@ mod control;
 mod serve;
 
 #[derive(Parser)]
-#[command(name = "xcomd", about = "xcom session daemon", version)]
+#[command(name = "xcomd", about = "xcom session daemon", version = xcom_proto::BUILD)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,

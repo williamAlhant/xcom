@@ -29,7 +29,7 @@ use xcom_transport::Channel;
 use ui::{App, UserEvent};
 
 #[derive(Parser)]
-#[command(name = "xcom", about = "xcom client", version)]
+#[command(name = "xcom", about = "xcom client", version = xcom_proto::BUILD)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
