@@ -146,13 +146,53 @@ else
     fail "key 38 stayed down on the remote display"
 fi
 
-echo "--- kill ---"
-"$XCOM" kill --ssh xcom@127.0.0.1 --ssh-args "$SSH_ARGS" --session persist \
-    >/dev/null 2>&1 || true
+echo "--- last-window dialog: close the app ---"
+DISPLAY=$DISP "$XCOM" connect --ssh xcom@127.0.0.1 \
+    --ssh-args "$SSH_ARGS" --session persist --exec "$APP" \
+    > "$OUT/client5.log" 2>&1 &
+CPID=$!
+for _ in $(seq 1 100); do
+    grep -q 'window .* opened' "$OUT/client5.log" 2>/dev/null && break
+    sleep 0.1
+done
+DISPLAY=$DISP "$X11I" close persist-test || fail "close helper found no window"
+for _ in $(seq 1 60); do
+    grep -q 'close requested for the last window: asking' "$OUT/client5.log" 2>/dev/null && break
+    sleep 0.05
+done
+grep -q 'close requested for the last window: asking' "$OUT/client5.log" \
+    || fail "close request did not open the dialog"
+# Click "Close window" (the left button): mouse hit-testing is deterministic
+# and does not depend on the synthetic keyboard focus.
+WIN=$(DISPLAY=$DISP "$X11I" list | grep persist-test | head -1)
+GEOM=$(awk '{print $2}' <<< "$WIN")
+WX=${GEOM%%+*}
+REST=${GEOM#*+}
+WY=${REST%%+*}
+DISPLAY=$DISP "$X11I" clickat $((WX + 91)) $((WY + 199)) \
+    || fail "could not click the dialog button"
+for _ in $(seq 1 100); do
+    kill -0 "$CPID" 2>/dev/null || break
+    sleep 0.1
+done
+wait "$CPID" 2>/dev/null || true
+CPID=
+grep -q 'close dialog: closing the window' "$OUT/client5.log" \
+    || fail "dialog did not choose Close"
+grep -qE 'session ended' "$OUT/client5.log" \
+    || fail "client did not report the session ending"
+if grep -q 'reconnecting' "$OUT/client5.log"; then
+    fail "client tried to reconnect after deliberately ending the session"
+fi
+if grep -q 'session is gone' "$OUT/client5.log"; then
+    fail "client reported a gone session after the app was closed"
+fi
+
+echo "--- teardown ---"
 sleep 1
 LEFT=$($SSH "kill -0 $PID1 2>/dev/null && echo app || true; pgrep -x Xvfb || true; ps -eo args | grep '^xcomd session' || true" | tr -d '\r')
-[ -z "$LEFT" ] || fail "left behind: $LEFT"
-$SSH 'xcomd sessions' | grep -q 'no sessions' || fail "session still listed after kill"
+[ -z "$LEFT" ] || fail "left behind after closing the app: $LEFT"
+$SSH 'xcomd sessions' | grep -q 'no sessions' || fail "session still listed after the app closed"
 
 echo "--- client 1 ---"; tail -4 "$OUT/client1.log"
 echo "--- client 2 ---"; tail -4 "$OUT/client2.log"

@@ -108,6 +108,9 @@ pub enum UserEvent {
     ConnectionLost {
         reconnect: bool,
     },
+    /// The session is ending on the server (the app exited or it was killed).
+    /// Do not reconnect.
+    SessionEnded,
     /// A reconnect attempt is about to start (attempt numbers start at 1).
     Reconnecting {
         attempt: u32,
@@ -302,6 +305,11 @@ pub struct App {
     stale: Option<std::collections::HashSet<u32>>,
     /// Windows re-announced by the new link since the outage.
     confirmed: std::collections::HashSet<u32>,
+    /// The server said the session is ending; ignore later link events.
+    ended: bool,
+    /// The client asked the last window to close: a following link loss is the
+    /// session ending, not a network problem to report or retry.
+    closing_last: bool,
     /// Last local pointer position (physical surface pixels), for hit-testing
     /// the dialog (the remote cursor is clamped to the store and cannot be
     /// used for the letterboxed surface).
@@ -445,6 +453,8 @@ impl App {
             banner: None,
             stale: None,
             confirmed: std::collections::HashSet::new(),
+            ended: false,
+            closing_last: false,
         }
     }
 
@@ -846,6 +856,7 @@ impl App {
         match choice {
             CloseChoice::Close => {
                 logln!("[ui] close dialog: closing the window");
+                self.closing_last = true;
                 self.send(Message::WindowClose { id: window });
                 self.present(window);
             }
@@ -1105,6 +1116,16 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             UserEvent::ConnectionLost { reconnect } => {
+                if self.ended {
+                    return;
+                }
+                if reconnect && self.closing_last {
+                    logln!("[ui] session ended after closing the last window");
+                    self.ended = true;
+                    self.report();
+                    el.exit();
+                    return;
+                }
                 if reconnect {
                     logln!(
                         "[ui] connection lost, keeping {} window(s) for reattach",
@@ -1121,27 +1142,51 @@ impl ApplicationHandler<UserEvent> for App {
                     el.exit();
                 }
             }
+            UserEvent::SessionEnded => {
+                if self.ended {
+                    return;
+                }
+                self.ended = true;
+                logln!("[ui] session ended");
+                self.report();
+                el.exit();
+            }
             UserEvent::Reconnecting { attempt } => {
+                if self.ended {
+                    return;
+                }
                 self.banner =
                     Some(format!("connection lost — reconnecting (attempt {attempt})…"));
                 self.redraw_all();
             }
             UserEvent::Reconnected => {
+                if self.ended {
+                    return;
+                }
                 logln!("[ui] reconnected; waiting for the window resync");
                 self.banner = Some("reconnected — resyncing…".to_string());
                 self.redraw_all();
             }
             UserEvent::ReconnectFailed(error) => {
+                if self.ended {
+                    return;
+                }
                 logln!("[ui] reconnect failed: {error}");
                 self.banner = Some(format!("reconnect failed: {error}"));
                 self.redraw_all();
             }
             UserEvent::SessionGone(error) => {
+                if self.ended {
+                    return;
+                }
                 logln!("[ui] session is gone: {error}");
                 self.report();
                 el.exit();
             }
             UserEvent::SyncDone => {
+                if self.ended {
+                    return;
+                }
                 self.banner = None;
                 if let Some(stale) = self.stale.take() {
                     let gone: Vec<u32> = stale.difference(&self.confirmed).copied().collect();
@@ -1198,6 +1243,7 @@ impl ApplicationHandler<UserEvent> for App {
                     match self.close_action {
                         CloseAction::Close => {
                             logln!("[ui] close requested for win {remote:#x}");
+                            self.closing_last = true;
                             self.send(Message::WindowClose { id: remote });
                         }
                         CloseAction::Disconnect => {

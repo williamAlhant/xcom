@@ -419,6 +419,11 @@ fn serve_attachment(
     let (full_tx, full_rx) = mpsc::channel::<Window>();
     let conn_for_input = session.connection();
     let shutdown_ctrl = Arc::clone(&shutdown);
+    // Set when the *session* is ending (app exit or kill), as opposed to the
+    // client just leaving. The control thread uses it to send a final
+    // SessionEnded so the client does not try to reconnect.
+    let session_ended = Arc::new(AtomicBool::new(false));
+    let session_ended_ctrl = Arc::clone(&session_ended);
     let geo_ctrl = Arc::clone(geo);
     let clipboard_ctrl = clipboard.clone();
     let clipboard_rx_ctrl = Arc::clone(clipboard_rx);
@@ -434,6 +439,7 @@ fn serve_attachment(
             ctrl_send,
             full_tx,
             shutdown_ctrl,
+            session_ended_ctrl,
             geo_ctrl,
             (screen_w, screen_h),
             clipboard_ctrl,
@@ -506,6 +512,7 @@ fn serve_attachment(
         announced,
         app,
         session_end,
+        &session_ended,
         drop_at,
     );
 
@@ -673,6 +680,7 @@ fn control_loop(
     outbound_tx: mpsc::Sender<Message>,
     full_requests: mpsc::Sender<Window>,
     shutdown: Arc<AtomicBool>,
+    session_ended: Arc<AtomicBool>,
     geo: GeometryMap,
     screen: (u16, u16),
     clipboard: Option<Clipboard>,
@@ -693,6 +701,7 @@ fn control_loop(
         outbound_tx,
         full_requests,
         shutdown,
+        &session_ended,
         geo,
         screen,
         clipboard,
@@ -724,6 +733,7 @@ fn control_loop_inner(
     outbound_tx: mpsc::Sender<Message>,
     full_requests: mpsc::Sender<Window>,
     shutdown: Arc<AtomicBool>,
+    session_ended: &AtomicBool,
     geo: GeometryMap,
     screen: (u16, u16),
     clipboard: Option<Clipboard>,
@@ -735,6 +745,16 @@ fn control_loop_inner(
     let mut last_rx = Instant::now();
     loop {
         if shutdown.load(Ordering::SeqCst) {
+            // The session is ending on purpose (app exit or kill): tell the
+            // client before the sockets close, so it exits instead of
+            // reconnecting and reporting a "gone" session.
+            if session_ended.load(Ordering::SeqCst) {
+                let msg = Message::SessionEnded;
+                if control.send(msg.msg_type(), &msg.encode()).is_ok() {
+                    control.shutdown();
+                    logln!("[serve] sent session-ended to the client");
+                }
+            }
             return Ok(());
         }
         // Window events produced by the capture loop, then clipboard pushes
@@ -1055,6 +1075,7 @@ fn serve_loop(
     mut announced: std::collections::HashSet<Window>,
     app: &mut Option<Child>,
     session_end: &AtomicBool,
+    session_ended: &AtomicBool,
     drop_at: Option<Instant>,
 ) -> Result<AttachmentEnd> {
     // A window's first full frame can be captured before the app has painted
@@ -1083,7 +1104,17 @@ fn serve_loop(
     let mut last_stats = Instant::now();
 
     loop {
-        if shutdown.load(Ordering::SeqCst) || session_end.load(Ordering::SeqCst) {
+        if shutdown.load(Ordering::SeqCst) {
+            return Ok(AttachmentEnd::Detached);
+        }
+        if session_end.load(Ordering::SeqCst) {
+            // `xcomd kill`: the session is ending. Tell the client on the bulk
+            // channel *before* dropping it, so the session-ended notice is
+            // ordered ahead of the EOF that the reconnect supervisor sees.
+            session_ended.store(true, Ordering::SeqCst);
+            let msg = Message::SessionEnded;
+            let _ = bulk.send(msg.msg_type(), &msg.encode());
+            bulk.shutdown();
             return Ok(AttachmentEnd::Detached);
         }
         if drop_at.is_some_and(|at| Instant::now() >= at) {
@@ -1096,6 +1127,10 @@ fn serve_loop(
             match child.try_wait() {
                 Ok(Some(_)) => {
                     logln!("[serve] app exited; ending the session");
+                    session_ended.store(true, Ordering::SeqCst);
+                    let msg = Message::SessionEnded;
+                    let _ = bulk.send(msg.msg_type(), &msg.encode());
+                    bulk.shutdown();
                     shutdown.store(true, Ordering::SeqCst);
                     return Ok(AttachmentEnd::AppExited);
                 }

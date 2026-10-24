@@ -24,7 +24,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use winit::event_loop::EventLoop;
 
-use xcom_proto::{logln, Message, MSG_DAMAGE};
+use xcom_proto::{logln, Message, MSG_DAMAGE, MSG_SESSION_ENDED};
 use xcom_transport::Channel;
 use ui::{App, UserEvent};
 
@@ -1062,6 +1062,7 @@ pub(crate) fn control_reader_loop(
                     Message::WindowDestroy { id } => Some(UserEvent::Close { id }),
                     Message::Display { w, h } => Some(UserEvent::Display { w, h }),
                     Message::SyncDone => Some(UserEvent::SyncDone),
+                    Message::SessionEnded => Some(UserEvent::SessionEnded),
                     _ => None,
                 };
                 if let Some(ev) = event {
@@ -1152,6 +1153,12 @@ pub(crate) fn bulk_loop(
             Ok(Some((MSG_DAMAGE, payload))) => {
                 let frame = xcom_proto::DamageFrame::decode(&payload)?;
                 proxy.send_event(UserEvent::Frame(frame)).ok();
+            }
+            // The session is ending: deliver this before the EOF/down signal so
+            // the UI exits quietly instead of showing the reconnect banner.
+            Ok(Some((MSG_SESSION_ENDED, _))) => {
+                proxy.send_event(UserEvent::SessionEnded).ok();
+                return Ok(());
             }
             Ok(Some((ty, _))) => logln!("[xcom] bulk: unexpected msg type {ty}"),
             Ok(None) => return Ok(()),

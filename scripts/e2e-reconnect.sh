@@ -85,8 +85,11 @@ for _ in $(seq 1 100); do
     grep -q 'window .* opened' "$OUT/client-gone.log" 2>/dev/null && break
     sleep 0.1
 done
-"$XCOM" kill --ssh xcom@127.0.0.1 --ssh-args "$SSH_ARGS" --session default \
-    >/dev/null 2>&1 || true
+OWNER=$($SSH 'xcomd sessions' | awk '{print $5}' | tr -d '\r')
+[ -n "$OWNER" ] || fail "session owner pid missing"
+# SIGKILL sends no SessionEnded: the client must notice the crash, retry once
+# (attach-only) and classify the missing session as permanent.
+$SSH "kill -9 $OWNER" 2>/dev/null || fail "could not kill the owner"
 ALIVE=1
 for _ in $(seq 1 100); do
     if ! kill -0 "$CPID" 2>/dev/null; then
