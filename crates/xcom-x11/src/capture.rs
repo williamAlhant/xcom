@@ -560,6 +560,16 @@ impl CaptureSession {
         Ok(())
     }
 
+    /// Queue the current pointer image even if its serial has not changed.
+    ///
+    /// A reattaching client has no cursor state, but the serial check above
+    /// would suppress a resend until the pointer image changes. Called once per
+    /// attachment, before the capture loop starts forwarding events.
+    pub fn refresh_cursor(&mut self) -> Result<()> {
+        self.last_cursor_serial = u32::MAX;
+        self.read_cursor()
+    }
+
     /// Turn pending damage into one captured frame and queue it.
     fn capture_if_ready(&mut self, win: Window) -> Result<()> {
         let (t_event_ns, mut rects, need_fetch, w, h, mapped) = {

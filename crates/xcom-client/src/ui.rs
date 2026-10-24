@@ -36,6 +36,18 @@ use xcom_proto::logln;
 
 use crate::keys::{KeyAction, KeyState};
 use crate::metrics::{Metrics, ServerStats};
+use crate::hud::CloseChoice;
+
+/// What closing the last attached window should do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum CloseAction {
+    /// Ask with an in-window dialog (default).
+    Ask,
+    /// Close the remote window (the app quits and the session ends).
+    Close,
+    /// Detach and leave the session running.
+    Disconnect,
+}
 
 /// Startup options for the UI (kept separate to keep `App::new` readable).
 pub struct AppOptions {
@@ -45,6 +57,8 @@ pub struct AppOptions {
     pub hud: bool,
     pub queue_us: Arc<AtomicU32>,
     pub clipboard_sync: bool,
+    /// What a request to close the last window does (dialog by default).
+    pub close_action: CloseAction,
     /// Largest local monitor, for the "session is smaller than this monitor"
     /// note. `None` when it could not be queried.
     pub monitor: Option<(u16, u16)>,
@@ -263,6 +277,21 @@ pub struct App {
     screen: Option<(u16, u16)>,
     /// Largest local monitor, for the startup note.
     monitor: Option<(u16, u16)>,
+    /// What a close request on the last window does.
+    close_action: CloseAction,
+    /// Modal "close the last window?" dialog, when one is up.
+    dialog: Option<CloseDialog>,
+    /// Last local pointer position (physical surface pixels), for hit-testing
+    /// the dialog (the remote cursor is clamped to the store and cannot be
+    /// used for the letterboxed surface).
+    pointer: (f64, f64),
+}
+
+struct CloseDialog {
+    /// The window the dialog is drawn on (the last attached window).
+    window: u32,
+    focus: CloseChoice,
+    hover: Option<CloseChoice>,
 }
 
 /// Refuse absurd window sizes from the wire: the store is `w*h*4` bytes, and
@@ -362,6 +391,7 @@ impl App {
             hud,
             queue_us,
             clipboard_sync,
+            close_action,
             monitor,
         } = opts;
         let clipboard = crate::clipboard::spawn(input_tx.clone(), clipboard_sync);
@@ -388,6 +418,9 @@ impl App {
             mods: ModifiersState::empty(),
             screen: None,
             monitor,
+            close_action,
+            dialog: None,
+            pointer: (0.0, 0.0),
         }
     }
 
@@ -647,6 +680,11 @@ impl App {
     }
 
     fn present(&mut self, id: u32) {
+        let dialog = self
+            .dialog
+            .as_ref()
+            .filter(|d| d.window == id)
+            .map(|d| (d.focus, d.hover));
         let (Some(att), Some(pix)) = (self.attached.get_mut(&id), self.pixels.get(&id)) else {
             return;
         };
@@ -694,6 +732,9 @@ impl App {
         // it must not be mistaken for remote content.
         if self.metrics.hud_on() {
             crate::hud::draw(&mut buf, lw, lh, self.metrics.hud());
+        }
+        if let Some((focus, hover)) = dialog {
+            crate::hud::draw_close_dialog(&mut buf, lw, lh, focus, hover);
         }
         if let Err(e) = buf.present() {
             self.present_errors += 1;
@@ -748,6 +789,57 @@ impl App {
 
     fn remote_id(&self, id: WindowId) -> Option<u32> {
         self.by_winit.get(&id).copied()
+    }
+
+    /// Show the modal "close the last window?" dialog on `window`.
+    fn open_close_dialog(&mut self, window: u32) {
+        self.dialog = Some(CloseDialog {
+            window,
+            focus: CloseChoice::Disconnect,
+            hover: None,
+        });
+        self.present(window);
+    }
+
+    /// Activate the focused dialog button.
+    fn activate_close_dialog(&mut self, el: &ActiveEventLoop, window: u32) {
+        let Some(choice) = self.dialog.as_ref().map(|d| d.focus) else {
+            return;
+        };
+        self.dialog = None;
+        match choice {
+            CloseChoice::Close => {
+                logln!("[ui] close dialog: closing the window");
+                self.send(Message::WindowClose { id: window });
+                self.present(window);
+            }
+            CloseChoice::Disconnect => {
+                logln!("[ui] close dialog: disconnect (leaving the session running)");
+                self.report();
+                self.send(Message::Bye);
+                el.exit();
+            }
+            CloseChoice::Cancel => {
+                logln!("[ui] close dialog: cancelled");
+                self.present(window);
+            }
+        }
+    }
+
+    /// Dismiss the dialog without acting (Esc or a click outside the buttons).
+    fn cancel_close_dialog(&mut self, window: u32) {
+        if self.dialog.take().is_some() {
+            logln!("[ui] close dialog: cancelled");
+            self.present(window);
+        }
+    }
+
+    fn focus_close_dialog(&mut self, window: u32, forward: bool) {
+        if let Some(dialog) = self.dialog.as_mut() {
+            dialog.focus = crate::hud::close_choice_step(dialog.focus, forward);
+            dialog.hover = None;
+            self.present(window);
+        }
     }
 }
 
@@ -862,6 +954,9 @@ impl ApplicationHandler<UserEvent> for App {
                     att.window.set_visible(false);
                     att.visible = false;
                 }
+                if self.dialog.as_ref().is_some_and(|d| d.window == id) {
+                    self.dialog = None;
+                }
             }
             UserEvent::Map { id } => {
                 if let Some(att) = self.attached.get_mut(&id) {
@@ -879,6 +974,9 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Some(att) = self.attached.remove(&id) {
                     self.by_winit.remove(&att.window.id());
                     logln!("[ui] window {id:#x} closed");
+                }
+                if self.dialog.as_ref().is_some_and(|d| d.window == id) {
+                    self.dialog = None;
                 }
                 if self.ever_had_windows && self.attached.is_empty() {
                     // The last remote window is gone: the session has nothing
@@ -970,6 +1068,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             UserEvent::ConnectionLost => {
+                self.dialog = None;
                 logln!("[ui] connection lost, closing {} window(s)", self.attached.len());
                 self.report();
                 el.exit();
@@ -977,7 +1076,7 @@ impl ApplicationHandler<UserEvent> for App {
         }
     }
 
-    fn window_event(&mut self, _el: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+    fn window_event(&mut self, el: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
         // Modifier state is global and must be tracked even for events that
         // arrive before/without a mapped remote window.
         if let WindowEvent::ModifiersChanged(m) = &event {
@@ -1006,10 +1105,31 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::CloseRequested => {
-                // Close just this remote window (WM_DELETE_REQUEST); the
-                // session ends when the last one is destroyed.
-                logln!("[ui] close requested for win {remote:#x}");
-                self.send(Message::WindowClose { id: remote });
+                // Closing the last window is ambiguous now: close it (the app
+                // quits and the session ends) or disconnect and leave it
+                // running. Ask with an in-window dialog unless a test policy
+                // says otherwise.
+                if self.attached.len() > 1 {
+                    logln!("[ui] close requested for win {remote:#x}");
+                    self.send(Message::WindowClose { id: remote });
+                } else {
+                    match self.close_action {
+                        CloseAction::Close => {
+                            logln!("[ui] close requested for win {remote:#x}");
+                            self.send(Message::WindowClose { id: remote });
+                        }
+                        CloseAction::Disconnect => {
+                            logln!("[ui] close requested: disconnecting");
+                            self.report();
+                            self.send(Message::Bye);
+                            el.exit();
+                        }
+                        CloseAction::Ask => {
+                            logln!("[ui] close requested for the last window: asking");
+                            self.open_close_dialog(remote);
+                        }
+                    }
+                }
             }
             WindowEvent::RedrawRequested => self.present(remote),
             WindowEvent::Resized(size) => {
@@ -1047,6 +1167,32 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
+                self.pointer = (position.x, position.y);
+                if self.dialog.as_ref().is_some_and(|d| d.window == remote) {
+                    let local = self
+                        .attached
+                        .get(&remote)
+                        .map(|a| a.local)
+                        .unwrap_or((0, 0));
+                    let hover = crate::hud::close_dialog_hit(
+                        local.0 as usize,
+                        local.1 as usize,
+                        position.x,
+                        position.y,
+                    );
+                    let changed = self.dialog.as_mut().is_some_and(|d| {
+                        if d.hover == hover {
+                            false
+                        } else {
+                            d.hover = hover;
+                            true
+                        }
+                    });
+                    if changed {
+                        self.present(remote);
+                    }
+                    return;
+                }
                 // The presented image is 1:1 at (0,0); anything beyond the
                 // remote window is letterbox. Clamp, or a click in the band
                 // lands outside the app on the remote root.
@@ -1074,6 +1220,35 @@ impl ApplicationHandler<UserEvent> for App {
                 );
             }
             WindowEvent::MouseInput { state, button, .. } => {
+                if self.dialog.as_ref().is_some_and(|d| d.window == remote) {
+                    if state == ElementState::Pressed && button == MouseButton::Left {
+                        let local = self
+                            .attached
+                            .get(&remote)
+                            .map(|a| a.local)
+                            .unwrap_or((0, 0));
+                        let hit = crate::hud::close_dialog_hit(
+                            local.0 as usize,
+                            local.1 as usize,
+                            self.pointer.0,
+                            self.pointer.1,
+                        );
+                        match hit {
+                            Some(choice) => {
+                                if let Some(dialog) = self.dialog.as_mut() {
+                                    dialog.focus = choice;
+                                }
+                                self.activate_close_dialog(el, remote);
+                            }
+                            None => {
+                                // Click outside (or on the panel background)
+                                // cancels, like Esc.
+                                self.cancel_close_dialog(remote);
+                            }
+                        }
+                    }
+                    return;
+                }
                 let (x, y) = self
                     .attached
                     .get(&remote)
@@ -1094,6 +1269,9 @@ impl ApplicationHandler<UserEvent> for App {
                 );
             }
             WindowEvent::MouseWheel { delta, .. } => {
+                if self.dialog.as_ref().is_some_and(|d| d.window == remote) {
+                    return;
+                }
                 let dy = match delta {
                     MouseScrollDelta::LineDelta(_, y) => y,
                     MouseScrollDelta::PixelDelta(p) => p.y as f32,
@@ -1163,6 +1341,30 @@ impl ApplicationHandler<UserEvent> for App {
                 self.send(Message::Focus { window: remote });
             }
             WindowEvent::KeyboardInput { event, .. } => {
+                // The close dialog is modal: keys drive it locally and never
+                // reach the remote app.
+                if self.dialog.is_some() {
+                    if event.state == ElementState::Pressed && !event.repeat {
+                        use winit::keyboard::{Key, NamedKey};
+                        let window = self.dialog.as_ref().map(|d| d.window).unwrap_or(remote);
+                        match event.logical_key {
+                            Key::Named(NamedKey::Escape) => {
+                                self.cancel_close_dialog(window);
+                            }
+                            Key::Named(NamedKey::Enter) | Key::Named(NamedKey::Space) => {
+                                self.activate_close_dialog(el, window);
+                            }
+                            Key::Named(NamedKey::Tab) | Key::Named(NamedKey::ArrowRight) => {
+                                self.focus_close_dialog(window, true);
+                            }
+                            Key::Named(NamedKey::ArrowLeft) => {
+                                self.focus_close_dialog(window, false);
+                            }
+                            _ => {}
+                        }
+                    }
+                    return;
+                }
                 // Local test aid: dump the store exactly when the user sees the
                 // artifact (not forwarded to the remote app). Opt-in.
                 if self.debug_tools

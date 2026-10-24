@@ -245,9 +245,213 @@ pub fn draw(buf: &mut [u32], w: usize, h: usize, hud: &Hud) {
     }
 }
 
+/// Buttons of the last-window close dialog, in display order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CloseChoice {
+    /// Close the remote window; the app (and the session) ends.
+    Close,
+    /// Leave the app running and detach this client.
+    Disconnect,
+    /// Dismiss the dialog.
+    Cancel,
+}
+
+const CLOSE_CHOICES: [(CloseChoice, &str); 3] = [
+    (CloseChoice::Close, "Close window"),
+    (CloseChoice::Disconnect, "Disconnect"),
+    (CloseChoice::Cancel, "Cancel"),
+];
+
+#[derive(Clone, Copy)]
+struct Rect {
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+}
+
+impl Rect {
+    fn contains(&self, x: f64, y: f64) -> bool {
+        x >= self.x as f64
+            && y >= self.y as f64
+            && x < (self.x + self.w) as f64
+            && y < (self.y + self.h) as f64
+    }
+}
+
+/// Panel and button rectangles for a `w`x`h` surface. Kept in one place so
+/// drawing and hit-testing cannot drift apart.
+fn close_dialog_layout(w: usize, h: usize) -> (Rect, [(CloseChoice, Rect); 3]) {
+    let panel_w = w.saturating_sub(20).clamp(1, 460);
+    let panel_h = h.saturating_sub(20).min(132);
+    let panel = Rect {
+        x: (w - panel_w) / 2,
+        y: (h - panel_h) / 2,
+        w: panel_w,
+        h: panel_h,
+    };
+    let gap = 8usize;
+    let btn_w = (panel_w.saturating_sub(gap * 4) / 3).max(1);
+    let btn_h = 26.min(panel_h);
+    let by = panel.y + panel_h.saturating_sub(btn_h + 12);
+    let mut buttons = [(CloseChoice::Close, Rect { x: 0, y: 0, w: 0, h: 0 }); 3];
+    for (i, (choice, _)) in CLOSE_CHOICES.iter().enumerate() {
+        buttons[i] = (
+            *choice,
+            Rect {
+                x: panel.x + gap + i * (btn_w + gap),
+                y: by,
+                w: btn_w,
+                h: btn_h,
+            },
+        );
+    }
+    (panel, buttons)
+}
+
+fn fill_rect(buf: &mut [u32], w: usize, h: usize, r: Rect, color: u32, alpha: u32) {
+    for y in r.y..(r.y + r.h).min(h) {
+        for x in r.x..(r.x + r.w).min(w) {
+            let i = y * w + x;
+            buf[i] = mix(buf[i], color, alpha);
+        }
+    }
+}
+
+fn stroke_rect(buf: &mut [u32], w: usize, h: usize, r: Rect, color: u32) {
+    if r.w == 0 || r.h == 0 {
+        return;
+    }
+    fill_rect(buf, w, h, Rect { x: r.x, y: r.y, w: r.w, h: 1 }, color, 255);
+    if r.h > 1 {
+        fill_rect(
+            buf,
+            w,
+            h,
+            Rect { x: r.x, y: r.y + r.h - 1, w: r.w, h: 1 },
+            color,
+            255,
+        );
+    }
+    fill_rect(buf, w, h, Rect { x: r.x, y: r.y, w: 1, h: r.h }, color, 255);
+    if r.w > 1 {
+        fill_rect(
+            buf,
+            w,
+            h,
+            Rect { x: r.x + r.w - 1, y: r.y, w: 1, h: r.h },
+            color,
+            255,
+        );
+    }
+}
+
+/// Draw the "close the last window?" dialog over a presented surface.
+///
+/// `focus` is the button activated by Enter; `hover` highlights the button
+/// under the pointer. Colors carry opaque alpha for Wayland/Windows surfaces.
+pub fn draw_close_dialog(
+    buf: &mut [u32],
+    w: usize,
+    h: usize,
+    focus: CloseChoice,
+    hover: Option<CloseChoice>,
+) {
+    if w == 0 || h == 0 || buf.len() < w * h {
+        return;
+    }
+    let (panel, buttons) = close_dialog_layout(w, h);
+    fill_rect(buf, w, h, panel, 0x0000_0000, 236);
+    stroke_rect(buf, w, h, panel, 0x0080_8080);
+    text(
+        buf,
+        w,
+        h,
+        panel.x + 14,
+        panel.y + 12,
+        "Close the last window?",
+        FG,
+    );
+    text(
+        buf,
+        w,
+        h,
+        panel.x + 14,
+        panel.y + 30,
+        "The session ends when the app quits.",
+        DIM,
+    );
+    for (choice, rect) in buttons {
+        let (color, alpha) = if choice == focus {
+            (0x003a_6ea5, 255) // focused: blue
+        } else if hover == Some(choice) {
+            (0x0048_4848, 255)
+        } else {
+            (0x0024_2424, 255)
+        };
+        fill_rect(buf, w, h, rect, color, alpha);
+        stroke_rect(buf, w, h, rect, if choice == focus { FG } else { DIM });
+        let label = CLOSE_CHOICES
+            .iter()
+            .find(|(c, _)| *c == choice)
+            .map(|(_, l)| *l)
+            .unwrap_or("");
+        let tw = label.chars().count() * GLYPH_W;
+        let tx = rect.x + rect.w.saturating_sub(tw) / 2;
+        let ty = rect.y + rect.h.saturating_sub(8) / 2;
+        text(buf, w, h, tx, ty, label, FG);
+    }
+}
+
+/// Which dialog button (if any) is at surface position `(x, y)`.
+///
+/// `None` means "not a button" (outside the panel or on its background), which
+/// the caller treats as Cancel: click-outside dismisses the dialog.
+pub fn close_dialog_hit(w: usize, h: usize, x: f64, y: f64) -> Option<CloseChoice> {
+    let (panel, buttons) = close_dialog_layout(w, h);
+    if !panel.contains(x, y) {
+        return None;
+    }
+    buttons
+        .iter()
+        .find(|(_, rect)| rect.contains(x, y))
+        .map(|(choice, _)| *choice)
+}
+
+/// Next/previous button for Tab and the arrow keys.
+pub fn close_choice_step(current: CloseChoice, forward: bool) -> CloseChoice {
+    let idx = CLOSE_CHOICES
+        .iter()
+        .position(|(choice, _)| *choice == current)
+        .unwrap_or(1);
+    let n = CLOSE_CHOICES.len();
+    let next = if forward {
+        (idx + 1) % n
+    } else {
+        (idx + n - 1) % n
+    };
+    CLOSE_CHOICES[next].0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dialog_buttons_cycle_and_hit() {
+        assert_eq!(CloseChoice::Disconnect, close_choice_step(CloseChoice::Close, true));
+        assert_eq!(CloseChoice::Cancel, close_choice_step(CloseChoice::Disconnect, true));
+        assert_eq!(CloseChoice::Close, close_choice_step(CloseChoice::Cancel, true));
+        assert_eq!(CloseChoice::Cancel, close_choice_step(CloseChoice::Close, false));
+
+        let (panel, buttons) = close_dialog_layout(800, 600);
+        let (_, middle) = buttons[1];
+        let x = (middle.x + middle.w / 2) as f64;
+        let y = (middle.y + middle.h / 2) as f64;
+        assert_eq!(close_dialog_hit(800, 600, x, y), Some(CloseChoice::Disconnect));
+        assert_eq!(close_dialog_hit(800, 600, 1.0, 1.0), None);
+        assert!(panel.contains(x, y));
+    }
 
     #[test]
     fn font_covers_printable_ascii() {

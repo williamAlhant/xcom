@@ -227,6 +227,32 @@ fn main() -> Result<()> {
                 std::thread::sleep(std::time::Duration::from_millis(150));
             }
         }
+        "close" => {
+            // Test aid: ask a client window to close, like a WM close button
+            // (WM_DELETE_WINDOW). Runs on the display that shows the window.
+            let needle = args.next().context("close needs a title substring")?;
+            let win = find_window(&conn, root, &needle)?.context("no window matched")?;
+            let handled = xcom_x11::windows::request_close(&conn, win)?;
+            println!(
+                "close {win:#x}: {}",
+                if handled {
+                    "WM_DELETE_WINDOW"
+                } else {
+                    "destroyed"
+                }
+            );
+        }
+        "keystate" => {
+            // Test aid: is `keycode` currently down? Exit 1 when it is, so a
+            // script can assert that a detach released the user's keys.
+            let code: u8 = args.next().context("keystate needs a keycode")?.parse()?;
+            let reply = conn.query_keymap()?.reply()?;
+            let down = reply.keys[code as usize / 8] & (1 << (code % 8)) != 0;
+            println!("keycode {code}: {}", if down { "down" } else { "up" });
+            if down {
+                std::process::exit(1);
+            }
+        }
         "down" => {
             for code in args {
                 let code: u8 = code.parse().context("keycode must be 0..=255")?;

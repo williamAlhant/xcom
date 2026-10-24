@@ -384,6 +384,12 @@ fn serve_attachment(
         .context("accepting bulk channel")?;
     logln!("[serve] client connected");
 
+    // A new client has no cursor state: force the current image through even
+    // if its serial has not changed since the previous attachment.
+    if let Err(e) = session.refresh_cursor() {
+        logln!("[serve] cursor refresh failed: {e:#}");
+    }
+
     // Announce the display first: the client caps windows at it. The X pointer
     // cannot leave the screen, so a larger window would have a region that is
     // visible but unclickable (XTEST clamps at the screen edge).

@@ -129,6 +129,11 @@ struct ConnectArgs {
     /// per-window placement and clipboard mirroring depend on it.
     #[arg(long, value_enum, default_value = "auto")]
     backend: Backend,
+    /// What closing the last window does: `ask` shows an in-window dialog,
+    /// `close` closes it (the session ends), `disconnect` leaves the session
+    /// running. Scripts and tests use `close`/`disconnect`.
+    #[arg(long, value_enum, default_value = "ask")]
+    close_action: ui::CloseAction,
     /// Test aid: type this text (Latin-1) after the session comes up.
     #[arg(long, allow_hyphen_values = true)]
     type_text: Option<String>,
@@ -807,6 +812,7 @@ fn connect(args: ConnectArgs) -> Result<()> {
             hud: args.hud,
             queue_us,
             clipboard_sync: !args.no_clipboard_sync,
+            close_action: args.close_action,
             monitor,
         },
     );
