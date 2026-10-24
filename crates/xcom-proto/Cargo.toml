@@ -5,5 +5,11 @@ edition.workspace = true
 license.workspace = true
 description = "Wire protocol for the xcom channel"
 
+[dependencies]
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }

@@ -308,23 +308,22 @@ impl Owner {
 
         // The single handshake line: everything the client needs to authenticate
         // us (fingerprint) and itself (one token per role), plus where to dial.
-        let session_id = self.session_id;
-        let line = format!(
-            "{{\"ok\":true,\"proto\":{},\"build\":\"{}\",\"session\":\"{session_id:016x}\",\
-             \"session_name\":\"{}\",\"created\":{},\"attached\":true,\
-             \"display\":\"{}\",\"app\":\"{}\",\"connect\":\"{addr}\",\
-             \"token_control\":\"{}\",\"token_bulk\":\"{}\",\
-             \"cert_sha256\":\"{}\"}}",
-            xcom_proto::PROTO_VERSION,
-            xcom_proto::BUILD,
-            self.name,
-            self.created,
-            self.display,
-            crate::control::json_escape(&self.app_cmd),
-            xcom_transport::hex(&control_token),
-            xcom_transport::hex(&bulk_token),
-            identity.fingerprint(),
-        );
+        let handshake = xcom_proto::Handshake {
+            ok: true,
+            proto: xcom_proto::PROTO_VERSION,
+            build: Some(xcom_proto::BUILD.to_string()),
+            session: format!("{:016x}", self.session_id),
+            session_name: self.name.clone(),
+            created: self.created,
+            attached: true,
+            display: self.display.clone(),
+            app: self.app_cmd.clone(),
+            connect: addr.clone(),
+            token_control: xcom_transport::hex(&control_token),
+            token_bulk: xcom_transport::hex(&bulk_token),
+            cert_sha256: identity.fingerprint().to_string(),
+        };
+        let line = serde_json::to_string(&handshake).context("encoding the handshake")?;
         Ok(Attachment {
             acceptor,
             line,

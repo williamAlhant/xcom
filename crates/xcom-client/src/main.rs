@@ -183,20 +183,14 @@ struct KillArgs {
     session: String,
 }
 
-struct Handshake {
+/// The local side of the ssh bootstrap: the handshake has already been parsed
+/// into the values the client needs.
+struct Bootstrap {
     addr: String,
     control_token: [u8; 32],
     bulk_token: [u8; 32],
     fingerprint: String,
     ssh: Option<Child>,
-}
-
-fn json_field(line: &str, key: &str) -> Option<String> {
-    let pat = format!("\"{key}\":\"");
-    let start = line.find(&pat)? + pat.len();
-    let rest = &line[start..];
-    let end = rest.find('"')?;
-    Some(rest[..end].to_string())
 }
 
 /// Choose the windowing backend and apply it to the environment.
@@ -265,18 +259,6 @@ fn apply_backend(choice: Backend) -> Result<(Backend, Option<std::ffi::OsString>
         );
     }
     Ok((chosen, saved))
-}
-
-/// Numeric JSON field (`"proto":6`), unlike `json_field` which expects a
-/// quoted string value.
-fn json_number(line: &str, key: &str) -> Option<u64> {
-    let pat = format!("\"{key}\":");
-    let start = line.find(&pat)? + pat.len();
-    let rest = &line[start..];
-    let end = rest
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(rest.len());
-    rest[..end].parse().ok()
 }
 
 fn token32(bytes: Vec<u8>) -> Result<[u8; 32]> {
@@ -448,7 +430,7 @@ fn bootstrap_ssh(
     session: &str,
     replace: bool,
     idle_timeout: u64,
-) -> Result<Handshake> {
+) -> Result<Bootstrap> {
     // Let XCOM_DEBUG follow the session so the daemon traces too.
     let dbg = if xcom_proto::debug() {
         "XCOM_DEBUG=1 "
@@ -520,19 +502,24 @@ fn bootstrap_ssh(
                 }
             };
             if line.starts_with('{') {
-                let addr = json_field(&line, "connect").context("handshake line: connect")?;
-                let control = hex_decode(
-                    &json_field(&line, "token_control")
-                        .context("handshake line: token_control")?,
-                )?;
-                let bulk = hex_decode(
-                    &json_field(&line, "token_bulk").context("handshake line: token_bulk")?,
-                )?;
-                let fingerprint =
-                    json_field(&line, "cert_sha256").context("handshake line: cert_sha256")?;
+                let hs: xcom_proto::Handshake = serde_json::from_str(&line)
+                    .with_context(|| format!("handshake line: {line}"))?;
+                if !hs.ok {
+                    bail!("the daemon reported a failed handshake");
+                }
+                // A version mismatch means the remote binary is from a
+                // different build: say so plainly instead of failing later on an
+                // unknown message type.
+                if hs.proto != xcom_proto::PROTO_VERSION {
+                    bail!(
+                        "remote speaks protocol {}, this client speaks {} (update the other side)",
+                        hs.proto,
+                        xcom_proto::PROTO_VERSION
+                    );
+                }
                 // A daemon from another revision can look like a bug (e.g. a
                 // missing feature that exists in this client).
-                match json_field(&line, "build") {
+                match hs.build.as_deref() {
                     Some(remote) if remote != xcom_proto::BUILD => logln!(
                         "[xcom] warning: remote xcomd build {remote} differs from this client \
                          ({}); update the remote binary",
@@ -544,30 +531,16 @@ fn bootstrap_ssh(
                          update it if something misbehaves"
                     ),
                 }
-                // The JSON is informational, but a version mismatch here means
-                // the remote binary is from a different build: say so plainly
-                // instead of failing later on an unknown message type. (The TLS
-                // hello checks it too; this is the friendlier early error.)
-                match json_number(&line, "proto") {
-                    Some(p) if p == xcom_proto::PROTO_VERSION as u64 => {}
-                    Some(p) => bail!(
-                        "remote speaks protocol {p}, this client speaks {} (update the other side)",
-                        xcom_proto::PROTO_VERSION
-                    ),
-                    None => bail!("handshake line: missing proto"),
-                }
                 // Reattaching does not relaunch the app, so say which one is
                 // running: a stale session is the surprising case.
-                if let Some(app) = json_field(&line, "app") {
-                    if !app.is_empty() {
-                        logln!("[xcom] session app: {app}");
-                    }
+                if !hs.app.is_empty() {
+                    logln!("[xcom] session app: {}", hs.app);
                 }
                 return Ok((
-                    addr,
-                    token32(control)?,
-                    token32(bulk)?,
-                    fingerprint,
+                    hs.connect,
+                    token32(hex_decode(&hs.token_control)?)?,
+                    token32(hex_decode(&hs.token_bulk)?)?,
+                    hs.cert_sha256,
                 ));
             }
             // Anything else is daemon log output; show it and keep the last
@@ -578,7 +551,7 @@ fn bootstrap_ssh(
     })();
 
     match parsed {
-        Ok((addr, control_token, bulk_token, fingerprint)) => Ok(Handshake {
+        Ok((addr, control_token, bulk_token, fingerprint)) => Ok(Bootstrap {
             addr,
             control_token,
             bulk_token,
@@ -600,8 +573,8 @@ fn bootstrap_direct(
     control: &str,
     bulk: &str,
     fingerprint: &str,
-) -> Result<Handshake> {
-    Ok(Handshake {
+) -> Result<Bootstrap> {
+    Ok(Bootstrap {
         addr: addr.to_string(),
         control_token: token32(hex_decode(control)?)?,
         bulk_token: token32(hex_decode(bulk)?)?,

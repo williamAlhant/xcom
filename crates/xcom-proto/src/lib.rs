@@ -13,6 +13,46 @@
 
 pub const PROTO_VERSION: u16 = 9;
 
+use serde::{Deserialize, Serialize};
+
+/// One flat JSON object: the ssh bootstrap handshake printed by
+/// `xcomd serve --json` / `xcomd attach --json` and parsed by the client.
+///
+/// This is the only structured JSON shared with the shell-facing side; the
+/// binary channel protocol stays hand-rolled (see the module docs).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Handshake {
+    /// Always true on success; defaults to true so a partial/older handshake
+    /// still reaches the protocol-version check.
+    #[serde(default = "default_true")]
+    pub ok: bool,
+    pub proto: u16,
+    /// `Option` so a daemon from before build ids still parses (with a warning).
+    #[serde(default)]
+    pub build: Option<String>,
+    /// Random per-session id (hex), distinct from the user-facing name.
+    #[serde(default)]
+    pub session: String,
+    #[serde(default)]
+    pub session_name: String,
+    #[serde(default)]
+    pub created: u64,
+    #[serde(default)]
+    pub attached: bool,
+    #[serde(default)]
+    pub display: String,
+    #[serde(default)]
+    pub app: String,
+    pub connect: String,
+    pub token_control: String,
+    pub token_bulk: String,
+    pub cert_sha256: String,
+}
+
+fn default_true() -> bool {
+    true
+}
+
 /// Build identifier (`git describe --always --dirty --tags`, or the crate
 /// version when git is unavailable). Advertised in the handshake so a stale
 /// daemon is noticed instead of silently behaving like an old version.
@@ -1154,5 +1194,30 @@ mod tests {
         let mut bytes = f.encode();
         bytes.push(0);
         assert!(DamageFrame::decode(&bytes).is_err());
+    }
+
+    #[test]
+    fn handshake_json_round_trips_awkward_app() {
+        let hs = Handshake {
+            ok: true,
+            proto: PROTO_VERSION,
+            build: Some("build".into()),
+            session: "0123456789abcdef".into(),
+            session_name: "default".into(),
+            created: 1,
+            attached: true,
+            display: ":2".into(),
+            // Quotes, a backslash and a newline used to truncate the
+            // hand-rolled reader.
+            app: "echo \"hi\" \\\n é".into(),
+            connect: "127.0.0.1:1234".into(),
+            token_control: "00".repeat(32),
+            token_bulk: "11".repeat(32),
+            cert_sha256: "22".repeat(32),
+        };
+        let line = serde_json::to_string(&hs).unwrap();
+        let back: Handshake = serde_json::from_str(&line).unwrap();
+        assert_eq!(back, hs);
+        assert!(line.contains("\\\"hi\\\""));
     }
 }

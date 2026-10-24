@@ -21,6 +21,7 @@ use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
+use serde::{Deserialize, Serialize};
 use xcom_proto::logln;
 
 pub const DEFAULT_SESSION: &str = "default";
@@ -79,19 +80,53 @@ pub struct Info {
 }
 
 impl Info {
-    fn line(&self, attached: bool) -> String {
-        format!(
-            "{{\"ok\":true,\"name\":\"{}\",\"display\":\"{}\",\"app\":\"{}\",\"pid\":{},\
-             \"created\":{},\"idle_timeout\":{},\"attached\":{}}}",
-            json_escape(&self.name),
-            json_escape(&self.display),
-            json_escape(&self.app),
-            self.pid,
-            self.created,
-            self.idle_timeout,
-            attached
-        )
+    fn session(&self, attached: bool) -> SessionInfo {
+        SessionInfo {
+            ok: true,
+            name: self.name.clone(),
+            display: self.display.clone(),
+            app: self.app.clone(),
+            pid: self.pid,
+            created: self.created,
+            idle_timeout: self.idle_timeout,
+            attached,
+        }
     }
+}
+
+/// Wire form of the `info` reply.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionInfo {
+    pub ok: bool,
+    pub name: String,
+    pub display: String,
+    pub app: String,
+    pub pid: u32,
+    pub created: u64,
+    pub idle_timeout: u64,
+    pub attached: bool,
+}
+
+/// One request line on the session socket.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "cmd", rename_all = "lowercase")]
+enum Request {
+    Attach {
+        /// The ssh client's IP, forwarded by `attach`; absent for a local
+        /// bootstrap.
+        #[serde(default)]
+        peer: Option<String>,
+    },
+    Info,
+    Kill,
+}
+
+/// Shared reply for `kill` and error responses.
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct Reply {
+    ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
 }
 
 /// An attach request handed from the socket thread to the owner loop.
@@ -200,22 +235,26 @@ fn handle(
     if reader.read_line(&mut line).is_err() {
         return;
     }
-    match field(&line, "cmd").as_deref() {
-        Some("attach") => {
+    let request: Request = match serde_json::from_str(line.trim_end()) {
+        Ok(request) => request,
+        Err(e) => {
+            reply_error(&mut stream, &format!("bad request: {e}"));
+            return;
+        }
+    };
+    match request {
+        Request::Attach { peer } => {
+            let peer = peer.and_then(|peer| peer.parse().ok());
             // Reserve the slot before handing the request to the owner loop, so
             // two bootstraps cannot both think they got it.
             if attached.swap(true, Ordering::SeqCst) {
-                reply(&mut stream, "{\"ok\":false,\"error\":\"session busy\"}");
+                reply_error(&mut stream, "session busy");
                 return;
             }
-            let peer = field(&line, "peer").and_then(|p| p.parse().ok());
             let (tx, rx) = mpsc::sync_channel(1);
             if commands.send(Command::Attach { peer, reply: tx }).is_err() {
                 attached.store(false, Ordering::SeqCst);
-                reply(
-                    &mut stream,
-                    "{\"ok\":false,\"error\":\"session is shutting down\"}",
-                );
+                reply_error(&mut stream, "session is shutting down");
                 return;
             }
             match rx.recv_timeout(Duration::from_secs(20)) {
@@ -225,38 +264,42 @@ fn handle(
                 }
                 Ok(Err(e)) => {
                     attached.store(false, Ordering::SeqCst);
-                    reply(
-                        &mut stream,
-                        &format!(
-                            "{{\"ok\":false,\"error\":\"{}\"}}",
-                            json_escape(&e)
-                        ),
-                    );
+                    reply_error(&mut stream, &e);
                 }
                 Err(_) => {
                     attached.store(false, Ordering::SeqCst);
-                    reply(
-                        &mut stream,
-                        "{\"ok\":false,\"error\":\"attach timed out\"}",
-                    );
+                    reply_error(&mut stream, "attach timed out");
                 }
             }
         }
-        Some("info") => {
-            let _ = writeln!(stream, "{}", info.line(attached.load(Ordering::SeqCst)));
+        Request::Info => {
+            let info = info.session(attached.load(Ordering::SeqCst));
+            match serde_json::to_string(&info) {
+                Ok(line) => reply(&mut stream, &line),
+                Err(e) => logln!("[control] encoding info: {e}"),
+            }
         }
-        Some("kill") => {
+        Request::Kill => {
             kill.store(true, Ordering::SeqCst);
-            reply(&mut stream, "{\"ok\":true}");
+            match serde_json::to_string(&Reply {
+                ok: true,
+                error: None,
+            }) {
+                Ok(line) => reply(&mut stream, &line),
+                Err(e) => logln!("[control] encoding kill reply: {e}"),
+            }
         }
-        Some(other) => reply(
-            &mut stream,
-            &format!(
-                "{{\"ok\":false,\"error\":\"unknown command {}\"}}",
-                json_escape(other)
-            ),
-        ),
-        None => reply(&mut stream, "{\"ok\":false,\"error\":\"bad request\"}"),
+    }
+}
+
+fn reply_error(stream: &mut UnixStream, message: &str) {
+    let response = Reply {
+        ok: false,
+        error: Some(message.to_string()),
+    };
+    match serde_json::to_string(&response) {
+        Ok(line) => reply(stream, &line),
+        Err(e) => logln!("[control] encoding error reply: {e}"),
     }
 }
 
@@ -340,23 +383,33 @@ pub fn attach(args: &AttachArgs) -> Result<()> {
         }
         return Err(e).context("reading the handshake from the session");
     }
-    if let Some(error) = field(&line, "error") {
+    // The reply is either a full handshake or `{"ok":false,"error":...}`.
+    let value: serde_json::Value = match serde_json::from_str(line.trim_end()) {
+        Ok(value) => value,
+        Err(e) => {
+            if spawned {
+                kill_quiet(&args.name);
+            }
+            bail!("session {} did not return a handshake: {e}", args.name);
+        }
+    };
+    if value.get("ok").and_then(|v| v.as_bool()) != Some(true) {
         // Do not leave an owner we just started for a request it refused
         // (e.g. a peer-less --listen on a public address).
         if spawned {
             kill_quiet(&args.name);
         }
+        let error = value
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("attach failed");
         bail!("{error}");
     }
-    if !line.contains("\"ok\":true") {
+    if let Err(e) = serde_json::from_value::<xcom_proto::Handshake>(value) {
         if spawned {
             kill_quiet(&args.name);
         }
-        bail!(
-            "session {} did not return a handshake: {}",
-            args.name,
-            line.trim_end()
-        );
+        bail!("session {} returned an invalid handshake: {e}", args.name);
     }
     if args.json {
         // Never panic on a broken stdout: that is the bootstrap channel.
@@ -490,29 +543,30 @@ pub fn list() -> Result<()> {
         if path.extension().and_then(|e| e.to_str()) != Some("sock") {
             continue;
         }
-        let Some(name) = path.file_stem().and_then(|s| s.to_str()) else {
-            continue;
-        };
         let Ok(line) = query(&path) else {
             continue; // stale socket: the owner is gone
         };
-        let display = field(&line, "display").unwrap_or_default();
-        let app = field(&line, "app").unwrap_or_default();
-        let pid = number(&line, "pid").unwrap_or(0);
-        let created = number(&line, "created").unwrap_or(0);
-        let idle = number(&line, "idle_timeout").unwrap_or(0);
-        let attached = boolean(&line, "attached");
-        let age = now_unix().saturating_sub(created);
+        let Ok(info) = serde_json::from_str::<SessionInfo>(line.trim_end()) else {
+            continue;
+        };
+        let age = now_unix().saturating_sub(info.created);
         println!(
-            "{name}\tdisplay {display}\tpid {pid}\tup {}\t{}\tidle {}\tapp: {}",
+            "{}\tdisplay {}\tpid {}\tup {}\t{}\tidle {}\tapp: {}",
+            info.name,
+            info.display,
+            info.pid,
             human_age(age),
-            if attached { "attached" } else { "detached" },
-            if idle == 0 {
+            if info.attached {
+                "attached"
+            } else {
+                "detached"
+            },
+            if info.idle_timeout == 0 {
                 "never".to_string()
             } else {
-                format!("{idle}s")
+                format!("{}s", info.idle_timeout)
             },
-            if app.is_empty() { "-" } else { &app },
+            if info.app.is_empty() { "-" } else { &info.app },
         );
         found += 1;
     }
@@ -549,58 +603,17 @@ pub fn kill(name: &str) -> Result<()> {
     stream.flush()?;
     let mut line = String::new();
     BufReader::new(stream).read_line(&mut line)?;
-    if line.contains("\"ok\":true") {
-        logln!("[kill] session {name} is stopping");
-        Ok(())
-    } else {
-        bail!(
-            "{}",
-            field(&line, "error").unwrap_or_else(|| "kill failed".to_string())
-        )
-    }
-}
-
-/// Minimal JSON field readers: the protocol is line-JSON and all values here
-/// are strings, numbers or booleans (no serde dependency).
-fn field(line: &str, key: &str) -> Option<String> {
-    let pat = format!("\"{key}\":\"");
-    let start = line.find(&pat)? + pat.len();
-    let rest = &line[start..];
-    let end = rest.find('"')?;
-    Some(rest[..end].to_string())
-}
-
-fn number(line: &str, key: &str) -> Option<u64> {
-    let pat = format!("\"{key}\":");
-    let start = line.find(&pat)? + pat.len();
-    let rest = &line[start..];
-    let end = rest
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(rest.len());
-    rest[..end].parse().ok()
-}
-
-fn boolean(line: &str, key: &str) -> bool {
-    let pat = format!("\"{key}\":");
-    line.find(&pat)
-        .map(|i| line[i + pat.len()..].starts_with("true"))
-        .unwrap_or(false)
-}
-
-pub(crate) fn json_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
+    match serde_json::from_str::<Reply>(line.trim_end()) {
+        Ok(reply) if reply.ok => {
+            logln!("[kill] session {name} is stopping");
+            Ok(())
         }
+        Ok(reply) => bail!(
+            "{}",
+            reply.error.unwrap_or_else(|| "kill failed".to_string())
+        ),
+        Err(e) => bail!("bad reply from session {name}: {e}"),
     }
-    out
 }
 
 fn now_unix() -> u64 {
@@ -617,5 +630,87 @@ fn human_age(secs: u64) -> String {
         format!("{}m", secs / 60)
     } else {
         format!("{}h{}m", secs / 3600, (secs % 3600) / 60)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_names_are_restricted() {
+        assert!(validate_name("default").is_ok());
+        assert!(validate_name("work-2_a.b").is_ok());
+        for bad in ["", ".", "..", "../x", "a/b", "a b", "../"] {
+            assert!(validate_name(bad).is_err(), "{bad:?} was accepted");
+        }
+        assert!(validate_name(&"x".repeat(65)).is_err());
+    }
+
+    #[test]
+    fn requests_parse() {
+        let request: Request =
+            serde_json::from_str(r#"{"cmd":"attach","peer":"203.0.113.7"}"#).unwrap();
+        match request {
+            Request::Attach { peer } => assert_eq!(peer.as_deref(), Some("203.0.113.7")),
+            _ => panic!("wrong command"),
+        }
+        assert!(matches!(
+            serde_json::from_str::<Request>(r#"{"cmd":"attach"}"#).unwrap(),
+            Request::Attach { peer: None }
+        ));
+        assert!(matches!(
+            serde_json::from_str::<Request>(r#"{"cmd":"info"}"#).unwrap(),
+            Request::Info
+        ));
+        assert!(matches!(
+            serde_json::from_str::<Request>(r#"{"cmd":"kill"}"#).unwrap(),
+            Request::Kill
+        ));
+        assert!(serde_json::from_str::<Request>(r#"{"cmd":"nope"}"#).is_err());
+    }
+
+    #[test]
+    fn session_info_round_trips_awkward_app() {
+        let info = SessionInfo {
+            ok: true,
+            name: "work".into(),
+            display: ":2".into(),
+            app: "echo \"hi\" \\\n é".into(),
+            pid: 42,
+            created: 7,
+            idle_timeout: 0,
+            attached: false,
+        };
+        let line = serde_json::to_string(&info).unwrap();
+        let back: SessionInfo = serde_json::from_str(&line).unwrap();
+        assert_eq!(back, info);
+    }
+
+    #[test]
+    fn replies_parse() {
+        let ok = serde_json::to_string(&Reply {
+            ok: true,
+            error: None,
+        })
+        .unwrap();
+        assert_eq!(ok, r#"{"ok":true}"#);
+        assert!(serde_json::from_str::<Reply>(&ok).unwrap().ok);
+
+        let error = serde_json::to_string(&Reply {
+            ok: false,
+            error: Some("session busy".into()),
+        })
+        .unwrap();
+        let back: Reply = serde_json::from_str(&error).unwrap();
+        assert!(!back.ok);
+        assert_eq!(back.error.as_deref(), Some("session busy"));
+    }
+
+    #[test]
+    fn human_ages() {
+        assert_eq!(human_age(5), "5s");
+        assert_eq!(human_age(90), "1m");
+        assert_eq!(human_age(3660), "1h1m");
     }
 }

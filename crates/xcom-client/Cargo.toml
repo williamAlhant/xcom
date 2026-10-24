@@ -14,6 +14,7 @@ arboard = { version = "3", default-features = false }
 anyhow = { workspace = true }
 clap = { workspace = true }
 raw-window-handle = "0.6"
+serde_json = { workspace = true }
 softbuffer = "0.4"
 winit = "0.30"
 xcom-codec = { path = "../xcom-codec" }
