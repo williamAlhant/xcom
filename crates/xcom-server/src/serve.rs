@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{self, ConnectionExt as _, Window};
 
@@ -296,6 +296,7 @@ impl Owner {
         let allow_peer = if net.allow_any_peer { None } else { peer };
         let acceptor =
             ChannelAcceptor::bind(&listen, &identity, control_token, bulk_token, allow_peer)?;
+        ensure_peer_policy(allow_peer, net.allow_any_peer, acceptor.local_addr()?.ip())?;
         let port = acceptor.local_addr()?.port();
 
         let host = net
@@ -330,6 +331,19 @@ impl Owner {
             addr,
         })
     }
+}
+
+/// Without an ssh peer there is nobody to allowlist. Loopback is still safe;
+/// anything else would silently expose the TLS port, so refuse unless the
+/// operator explicitly opted into `--allow-any-peer`.
+fn ensure_peer_policy(allow_peer: Option<IpAddr>, allow_any: bool, bound: IpAddr) -> Result<()> {
+    if allow_peer.is_none() && !allow_any && !bound.is_loopback() {
+        bail!(
+            "no ssh peer to allowlist: refusing to listen on {bound}; run the \
+             bootstrap over ssh or pass --allow-any-peer"
+        );
+    }
+    Ok(())
 }
 
 /// One prepared client rendezvous: bound TLS acceptor plus wire handshake.
@@ -390,10 +404,20 @@ fn serve_attachment(
         .acceptor
         .accept(Role::Control, timeout)
         .context("accepting control channel")?;
-    let mut bulk = att
+    // The second role must follow promptly. A partial connect (control up,
+    // bulk fails) otherwise keeps the session "busy" for the whole
+    // --accept-timeout, which kills the client's reconnect.
+    const SECOND_ROLE_WINDOW: Duration = Duration::from_secs(10);
+    let mut bulk = match att
         .acceptor
-        .accept(Role::Bulk, timeout)
-        .context("accepting bulk channel")?;
+        .accept(Role::Bulk, timeout.min(SECOND_ROLE_WINDOW))
+    {
+        Ok(bulk) => bulk,
+        Err(e) => {
+            logln!("[serve] bulk channel did not arrive ({e}); detaching");
+            return Err(e).context("accepting bulk channel");
+        }
+    };
     logln!("[serve] client connected");
 
     // A new client has no cursor state: force the current image through even
@@ -1432,5 +1456,21 @@ mod tests {
         // A zero-size window still resolves to its origin (no negative index).
         let z = geo(9, 5, 6, 0, 0);
         assert_eq!(root_coords(&z, 9, 10, 10), Some((5, 6)));
+    }
+
+    #[test]
+    fn peer_policy_refuses_unallowlisted_non_loopback() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let peer: IpAddr = Ipv4Addr::new(192, 0, 2, 1).into();
+        let loopback: IpAddr = Ipv4Addr::LOCALHOST.into();
+        let any: IpAddr = Ipv4Addr::UNSPECIFIED.into();
+        // Over ssh: the peer is allowlisted, whatever the bind address.
+        assert!(ensure_peer_policy(Some(peer), false, any).is_ok());
+        // Local attach on loopback: no allowlist needed.
+        assert!(ensure_peer_policy(None, false, loopback).is_ok());
+        // Exposed without a peer or an explicit opt-in: refuse.
+        assert!(ensure_peer_policy(None, false, any).is_err());
+        // --allow-any-peer is the documented escape hatch.
+        assert!(ensure_peer_policy(None, true, any).is_ok());
     }
 }

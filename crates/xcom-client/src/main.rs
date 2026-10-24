@@ -872,17 +872,37 @@ struct SupervisorArgs {
 /// Reconnect backoff: 1, 2, 4, 8, then 15 s forever.
 const BACKOFF: [u64; 5] = [1, 2, 4, 8, 15];
 
-/// Errors that mean retrying cannot help: the session is gone, busy, or the
-/// bootstrap is incompatible. Network/ssh failures are retried.
-fn permanent_failure(error: &str) -> bool {
-    error.contains("is gone")
+/// How a bootstrap failure should affect the reconnect loop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FailureKind {
+    /// Another client holds the session; retry briefly (it may be clearing a
+    /// partial connect), then give up.
+    Busy,
+    /// No amount of retrying can succeed.
+    Permanent,
+    /// Network/ssh trouble; keep retrying.
+    Transient,
+}
+
+fn classify_failure(error: &str) -> FailureKind {
+    if error.contains("session busy") {
+        FailureKind::Busy
+    } else if error.contains("is gone")
         || error.contains("is not running")
-        || error.contains("session busy")
         || error.contains("did not return a handshake")
         || error.contains("did not start")
         || error.contains("not found")
         || error.contains("Permission denied")
+    {
+        FailureKind::Permanent
+    } else {
+        FailureKind::Transient
+    }
 }
+
+/// Busy retries before giving up: 1+2+4+8+15 s covers the owner's 10 s
+/// second-role accept window.
+const BUSY_RETRIES: u32 = 5;
 
 /// Keep a --ssh session attached: on link loss, re-bootstrap attach-only and
 /// swap in the new link. Runs on its own thread; only the proxy talks to the UI.
@@ -900,6 +920,7 @@ fn supervise(
             .send_event(UserEvent::ConnectionLost { reconnect: true })
             .ok();
         let mut attempt = 0usize;
+        let mut busy = 0u32;
         loop {
             let delay = BACKOFF[attempt.min(BACKOFF.len() - 1)];
             attempt += 1;
@@ -923,12 +944,28 @@ fn supervise(
                 Ok(handshake) => handshake,
                 Err(e) => {
                     let msg = format!("{e:#}");
-                    if permanent_failure(&msg) {
-                        proxy.send_event(UserEvent::SessionGone(msg)).ok();
-                        return;
+                    match classify_failure(&msg) {
+                        FailureKind::Busy => {
+                            busy += 1;
+                            if busy > BUSY_RETRIES {
+                                proxy.send_event(UserEvent::SessionBusy(msg)).ok();
+                                return;
+                            }
+                            logln!(
+                                "[xcom] session busy (another client is attached); retrying"
+                            );
+                            proxy.send_event(UserEvent::ReconnectFailed(msg)).ok();
+                            continue;
+                        }
+                        FailureKind::Permanent => {
+                            proxy.send_event(UserEvent::SessionGone(msg)).ok();
+                            return;
+                        }
+                        FailureKind::Transient => {
+                            proxy.send_event(UserEvent::ReconnectFailed(msg)).ok();
+                            continue;
+                        }
                     }
-                    proxy.send_event(UserEvent::ReconnectFailed(msg)).ok();
-                    continue;
                 }
             };
             if let Some(mut ssh) = handshake.ssh {
@@ -1182,27 +1219,38 @@ mod tests {
 
     #[test]
     fn reconnect_failure_classes() {
-        use super::permanent_failure;
+        use super::{classify_failure, FailureKind};
+        // Another client may still be clearing a partial connect.
+        assert_eq!(classify_failure("session busy"), FailureKind::Busy);
         // Remote attach errors that no amount of retrying can fix.
-        assert!(permanent_failure(
-            "the ssh session ended before the daemon sent its handshake line: \
-             Error: session default is gone (No such file or directory (os error 2)); \
-             use --create to start it"
-        ));
-        assert!(permanent_failure("session busy"));
-        assert!(permanent_failure(
-            "the ssh session ended ...: sh: 1: xcomd: not found"
-        ));
-        assert!(permanent_failure("session default did not start"));
+        assert_eq!(
+            classify_failure(
+                "the ssh session ended before the daemon sent its handshake line: \
+                 Error: session default is gone (No such file or directory (os error 2)); \
+                 use --create to start it"
+            ),
+            FailureKind::Permanent
+        );
+        assert_eq!(
+            classify_failure("the ssh session ended ...: sh: 1: xcomd: not found"),
+            FailureKind::Permanent
+        );
+        assert_eq!(
+            classify_failure("session default did not start"),
+            FailureKind::Permanent
+        );
         // Network and ssh failures are transient.
-        assert!(!permanent_failure(
-            "spawning ssh (is the OpenSSH client installed?)"
-        ));
-        assert!(!permanent_failure(
-            "control channel: io: Connection reset by peer (os error 104)"
-        ));
-        assert!(!permanent_failure(
-            "the ssh session ended before the daemon sent its handshake line"
-        ));
+        assert_eq!(
+            classify_failure("spawning ssh (is the OpenSSH client installed?)"),
+            FailureKind::Transient
+        );
+        assert_eq!(
+            classify_failure("control channel: io: Connection reset by peer (os error 104)"),
+            FailureKind::Transient
+        );
+        assert_eq!(
+            classify_failure("the ssh session ended before the daemon sent its handshake line"),
+            FailureKind::Transient
+        );
     }
 }

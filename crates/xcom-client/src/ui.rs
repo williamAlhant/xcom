@@ -121,6 +121,8 @@ pub enum UserEvent {
     ReconnectFailed(String),
     /// The session itself is gone: no retry can succeed.
     SessionGone(String),
+    /// Another client is attached and the busy retries ran out.
+    SessionBusy(String),
     /// The reattach initial sync is complete; windows not re-announced are gone.
     SyncDone,
     /// Test aid: resize the first local window (stress for the resize loop).
@@ -1180,6 +1182,14 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
                 logln!("[ui] session is gone: {error}");
+                self.report();
+                el.exit();
+            }
+            UserEvent::SessionBusy(error) => {
+                if self.ended {
+                    return;
+                }
+                logln!("[ui] another client is attached: {error}");
                 self.report();
                 el.exit();
             }

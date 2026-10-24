@@ -305,10 +305,12 @@ pub fn attach(args: &AttachArgs) -> Result<()> {
         }
     }
 
+    let mut spawned = false;
     let mut stream = match UnixStream::connect(&path) {
         Ok(stream) => stream,
         Err(_) if create => {
             spawn_session(args)?;
+            spawned = true;
             connect_wait(&path, &args.name, Duration::from_secs(20))?
         }
         Err(e) => bail!(
@@ -331,13 +333,25 @@ pub fn attach(args: &AttachArgs) -> Result<()> {
     stream.flush().context("flushing the attach request")?;
 
     let mut line = String::new();
-    BufReader::new(stream)
-        .read_line(&mut line)
-        .context("reading the handshake from the session")?;
+    let read = BufReader::new(stream).read_line(&mut line);
+    if let Err(e) = read {
+        if spawned {
+            kill_quiet(&args.name);
+        }
+        return Err(e).context("reading the handshake from the session");
+    }
     if let Some(error) = field(&line, "error") {
+        // Do not leave an owner we just started for a request it refused
+        // (e.g. a peer-less --listen on a public address).
+        if spawned {
+            kill_quiet(&args.name);
+        }
         bail!("{error}");
     }
     if !line.contains("\"ok\":true") {
+        if spawned {
+            kill_quiet(&args.name);
+        }
         bail!(
             "session {} did not return a handshake: {}",
             args.name,
@@ -353,6 +367,18 @@ pub fn attach(args: &AttachArgs) -> Result<()> {
         logln!("[attach] {}", line.trim_end());
     }
     Ok(())
+}
+
+/// Best-effort cleanup of an owner this bootstrap just spawned: a refused
+/// first attach must not leave an idle session behind.
+fn kill_quiet(name: &str) {
+    let Ok(path) = socket_path(name) else {
+        return;
+    };
+    if let Ok(mut stream) = UnixStream::connect(&path) {
+        let _ = writeln!(stream, "{{\"cmd\":\"kill\"}}");
+        let _ = stream.flush();
+    }
 }
 
 /// Start a detached owner. It outlives this bootstrap process (and ssh).
