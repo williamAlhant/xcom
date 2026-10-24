@@ -96,8 +96,9 @@ The client cannot be built fully static: winit and softbuffer load
 support.
 
 Tests: `cargo test --workspace`, plus `scripts/e2e-direct.sh`,
-`scripts/e2e-ssh.sh`, `scripts/e2e-persist.sh`, `scripts/e2e-reconnect.sh`
-and `scripts/e2e-clipboard.sh` (short end-to-end runs).
+`scripts/e2e-ssh.sh`, `scripts/e2e-persist.sh`, `scripts/e2e-reconnect.sh`,
+`scripts/e2e-sessions.sh` and `scripts/e2e-clipboard.sh` (short end-to-end
+runs).
 
 The client warns when the remote daemon reports a different build id: a stale
 `xcomd` silently behaves like an old version, which is easy to mistake for a
@@ -115,7 +116,8 @@ client bug.
   connects (`--spawn WxH` overrides it); a monitor attached afterwards needs a
   new session to be fully usable.
 - **One attachment per session.** A second client is rejected as "session
-  busy"; there is no multi-client sharing.
+  busy"; there is no multi-client sharing. A reconnecting client retries busy
+  briefly in case the owner is still clearing a partial connect.
 - **Reattach needs ssh.** A dropped `--ssh` link reconnects in the background
   (`--no-reconnect` opts out); `--direct` clients exit instead, because their
   single-use tokens only arrive over ssh.
@@ -146,4 +148,5 @@ or on macOS.
 
 - `docs/m2.md` — window management, clipboard, cursor.
 - `docs/m3.md` — persistent sessions, reattach, the close dialog.
+- `docs/session-security.md` — session trust boundaries and knobs.
 - `docs/windows-client.md` — Windows build and Wine findings.
