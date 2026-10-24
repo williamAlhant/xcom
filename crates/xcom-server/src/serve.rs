@@ -8,7 +8,7 @@
 
 use std::io::Write;
 use std::net::{IpAddr, UdpSocket};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
@@ -114,62 +114,135 @@ fn die_with_parent(cmd: &mut Command) {
 #[cfg(not(target_os = "linux"))]
 fn die_with_parent(_cmd: &mut Command) {}
 
-pub fn run(args: ServeArgs) -> Result<()> {
-    // --- display ---------------------------------------------------------
-    let (display, _xvfb): (String, Option<Xvfb>) = match &args.display {
-        Some(d) => (d.clone(), None),
-        None => {
-            let (w, h) = parse_size(&args.spawn)?;
-            let server = Xvfb::spawn(w, h)
-                .context("spawning a virtual display (install xorg-server-xvfb)")?;
-            (server.display.clone(), Some(server))
-        }
-    };
+/// Stable queue for clipboard pushes from the owner-owned worker.
+///
+/// The clipboard must outlive attachments (it owns the X selection and serves
+/// paste requests), so the receiver lives in the owner and each attachment
+/// drains it. Messages produced while detached are discarded by the owner.
+type ClipboardQueue = Arc<std::sync::Mutex<mpsc::Receiver<Message>>>;
 
-    // --- optional app ----------------------------------------------------
-    // The app's stdout must never touch ours: stdout is the handshake channel.
-    let mut app = match &args.exec {
-        Some(cmd) => {
-            let mut c = Command::new("sh");
-            c.arg("-c")
-                .arg(cmd)
-                .env("DISPLAY", &display)
-                .stdout(Stdio::null())
-                .stderr(Stdio::inherit());
-            // xterm and command-line tools need a UTF-8 locale to turn
-            // non-ASCII keysyms into characters; in a POSIX locale they drop
-            // them. Never override a locale the caller set.
-            if std::env::var_os("LANG").is_none() && std::env::var_os("LC_ALL").is_none() {
-                c.env("LANG", "C.UTF-8");
+/// Long-lived session state: display, app and capture pipeline.
+///
+/// Attachments come and go; everything here survives a client leaving.
+struct Owner {
+    display: String,
+    session: CaptureSession,
+    keymap: Keymap,
+    app: Option<Child>,
+    _xvfb: Option<Xvfb>,
+    geo: GeometryMap,
+    screen: (u16, u16),
+    clipboard: Option<Clipboard>,
+    clipboard_rx: ClipboardQueue,
+}
+
+impl Owner {
+    fn start(args: &ServeArgs) -> Result<Owner> {
+        // --- display -----------------------------------------------------
+        let (display, xvfb): (String, Option<Xvfb>) = match &args.display {
+            Some(d) => (d.clone(), None),
+            None => {
+                let (w, h) = parse_size(&args.spawn)?;
+                let server = Xvfb::spawn(w, h)
+                    .context("spawning a virtual display (install xorg-server-xvfb)")?;
+                (server.display.clone(), Some(server))
             }
-            die_with_parent(&mut c);
-            Some(
-                c.spawn()
-                    .with_context(|| format!("launching {cmd:?}"))?,
-            )
-        }
-        None => None,
-    };
+        };
 
-    // --- capture session -------------------------------------------------
-    // Only set the root arrow when we own the display; attaching to a real
-    // session must not change its cursor.
-    let mut session = CaptureSession::connect(
-        Some(&display),
-        CaptureConfig {
-            root_arrow: args.display.is_none(),
-            ..Default::default()
-        },
-    )?;
-    let root = session.root();
-    for t in windows::list_top_levels(session.connection().as_ref(), root, true)? {
-        if t.mapped {
-            let _ = session.add_window(t.window)?;
+        // --- optional app ------------------------------------------------
+        // The app's stdout must never touch ours: stdout is the handshake channel.
+        let app = match &args.exec {
+            Some(cmd) => {
+                let mut c = Command::new("sh");
+                c.arg("-c")
+                    .arg(cmd)
+                    .env("DISPLAY", &display)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::inherit());
+                // xterm and command-line tools need a UTF-8 locale to turn
+                // non-ASCII keysyms into characters; in a POSIX locale they drop
+                // them. Never override a locale the caller set.
+                if std::env::var_os("LANG").is_none() && std::env::var_os("LC_ALL").is_none() {
+                    c.env("LANG", "C.UTF-8");
+                }
+                die_with_parent(&mut c);
+                Some(
+                    c.spawn()
+                        .with_context(|| format!("launching {cmd:?}"))?,
+                )
+            }
+            None => None,
+        };
+
+        // --- capture session ---------------------------------------------
+        // Only set the root arrow when we own the display; attaching to a real
+        // session must not change its cursor.
+        let mut session = CaptureSession::connect(
+            Some(&display),
+            CaptureConfig {
+                root_arrow: args.display.is_none(),
+                ..Default::default()
+            },
+        )?;
+        let root = session.root();
+        for t in windows::list_top_levels(session.connection().as_ref(), root, true)? {
+            if t.mapped {
+                let _ = session.add_window(t.window)?;
+            }
         }
+
+        let keymap = Keymap::query(session.connection().as_ref())?;
+        let screen = session.screen_size();
+
+        // Geometry is shared between the capture loop and input injection.
+        let geo: GeometryMap = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        for win in session.windows() {
+            if let Some(g) = session.window_geometry(win) {
+                geo.lock().unwrap().insert(win, g);
+            }
+        }
+
+        // One clipboard worker for the session: it owns the remote selection,
+        // so it must survive detach. Its queue is drained by the current
+        // attachment; the owner discards messages while detached.
+        let (clip_tx, clip_rx) = mpsc::channel();
+        let clipboard = match Clipboard::spawn(&display, clip_tx) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                logln!("[serve] clipboard disabled: {e:#}");
+                None
+            }
+        };
+
+        Ok(Owner {
+            display,
+            session,
+            keymap,
+            app,
+            _xvfb: xvfb,
+            geo,
+            screen,
+            clipboard,
+            clipboard_rx: Arc::new(std::sync::Mutex::new(clip_rx)),
+        })
     }
 
-    let keymap = Keymap::query(session.connection().as_ref())?;
-    let (screen_w, screen_h) = session.screen_size();
+    /// Serve one attachment: identity/tokens, the two TLS channels, resync and
+    /// the capture loop. Returns when the client leaves (or fails); the owner
+    /// and the app stay alive.
+    fn attach_once(&mut self, args: &ServeArgs) -> Result<()> {
+        let Owner {
+            display,
+            session,
+            keymap,
+            geo,
+            screen,
+            clipboard,
+            clipboard_rx,
+            ..
+        } = self;
+        let (screen_w, screen_h) = *screen;
+        let root = session.root();
 
     // --- identity, tokens, listener --------------------------------------
     let identity = Identity::generate()?;
@@ -258,40 +331,28 @@ pub fn run(args: ServeArgs) -> Result<()> {
     // --- control thread: input in, window events out ---------------------
     let (ctrl_tx, ctrl_rx) = mpsc::channel::<Message>();
 
-    // Clipboard worker: own connection, separate thread; the session still
-    // works without it (e.g. if the display refuses another connection). It
-    // pushes remote selection changes to the client through `ctrl_tx`.
-    let clipboard = match Clipboard::spawn(&display, ctrl_tx.clone()) {
-        Ok(c) => Some(c),
-        Err(e) => {
-            logln!("[serve] clipboard disabled: {e:#}");
-            None
-        }
-    };
     let (full_tx, full_rx) = mpsc::channel::<Window>();
     let conn_for_input = session.connection();
     let shutdown_ctrl = Arc::clone(&shutdown);
-    let geo: GeometryMap = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
-    for win in session.windows() {
-        if let Some((x, y, w, h)) = session.window_geometry(win) {
-            geo.lock().unwrap().insert(win, (x, y, w, h));
-        }
-    }
-    let geo_ctrl = Arc::clone(&geo);
+    let geo_ctrl = Arc::clone(geo);
+    let clipboard_ctrl = clipboard.clone();
+    let clipboard_rx_ctrl = Arc::clone(clipboard_rx);
+    let keymap_ctrl = Keymap::clone(keymap);
     let ctrl_send = ctrl_tx.clone();
     let ctrl_thread = std::thread::spawn(move || {
         if let Err(e) = control_loop(
             control,
             conn_for_input,
             root,
-            keymap,
+            keymap_ctrl,
             ctrl_rx,
             ctrl_send,
             full_tx,
             shutdown_ctrl,
             geo_ctrl,
             (screen_w, screen_h),
-            clipboard,
+            clipboard_ctrl,
+            clipboard_rx_ctrl,
         ) {
             logln!("[serve] control loop ended with error: {e:#}");
         }
@@ -339,42 +400,56 @@ pub fn run(args: ServeArgs) -> Result<()> {
 
     // --- main loop: capture -> bulk channel ------------------------------
     let result = serve_loop(
-        &mut session,
+        session,
         bulk,
         &ctrl_tx,
         &full_rx,
         &shutdown,
-        &geo,
+        geo,
         &ctrl_thread,
         announced,
     );
 
     shutdown.store(true, Ordering::SeqCst);
-    if let Some(mut app) = app.take() {
-        #[cfg(target_os = "linux")]
-        {
-            let pid = app.id() as i32;
-            // The app is its own process-group leader (setpgid in pre_exec):
-            // signal the whole group, then force it after a short grace.
-            unsafe {
-                libc::kill(-pid, libc::SIGTERM);
-            }
-            let deadline = Instant::now() + Duration::from_millis(300);
-            while Instant::now() < deadline {
-                match app.try_wait() {
-                    Ok(Some(_)) => break,
-                    Ok(None) => std::thread::sleep(Duration::from_millis(10)),
-                    Err(_) => break,
+    let _ = ctrl_thread.join();
+    result
+    }
+
+    /// Stop the app and let the display go: session teardown, not detach.
+    fn stop_app(&mut self) {
+        if let Some(mut app) = self.app.take() {
+            #[cfg(target_os = "linux")]
+            {
+                let pid = app.id() as i32;
+                // The app is its own process-group leader (setpgid in pre_exec):
+                // signal the whole group, then force it after a short grace.
+                unsafe {
+                    libc::kill(-pid, libc::SIGTERM);
+                }
+                let deadline = Instant::now() + Duration::from_millis(300);
+                while Instant::now() < deadline {
+                    match app.try_wait() {
+                        Ok(Some(_)) => break,
+                        Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+                        Err(_) => break,
+                    }
+                }
+                unsafe {
+                    libc::kill(-pid, libc::SIGKILL);
                 }
             }
-            unsafe {
-                libc::kill(-pid, libc::SIGKILL);
-            }
+            let _ = app.kill();
+            let _ = app.wait();
         }
-        let _ = app.kill();
-        let _ = app.wait();
     }
-    let _ = ctrl_thread.join();
+}
+
+/// Serve a session. Still a single attachment for now; the owner loop and the
+/// control socket arrive in the next commits.
+pub fn run(args: ServeArgs) -> Result<()> {
+    let mut owner = Owner::start(&args)?;
+    let result = owner.attach_once(&args);
+    owner.stop_app();
     result
 }
 
@@ -390,7 +465,7 @@ impl Drop for ShutdownGuard {
 
 #[allow(clippy::too_many_arguments)] // thread entry point, one owner per parameter
 fn control_loop(
-    mut control: Channel,
+    control: Channel,
     conn: Arc<x11rb::rust_connection::RustConnection>,
     root: Window,
     keymap: Keymap,
@@ -401,9 +476,60 @@ fn control_loop(
     geo: GeometryMap,
     screen: (u16, u16),
     clipboard: Option<Clipboard>,
+    clipboard_rx: ClipboardQueue,
+) -> Result<()> {
+    let injector = Injector::new(&*conn, root, keymap);
+    // XTEST state is global to the display: anything still down when the
+    // attachment ends would stay stuck for the next client.
+    let mut held_keys: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut held_buttons: std::collections::HashSet<u8> = std::collections::HashSet::new();
+    let result = control_loop_inner(
+        &injector,
+        &conn,
+        &mut held_keys,
+        &mut held_buttons,
+        control,
+        outbound,
+        outbound_tx,
+        full_requests,
+        shutdown,
+        geo,
+        screen,
+        clipboard,
+        clipboard_rx,
+    );
+
+    // The client is gone: release everything it was holding down.
+    for sym in held_keys {
+        if let Err(e) = injector.key(sym, false) {
+            logln!("[serve] releasing key {sym:#x} failed: {e}");
+        }
+    }
+    for button in held_buttons {
+        if let Err(e) = injector.button(button, false) {
+            logln!("[serve] releasing button {button} failed: {e}");
+        }
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)] // loop body, one owner per parameter
+fn control_loop_inner(
+    injector: &Injector<'_, x11rb::rust_connection::RustConnection>,
+    conn: &x11rb::rust_connection::RustConnection,
+    held_keys: &mut std::collections::HashSet<u32>,
+    held_buttons: &mut std::collections::HashSet<u8>,
+    mut control: Channel,
+    outbound: mpsc::Receiver<Message>,
+    outbound_tx: mpsc::Sender<Message>,
+    full_requests: mpsc::Sender<Window>,
+    shutdown: Arc<AtomicBool>,
+    geo: GeometryMap,
+    screen: (u16, u16),
+    clipboard: Option<Clipboard>,
+    clipboard_rx: ClipboardQueue,
 ) -> Result<()> {
     let _guard = ShutdownGuard(Arc::clone(&shutdown));
-    let injector = Injector::new(&*conn, root, keymap);
     // Windows already warned about, so a drag past the edge logs once.
     let mut size_warned: std::collections::HashSet<Window> = std::collections::HashSet::new();
     let mut last_rx = Instant::now();
@@ -411,10 +537,18 @@ fn control_loop(
         if shutdown.load(Ordering::SeqCst) {
             return Ok(());
         }
-        // Window events produced by the capture loop.
+        // Window events produced by the capture loop, then clipboard pushes
+        // from the owner-owned worker (both feed the control channel).
         while let Ok(msg) = outbound.try_recv() {
             let payload = msg.encode();
             control.send(msg.msg_type(), &payload)?;
+        }
+        {
+            let rx = clipboard_rx.lock().unwrap_or_else(|e| e.into_inner());
+            while let Ok(msg) = rx.try_recv() {
+                let payload = msg.encode();
+                control.send(msg.msg_type(), &payload)?;
+            }
         }
 
         // Poll for inbound input; the short timeout is what lets us service
@@ -436,9 +570,15 @@ fn control_loop(
                     if xcom_proto::debug_keys() {
                         logln!("[serve] recv key sym={sym:#x} pressed={pressed}");
                     }
-                    if let Err(e) = injector.key(sym, pressed) {
+                    match injector.key(sym, pressed) {
                         // A single unresolvable keysym must not end the session.
-                        logln!("[serve] key {sym:#x} dropped: {e}");
+                        Ok(()) if pressed => {
+                            held_keys.insert(sym);
+                        }
+                        Ok(()) => {
+                            held_keys.remove(&sym);
+                        }
+                        Err(e) => logln!("[serve] key {sym:#x} dropped: {e}"),
                     }
                 }
                 Message::Focus { window } => {
@@ -466,6 +606,11 @@ fn control_loop(
                     }
                     injector.motion(rx, ry)?;
                     injector.button(button, pressed)?;
+                    if pressed {
+                        held_buttons.insert(button);
+                    } else {
+                        held_buttons.remove(&button);
+                    }
                     if pressed && button == 1 {
                         // Click-to-focus (there is no WM on the virtual
                         // display to do it for us).
@@ -523,7 +668,7 @@ fn control_loop(
                         logln!("[serve] close {id:#x}: not a tracked window");
                         continue;
                     }
-                    match windows::request_close(&*conn, id) {
+                    match windows::request_close(conn, id) {
                         Ok(true) => logln!("[serve] close {id:#x}: WM_DELETE_WINDOW"),
                         Ok(false) => logln!("[serve] close {id:#x}: destroyed (no WM_DELETE_WINDOW)"),
                         Err(e) => logln!("[serve] close {id:#x} failed: {e}"),
