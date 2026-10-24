@@ -283,6 +283,9 @@ pub struct AttachArgs {
     /// Idle timeout for a newly created session (0 = never).
     #[arg(long, default_value_t = 0)]
     pub idle_timeout: u64,
+    /// Test aid: drop each client link after N seconds (0 = never).
+    #[arg(long, default_value_t = 0)]
+    pub drop_after: u64,
     #[command(flatten)]
     pub display: crate::serve::DisplayArgs,
     #[command(flatten)]
@@ -371,6 +374,9 @@ fn spawn_session(args: &AttachArgs) -> Result<()> {
         .arg(&args.display.spawn)
         .arg("--idle-timeout")
         .arg(args.idle_timeout.to_string());
+    if args.drop_after > 0 {
+        cmd.arg("--drop-after").arg(args.drop_after.to_string());
+    }
     if let Some(display) = &args.display.display {
         cmd.arg("--display").arg(display);
     }

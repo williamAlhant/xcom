@@ -18,7 +18,6 @@ use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU32;
-use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -104,8 +103,23 @@ pub enum UserEvent {
     Frame(DamageFrame),
     /// Scripted runs: leave the event loop.
     Quit,
-    /// The channel died: never leave stale windows showing old content.
-    ConnectionLost,
+    /// The channel died. With `reconnect`, the window set is frozen under a
+    /// banner while the supervisor re-establishes the link.
+    ConnectionLost {
+        reconnect: bool,
+    },
+    /// A reconnect attempt is about to start (attempt numbers start at 1).
+    Reconnecting {
+        attempt: u32,
+    },
+    /// A fresh link is up; the server resends the window set and frames.
+    Reconnected,
+    /// A reconnect attempt failed but will be retried.
+    ReconnectFailed(String),
+    /// The session itself is gone: no retry can succeed.
+    SessionGone(String),
+    /// The reattach initial sync is complete; windows not re-announced are gone.
+    SyncDone,
     /// Test aid: resize the first local window (stress for the resize loop).
     ResizeLocal { w: u16, h: u16 },
     /// Test aid: dump the store now (transient artifacts included).
@@ -236,7 +250,7 @@ struct Attached {
 }
 
 pub struct App {
-    input_tx: Sender<(Message, Instant)>,
+    input_tx: crate::link::InputSink,
     pixels: HashMap<u32, Pixels>,
     attached: HashMap<u32, Attached>,
     by_winit: HashMap<WindowId, u32>,
@@ -281,6 +295,13 @@ pub struct App {
     close_action: CloseAction,
     /// Modal "close the last window?" dialog, when one is up.
     dialog: Option<CloseDialog>,
+    /// Reconnect status banner (none while the link is healthy).
+    banner: Option<String>,
+    /// Windows that existed before the current outage. On SyncDone, the ones
+    /// the server did not re-announce are closed.
+    stale: Option<std::collections::HashSet<u32>>,
+    /// Windows re-announced by the new link since the outage.
+    confirmed: std::collections::HashSet<u32>,
     /// Last local pointer position (physical surface pixels), for hit-testing
     /// the dialog (the remote cursor is clamped to the store and cannot be
     /// used for the letterboxed surface).
@@ -381,7 +402,7 @@ fn place_window(
 impl App {
     pub fn new(
         _proxy: EventLoopProxy<UserEvent>,
-        input_tx: Sender<(Message, Instant)>,
+        sink: crate::link::InputSink,
         opts: AppOptions,
     ) -> App {
         let AppOptions {
@@ -394,9 +415,9 @@ impl App {
             close_action,
             monitor,
         } = opts;
-        let clipboard = crate::clipboard::spawn(input_tx.clone(), clipboard_sync);
+        let clipboard = crate::clipboard::spawn(sink.clone(), clipboard_sync);
         App {
-            input_tx,
+            input_tx: sink,
             pixels: HashMap::new(),
             attached: HashMap::new(),
             by_winit: HashMap::new(),
@@ -421,6 +442,9 @@ impl App {
             close_action,
             dialog: None,
             pointer: (0.0, 0.0),
+            banner: None,
+            stale: None,
+            confirmed: std::collections::HashSet::new(),
         }
     }
 
@@ -685,6 +709,7 @@ impl App {
             .as_ref()
             .filter(|d| d.window == id)
             .map(|d| (d.focus, d.hover));
+        let banner = self.banner.clone();
         let (Some(att), Some(pix)) = (self.attached.get_mut(&id), self.pixels.get(&id)) else {
             return;
         };
@@ -733,6 +758,9 @@ impl App {
         if self.metrics.hud_on() {
             crate::hud::draw(&mut buf, lw, lh, self.metrics.hud());
         }
+        if let Some(text) = &banner {
+            crate::hud::draw_banner(&mut buf, lw, lh, text);
+        }
         if let Some((focus, hover)) = dialog {
             crate::hud::draw_close_dialog(&mut buf, lw, lh, focus, hover);
         }
@@ -746,6 +774,7 @@ impl App {
 
     fn blit_frame(&mut self, frame: &DamageFrame) {
         let id = frame.window;
+        self.confirmed.insert(id);
         if !sane_size(frame.win_w, frame.win_h) {
             logln!(
                 "[ui] frame {id:#x} rejected: implausible window size {}x{}",
@@ -778,7 +807,7 @@ impl App {
 
     fn send(&self, msg: Message) {
         // Enqueue with a timestamp: the writer thread measures the queue delay.
-        self.input_tx.send((msg, Instant::now())).ok();
+        self.input_tx.send(msg);
     }
 
     /// Send input and remember when, for the input -> present latency readout.
@@ -789,6 +818,13 @@ impl App {
 
     fn remote_id(&self, id: WindowId) -> Option<u32> {
         self.by_winit.get(&id).copied()
+    }
+
+    /// Request a repaint of every attached window (banner changes).
+    fn redraw_all(&self) {
+        for att in self.attached.values() {
+            att.window.request_redraw();
+        }
     }
 
     /// Show the modal "close the last window?" dialog on `window`.
@@ -864,6 +900,7 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
                 self.ever_had_windows = true;
+                self.confirmed.insert(id);
                 let pix = self.pixels.entry(id).or_insert_with(|| Pixels::new(w, h));
                 pix.x = x;
                 pix.y = y;
@@ -1067,11 +1104,56 @@ impl ApplicationHandler<UserEvent> for App {
                         .set_max_inner_size(Some(PhysicalSize::new(w as u32, h as u32)));
                 }
             }
-            UserEvent::ConnectionLost => {
-                self.dialog = None;
-                logln!("[ui] connection lost, closing {} window(s)", self.attached.len());
+            UserEvent::ConnectionLost { reconnect } => {
+                if reconnect {
+                    logln!(
+                        "[ui] connection lost, keeping {} window(s) for reattach",
+                        self.attached.len()
+                    );
+                    self.stale = Some(self.attached.keys().copied().collect());
+                    self.confirmed.clear();
+                    self.banner = Some("connection lost — reconnecting…".to_string());
+                    self.redraw_all();
+                } else {
+                    self.dialog = None;
+                    logln!("[ui] connection lost, closing {} window(s)", self.attached.len());
+                    self.report();
+                    el.exit();
+                }
+            }
+            UserEvent::Reconnecting { attempt } => {
+                self.banner =
+                    Some(format!("connection lost — reconnecting (attempt {attempt})…"));
+                self.redraw_all();
+            }
+            UserEvent::Reconnected => {
+                logln!("[ui] reconnected; waiting for the window resync");
+                self.banner = Some("reconnected — resyncing…".to_string());
+                self.redraw_all();
+            }
+            UserEvent::ReconnectFailed(error) => {
+                logln!("[ui] reconnect failed: {error}");
+                self.banner = Some(format!("reconnect failed: {error}"));
+                self.redraw_all();
+            }
+            UserEvent::SessionGone(error) => {
+                logln!("[ui] session is gone: {error}");
                 self.report();
                 el.exit();
+            }
+            UserEvent::SyncDone => {
+                self.banner = None;
+                if let Some(stale) = self.stale.take() {
+                    let gone: Vec<u32> = stale.difference(&self.confirmed).copied().collect();
+                    for id in gone {
+                        logln!("[ui] window {id:#x} disappeared while detached");
+                        self.pixels.remove(&id);
+                        if let Some(att) = self.attached.remove(&id) {
+                            self.by_winit.remove(&att.window.id());
+                        }
+                    }
+                }
+                self.redraw_all();
             }
         }
     }

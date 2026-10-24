@@ -12,11 +12,12 @@
 //! ourselves are suppressed for a short window so the two sides cannot echo
 //! each other; the daemon has an exact owner-window guard on its side.
 
-use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use xcom_proto::{logln, Message, CLIPBOARD_CLIPBOARD};
+
+use crate::link::InputSink;
 
 /// Ignore watcher events this long after we wrote the clipboard ourselves
 /// (our own write looks like a change; arboard's owner window is internal).
@@ -45,7 +46,7 @@ impl LocalClipboard {
 /// Start the watcher; the returned handle belongs to the UI thread.
 ///
 /// With `enabled == false` the local clipboard is never read or written.
-pub fn spawn(input_tx: Sender<(Message, Instant)>, enabled: bool) -> LocalClipboard {
+pub fn spawn(input: InputSink, enabled: bool) -> LocalClipboard {
     if !enabled {
         logln!("[ui] clipboard mirroring disabled");
         return LocalClipboard {
@@ -62,9 +63,8 @@ pub fn spawn(input_tx: Sender<(Message, Instant)>, enabled: bool) -> LocalClipbo
     };
     let suppress_until = Arc::new(Mutex::new(Instant::now()));
     if inner.is_some() {
-        let tx = input_tx;
         let suppress = Arc::clone(&suppress_until);
-        std::thread::spawn(move || watch(tx, suppress));
+        std::thread::spawn(move || watch(input, suppress));
     }
     LocalClipboard {
         inner,
@@ -75,7 +75,7 @@ pub fn spawn(input_tx: Sender<(Message, Instant)>, enabled: bool) -> LocalClipbo
 /// Read the local clipboard and push it to the remote if it really changed.
 fn read_and_push(
     cb: &mut arboard::Clipboard,
-    tx: &Sender<(Message, Instant)>,
+    input: &InputSink,
     suppress_until: &Mutex<Instant>,
 ) {
     if Instant::now() < *suppress_until.lock().unwrap() {
@@ -106,18 +106,14 @@ fn read_and_push(
         "[ui] clipboard: mirroring {} bytes to the remote",
         text.len()
     );
-    tx.send((
-        Message::ClipboardSet {
-            target: CLIPBOARD_CLIPBOARD,
-            text,
-        },
-        Instant::now(),
-    ))
-    .ok();
+    input.send(Message::ClipboardSet {
+        target: CLIPBOARD_CLIPBOARD,
+        text,
+    });
 }
 
 #[cfg(target_os = "linux")]
-fn watch(tx: Sender<(Message, Instant)>, suppress: Arc<Mutex<Instant>>) {
+fn watch(input: InputSink, suppress: Arc<Mutex<Instant>>) {
     use x11rb::connection::Connection;
     use x11rb::protocol::xfixes::{self, ConnectionExt as _};
     use x11rb::protocol::xproto::ConnectionExt as _;
@@ -177,7 +173,7 @@ fn watch(tx: Sender<(Message, Instant)>, suppress: Arc<Mutex<Instant>>) {
                     && e.selection == clipboard
                     && e.owner != x11rb::NONE =>
             {
-                read_and_push(&mut cb, &tx, &suppress);
+                read_and_push(&mut cb, &input, &suppress);
             }
             Ok(_) => {}
             Err(e) => {
@@ -189,7 +185,7 @@ fn watch(tx: Sender<(Message, Instant)>, suppress: Arc<Mutex<Instant>>) {
 }
 
 #[cfg(windows)]
-fn watch(tx: Sender<(Message, Instant)>, suppress: Arc<Mutex<Instant>>) {
+fn watch(input: InputSink, suppress: Arc<Mutex<Instant>>) {
     use windows_sys::Win32::System::DataExchange::GetClipboardSequenceNumber;
 
     let mut cb = match arboard::Clipboard::new() {
@@ -209,11 +205,11 @@ fn watch(tx: Sender<(Message, Instant)>, suppress: Arc<Mutex<Instant>>) {
             continue;
         }
         last = seq;
-        read_and_push(&mut cb, &tx, &suppress);
+        read_and_push(&mut cb, &input, &suppress);
     }
 }
 
 #[cfg(not(any(target_os = "linux", windows)))]
-fn watch(_tx: Sender<(Message, Instant)>, _suppress: Arc<Mutex<Instant>>) {
+fn watch(_input: InputSink, _suppress: Arc<Mutex<Instant>>) {
     logln!("[ui] clipboard sync not implemented on this platform");
 }

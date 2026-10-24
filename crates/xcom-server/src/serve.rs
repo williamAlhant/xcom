@@ -69,6 +69,10 @@ pub struct ServeArgs {
     /// Print the handshake line as JSON on stdout (used by the ssh bootstrap).
     #[arg(long)]
     pub json: bool,
+    /// Test aid: drop the client link after N seconds without ending the
+    /// session (the reconnect e2e uses it).
+    #[arg(long, default_value_t = 0)]
+    pub drop_after: u64,
 }
 
 #[derive(clap::Args)]
@@ -84,6 +88,10 @@ pub struct SessionArgs {
     /// (0 = never).
     #[arg(long, default_value_t = 0)]
     pub idle_timeout: u64,
+    /// Test aid: drop each client link after N seconds without ending the
+    /// session (the reconnect e2e uses it).
+    #[arg(long, default_value_t = 0)]
+    pub drop_after: u64,
 }
 
 fn parse_size(s: &str) -> Result<(u16, u16)> {
@@ -166,10 +174,12 @@ struct Owner {
     screen: (u16, u16),
     clipboard: Option<Clipboard>,
     clipboard_rx: ClipboardQueue,
+    /// Test aid: seconds after which each attachment is dropped (0 = never).
+    drop_after: u64,
 }
 
 impl Owner {
-    fn start(display_args: &DisplayArgs, name: &str) -> Result<Owner> {
+    fn start(display_args: &DisplayArgs, name: &str, drop_after: u64) -> Result<Owner> {
         crate::control::validate_name(name)?;
         // --- display -----------------------------------------------------
         let (display, xvfb): (String, Option<Xvfb>) = match &display_args.display {
@@ -261,6 +271,7 @@ impl Owner {
             screen,
             clipboard,
             clipboard_rx: Arc::new(std::sync::Mutex::new(clip_rx)),
+            drop_after,
         })
     }
 
@@ -360,6 +371,7 @@ fn serve_attachment(
         clipboard,
         clipboard_rx,
         app,
+        drop_after,
         ..
     } = owner;
     let (screen_w, screen_h) = *screen;
@@ -470,8 +482,14 @@ fn serve_attachment(
             None => logln!("[serve] sync: capture_full({win:#x}) returned None"),
         }
     }
+    // Reattach bookkeeping: everything the session still has has now been
+    // announced, so the client can drop windows that disappeared while it was
+    // detached. Ordered after the WindowCreate messages above.
+    ctrl_tx.send(Message::SyncDone).ok();
 
     // --- main loop: capture -> bulk channel ------------------------------
+    let drop_at = (*drop_after > 0)
+        .then(|| Instant::now() + Duration::from_secs(*drop_after));
     let result = serve_loop(
         session,
         bulk,
@@ -483,6 +501,7 @@ fn serve_attachment(
         announced,
         app,
         session_end,
+        drop_at,
     );
 
     shutdown.store(true, Ordering::SeqCst);
@@ -532,7 +551,11 @@ impl Owner {
 
 /// Serve one client over the legacy `xcomd serve` bootstrap.
 pub fn run(args: ServeArgs) -> Result<()> {
-    let mut owner = Owner::start(&args.display, crate::control::DEFAULT_SESSION)?;
+    let mut owner = Owner::start(
+        &args.display,
+        crate::control::DEFAULT_SESSION,
+        args.drop_after,
+    )?;
     let att = owner.prepare_attachment(&args.net, ssh_client_ip())?;
     if args.json {
         // Never panic on a broken stdout: that is the bootstrap channel.
@@ -552,7 +575,7 @@ pub fn run(args: ServeArgs) -> Result<()> {
 /// fresh handshake and serve each client that asks for one.
 pub fn run_session(args: SessionArgs) -> Result<()> {
     crate::control::validate_name(&args.name)?;
-    let mut owner = Owner::start(&args.display, &args.name)?;
+    let mut owner = Owner::start(&args.display, &args.name, args.drop_after)?;
     let info = crate::control::Info {
         name: args.name.clone(),
         display: owner.display.clone(),
@@ -1027,6 +1050,7 @@ fn serve_loop(
     mut announced: std::collections::HashSet<Window>,
     app: &mut Option<Child>,
     session_end: &AtomicBool,
+    drop_at: Option<Instant>,
 ) -> Result<AttachmentEnd> {
     // A window's first full frame can be captured before the app has painted
     // (and a freshly named pixmap may hold recycled memory). Static apps never
@@ -1055,6 +1079,11 @@ fn serve_loop(
 
     loop {
         if shutdown.load(Ordering::SeqCst) || session_end.load(Ordering::SeqCst) {
+            return Ok(AttachmentEnd::Detached);
+        }
+        if drop_at.is_some_and(|at| Instant::now() >= at) {
+            logln!("[serve] test aid: dropping the client link");
+            shutdown.store(true, Ordering::SeqCst);
             return Ok(AttachmentEnd::Detached);
         }
         // The app defines the session's life: an exit ends it, attached or not.

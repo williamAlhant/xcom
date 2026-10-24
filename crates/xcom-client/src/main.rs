@@ -9,12 +9,13 @@
 mod clipboard;
 mod hud;
 mod keys;
+mod link;
 mod metrics;
 mod ui;
 
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -24,7 +25,7 @@ use clap::{Parser, Subcommand};
 use winit::event_loop::EventLoop;
 
 use xcom_proto::{logln, Message, MSG_DAMAGE};
-use xcom_transport::{Channel, Role};
+use xcom_transport::Channel;
 use ui::{App, UserEvent};
 
 #[derive(Parser)]
@@ -134,6 +135,12 @@ struct ConnectArgs {
     /// running. Scripts and tests use `close`/`disconnect`.
     #[arg(long, value_enum, default_value = "ask")]
     close_action: ui::CloseAction,
+    /// Do not reconnect automatically after a dropped --ssh link.
+    #[arg(long)]
+    no_reconnect: bool,
+    /// Test aid: ask the session to drop the link after N seconds.
+    #[arg(long, default_value_t = 0)]
+    drop_after: u64,
     /// Test aid: type this text (Latin-1) after the session comes up.
     #[arg(long, allow_hyphen_values = true)]
     type_text: Option<String>,
@@ -430,11 +437,14 @@ fn display_size() -> Option<(u16, u16)> {
 }
 
 /// Run `xcomd attach --create --json` over ssh and parse the handshake line.
+#[allow(clippy::too_many_arguments)] // bootstrap options, one per caller flag
 fn bootstrap_ssh(
     target: &str,
     ssh_args: Option<&str>,
     exec: Option<&str>,
     spawn: Option<(u16, u16)>,
+    create: bool,
+    drop_after: u64,
     session: &str,
     replace: bool,
     idle_timeout: u64,
@@ -448,23 +458,30 @@ fn bootstrap_ssh(
     let remote = {
         // attach-or-create: on a reattach `--exec`/`--spawn` are ignored by the
         // owner (the app is already running); `--replace` is the way to change
-        // them.
-        let mut cmd = format!(
-            "xcomd attach --create --json --name {}",
-            shell_quote(session)
-        );
-        if replace {
-            cmd.push_str(" --replace");
+        // them. A reconnect is attach-only, so a dead session is an error
+        // instead of silently starting a new app.
+        let mut cmd = String::from("xcomd attach --json");
+        if create {
+            cmd.push_str(" --create");
         }
-        if idle_timeout > 0 {
-            cmd.push_str(&format!(" --idle-timeout {idle_timeout}"));
-        }
-        if let Some((w, h)) = spawn {
-            logln!("[xcom] requesting a {w}x{h} session display");
-            cmd.push_str(&format!(" --spawn {w}x{h}"));
-        }
-        if let Some(exec) = exec {
-            cmd.push_str(&format!(" --exec {}", shell_quote(exec)));
+        cmd.push_str(&format!(" --name {}", shell_quote(session)));
+        if create {
+            if replace {
+                cmd.push_str(" --replace");
+            }
+            if idle_timeout > 0 {
+                cmd.push_str(&format!(" --idle-timeout {idle_timeout}"));
+            }
+            if drop_after > 0 {
+                cmd.push_str(&format!(" --drop-after {drop_after}"));
+            }
+            if let Some((w, h)) = spawn {
+                logln!("[xcom] requesting a {w}x{h} session display");
+                cmd.push_str(&format!(" --spawn {w}x{h}"));
+            }
+            if let Some(exec) = exec {
+                cmd.push_str(&format!(" --exec {}", shell_quote(exec)));
+            }
         }
         format!("{dbg}{cmd}")
     };
@@ -607,6 +624,8 @@ fn connect(args: ConnectArgs) -> Result<()> {
             args.ssh_args.as_deref(),
             args.exec.as_deref(),
             args.spawn.or(monitor),
+            true,
+            args.drop_after,
             &args.session,
             args.replace,
             args.idle_timeout,
@@ -653,76 +672,37 @@ fn connect(args: ConnectArgs) -> Result<()> {
         &handshake.fingerprint[..16.min(handshake.fingerprint.len())]
     );
 
-    let timeout = Duration::from_secs(15);
-    let control = xcom_transport::connect(
-        &handshake.addr,
-        Role::Control,
-        &handshake.fingerprint,
-        &handshake.control_token,
-        timeout,
-    )
-    .context("control channel")?;
-    let bulk = xcom_transport::connect(
-        &handshake.addr,
-        Role::Bulk,
-        &handshake.fingerprint,
-        &handshake.bulk_token,
-        timeout,
-    )
-    .context("bulk channel")?;
-    logln!("[xcom] secure channel established");
-
     let proxy = event_loop.create_proxy();
     // Every message carries its enqueue time: the writer measures how long it
     // waited before reaching the socket (the HUD's queue_ms).
-    let (input_tx, input_rx) = mpsc::channel::<(Message, Instant)>();
     let queue_us = Arc::new(AtomicU32::new(0));
-    let pending_ping: Arc<Mutex<Option<(u64, Instant)>>> = Arc::new(Mutex::new(None));
 
-    // Control channel: split so input never waits behind a read timeout. The
-    // reader blocks on the socket; the writer writes as soon as a message is
-    // queued. See xcom_transport::Channel::split.
-    let (ctrl_reader, ctrl_writer) = control.split().context("splitting the control channel")?;
+    // One stable input handle for the UI, the clipboard worker and the test
+    // aids. The supervisor swaps the underlying sender on reconnect; messages
+    // sent while disconnected go to the dead channel and are dropped.
+    let (initial_tx, _initial_rx) = mpsc::channel::<(Message, Instant)>();
+    let sink = link::InputSink::new(initial_tx);
 
-    // Reader: window lifecycle in.
-    let proxy_reader = proxy.clone();
-    let pending_rx = Arc::clone(&pending_ping);
-    std::thread::spawn(move || {
-        control_reader_loop(ctrl_reader, proxy_reader.clone(), pending_rx);
-        // EOF or error: the session is gone — make the UI close its windows
-        // instead of leaving stale content on screen.
-        proxy_reader.send_event(UserEvent::ConnectionLost).ok();
-    });
+    let endpoint = link::Endpoint {
+        addr: handshake.addr.clone(),
+        control_token: handshake.control_token,
+        bulk_token: handshake.bulk_token,
+        fingerprint: handshake.fingerprint.clone(),
+    };
+    let current = link::start(&endpoint, &sink, &proxy, Arc::clone(&queue_us))?;
 
-    // Writer: input out, plus the keepalive. A ping unanswered for 20 s means
-    // the peer is gone (sleep/wake, NAT timeout); force-closing the socket
-    // wakes the reader so the UI can close the session.
-    let queue_tx = Arc::clone(&queue_us);
-    let pending_tx = Arc::clone(&pending_ping);
-    std::thread::spawn(move || {
-        control_writer_loop(ctrl_writer, input_rx, queue_tx, pending_tx);
-    });
-
-    // Keepalive + RTT: one ping every 5 s (the first immediately, so the HUD
-    // has a round-trip time from the start). The control loop treats 20 s
-    // without any traffic from the server as a dead session, which is what
-    // turns a sleep/wake or NAT-timeout half-open connection into a closed
-    // window instead of a permanently frozen one.
     // Seed the local clipboard from the remote's current selection; after this
-    // the daemon pushes changes and the watcher mirrors local ones.
+    // the daemon pushes changes and the watcher mirrors local ones. On every
+    // reattach the server resyncs the client, and this is repeated after the
+    // reconnected event below.
     if !args.no_clipboard_sync {
-        input_tx
-            .send((
-                Message::ClipboardGet {
-                    target: xcom_proto::CLIPBOARD_CLIPBOARD,
-                },
-                Instant::now(),
-            ))
-            .ok();
+        sink.send(Message::ClipboardGet {
+            target: xcom_proto::CLIPBOARD_CLIPBOARD,
+        });
     }
 
     if let Some(text) = args.type_text.clone() {
-        let tx = input_tx.clone();
+        let sink = sink.clone();
         let delay = args.type_delay;
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_secs(delay));
@@ -744,8 +724,7 @@ fn connect(args: ConnectArgs) -> Result<()> {
                     }
                 };
                 for pressed in [true, false] {
-                    tx.send((Message::InputKey { sym, pressed }, Instant::now()))
-                        .ok();
+                    sink.send_at(Message::InputKey { sym, pressed }, Instant::now());
                 }
                 std::thread::sleep(Duration::from_millis(30));
             }
@@ -793,18 +772,38 @@ fn connect(args: ConnectArgs) -> Result<()> {
         });
     }
 
-    // Bulk thread: damage frames in.
-    let proxy_bulk = proxy.clone();
-    std::thread::spawn(move || {
-        if let Err(e) = bulk_loop(bulk, proxy_bulk.clone()) {
-            logln!("[xcom] bulk channel: {e}");
-        }
-        proxy_bulk.send_event(UserEvent::ConnectionLost).ok();
-    });
+    // A dropped --ssh link is re-established in the background. --direct has
+    // no way to re-authenticate (single-use tokens arrive over ssh) and keeps
+    // the old exit-on-loss behaviour.
+    let reconnect = args.ssh.is_some() && !args.no_reconnect;
+    if reconnect {
+        let sup = SupervisorArgs {
+            ssh: args.ssh.clone().unwrap_or_default(),
+            ssh_args: args.ssh_args.clone(),
+            exec: args.exec.clone(),
+            spawn: args.spawn.or(monitor),
+            session: args.session.clone(),
+            connect: args.connect.clone(),
+            clipboard: !args.no_clipboard_sync,
+        };
+        let sup_sink = sink.clone();
+        let sup_proxy = proxy.clone();
+        let sup_queue = Arc::clone(&queue_us);
+        std::thread::spawn(move || supervise(current, sup, sup_sink, sup_proxy, sup_queue));
+    } else {
+        let loss_proxy = proxy.clone();
+        std::thread::spawn(move || {
+            current.wait_down();
+            current.stop();
+            loss_proxy
+                .send_event(UserEvent::ConnectionLost { reconnect: false })
+                .ok();
+        });
+    }
 
     let mut app = App::new(
         proxy,
-        input_tx,
+        sink,
         ui::AppOptions {
             dump: args.dump_ppm.clone(),
             fullscreen: args.fullscreen,
@@ -825,14 +824,123 @@ fn connect(args: ConnectArgs) -> Result<()> {
     result
 }
 
+/// What the reconnect supervisor needs to bootstrap a fresh attachment.
+struct SupervisorArgs {
+    ssh: String,
+    ssh_args: Option<String>,
+    exec: Option<String>,
+    spawn: Option<(u16, u16)>,
+    session: String,
+    connect: Option<String>,
+    clipboard: bool,
+}
+
+/// Reconnect backoff: 1, 2, 4, 8, then 15 s forever.
+const BACKOFF: [u64; 5] = [1, 2, 4, 8, 15];
+
+/// Errors that mean retrying cannot help: the session is gone, busy, or the
+/// bootstrap is incompatible. Network/ssh failures are retried.
+fn permanent_failure(error: &str) -> bool {
+    error.contains("is gone")
+        || error.contains("is not running")
+        || error.contains("session busy")
+        || error.contains("did not return a handshake")
+}
+
+/// Keep a --ssh session attached: on link loss, re-bootstrap attach-only and
+/// swap in the new link. Runs on its own thread; only the proxy talks to the UI.
+fn supervise(
+    mut link: link::Link,
+    args: SupervisorArgs,
+    sink: link::InputSink,
+    proxy: winit::event_loop::EventLoopProxy<UserEvent>,
+    queue_us: Arc<AtomicU32>,
+) {
+    loop {
+        link.wait_down();
+        link.stop();
+        proxy
+            .send_event(UserEvent::ConnectionLost { reconnect: true })
+            .ok();
+        let mut attempt = 0usize;
+        loop {
+            let delay = BACKOFF[attempt.min(BACKOFF.len() - 1)];
+            attempt += 1;
+            proxy
+                .send_event(UserEvent::Reconnecting {
+                    attempt: attempt as u32,
+                })
+                .ok();
+            std::thread::sleep(Duration::from_secs(delay));
+            let handshake = match bootstrap_ssh(
+                &args.ssh,
+                args.ssh_args.as_deref(),
+                args.exec.as_deref(),
+                args.spawn,
+                false,
+                0,
+                &args.session,
+                false,
+                0,
+            ) {
+                Ok(handshake) => handshake,
+                Err(e) => {
+                    let msg = format!("{e:#}");
+                    if permanent_failure(&msg) {
+                        proxy.send_event(UserEvent::SessionGone(msg)).ok();
+                        return;
+                    }
+                    proxy.send_event(UserEvent::ReconnectFailed(msg)).ok();
+                    continue;
+                }
+            };
+            if let Some(mut ssh) = handshake.ssh {
+                // `attach` exits after printing the handshake.
+                let _ = ssh.wait();
+            }
+            let mut endpoint = link::Endpoint {
+                addr: handshake.addr,
+                control_token: handshake.control_token,
+                bulk_token: handshake.bulk_token,
+                fingerprint: handshake.fingerprint,
+            };
+            if let Some(connect) = &args.connect {
+                endpoint.addr = connect.clone();
+            }
+            match link::start(&endpoint, &sink, &proxy, Arc::clone(&queue_us)) {
+                Ok(next) => {
+                    logln!("[xcom] reconnected (attempt {attempt})");
+                    if args.clipboard {
+                        sink.send(Message::ClipboardGet {
+                            target: xcom_proto::CLIPBOARD_CLIPBOARD,
+                        });
+                    }
+                    proxy.send_event(UserEvent::Reconnected).ok();
+                    link = next;
+                    break;
+                }
+                Err(e) => {
+                    proxy
+                        .send_event(UserEvent::ReconnectFailed(format!("{e:#}")))
+                        .ok();
+                }
+            }
+        }
+    }
+}
+
 /// Reader half: blocking, no polling. Dispatches window events to the UI and
 /// measures RTT when a pong matches the outstanding ping.
-fn control_reader_loop(
+pub(crate) fn control_reader_loop(
     mut reader: xcom_transport::ChannelReader,
     proxy: winit::event_loop::EventLoopProxy<UserEvent>,
     pending: Arc<Mutex<Option<(u64, Instant)>>>,
+    stop: Arc<AtomicBool>,
 ) {
     loop {
+        if stop.load(Ordering::SeqCst) {
+            return;
+        }
         match reader.recv() {
             Ok(Some((ty, payload))) => {
                 let Ok(msg) = Message::decode(ty, &payload) else {
@@ -916,6 +1024,7 @@ fn control_reader_loop(
                     Message::WindowMapped { id } => Some(UserEvent::Map { id }),
                     Message::WindowDestroy { id } => Some(UserEvent::Close { id }),
                     Message::Display { w, h } => Some(UserEvent::Display { w, h }),
+                    Message::SyncDone => Some(UserEvent::SyncDone),
                     _ => None,
                 };
                 if let Some(ev) = event {
@@ -947,11 +1056,12 @@ fn send_ping(
     true
 }
 
-fn control_writer_loop(
+pub(crate) fn control_writer_loop(
     mut writer: xcom_transport::ChannelWriter,
     input_rx: mpsc::Receiver<(Message, Instant)>,
     queue_us: Arc<AtomicU32>,
     pending: Arc<Mutex<Option<(u64, Instant)>>>,
+    stop: Arc<AtomicBool>,
 ) {
     // First ping immediately, so the HUD has a round-trip time from the start.
     if !send_ping(&mut writer, &pending) {
@@ -959,6 +1069,9 @@ fn control_writer_loop(
         return;
     }
     loop {
+        if stop.load(Ordering::SeqCst) {
+            return;
+        }
         // Liveness: a ping outstanding for 20 s means the peer is gone. This is
         // the app-level equivalent of the old "no traffic for 20 s" check.
         if let Some((_, at)) = *pending.lock().unwrap() {
@@ -993,7 +1106,10 @@ fn control_writer_loop(
     }
 }
 
-fn bulk_loop(mut bulk: Channel, proxy: winit::event_loop::EventLoopProxy<UserEvent>) -> Result<()> {
+pub(crate) fn bulk_loop(
+    mut bulk: Channel,
+    proxy: winit::event_loop::EventLoopProxy<UserEvent>,
+) -> Result<()> {
     loop {
         match bulk.recv() {
             Ok(Some((MSG_DAMAGE, payload))) => {

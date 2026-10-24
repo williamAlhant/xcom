@@ -11,7 +11,7 @@
 //! (the M0 harness and the e2e key-latency check rely on that); other targets
 //! fall back to the system clock so this crate still builds for Windows.
 
-pub const PROTO_VERSION: u16 = 7;
+pub const PROTO_VERSION: u16 = 8;
 
 /// Build identifier (`git describe --always --dirty --tags`, or the crate
 /// version when git is unavailable). Advertised in the handshake so a stale
@@ -82,6 +82,10 @@ pub const MSG_STATS: u8 = 34;
 
 /// Server -> client: session display size, sent first on the control channel.
 pub const MSG_DISPLAY: u8 = 35;
+
+/// Server -> client: the reattach initial sync is complete. The client closes
+/// windows that were not re-announced (they disappeared while detached).
+pub const MSG_SYNC_DONE: u8 = 36;
 
 /// Selection text is length-prefixed with u16; keep a margin below the limit.
 pub const MAX_CLIPBOARD_TEXT: usize = 60_000;
@@ -414,6 +418,8 @@ pub enum Message {
         w: u16,
         h: u16,
     },
+    /// The reattach initial sync is complete (see `MSG_SYNC_DONE`).
+    SyncDone,
     Bye,
 }
 
@@ -487,6 +493,7 @@ impl Message {
             Message::Cursor { .. } => MSG_CURSOR,
             Message::Stats { .. } => MSG_STATS,
             Message::Display { .. } => MSG_DISPLAY,
+            Message::SyncDone => MSG_SYNC_DONE,
             Message::Bye => MSG_BYE,
         }
     }
@@ -601,7 +608,7 @@ impl Message {
                 put_u16(&mut out, *w);
                 put_u16(&mut out, *h);
             }
-            Message::Bye => {}
+            Message::SyncDone | Message::Bye => {}
         }
         out
     }
@@ -705,6 +712,7 @@ impl Message {
                 h: take_u16(&mut p)?,
             },
             MSG_BYE => Message::Bye,
+            MSG_SYNC_DONE => Message::SyncDone,
             MSG_STATS => Message::Stats {
                 interval_ms: take_u32(&mut p)?,
                 frames: take_u32(&mut p)?,
@@ -1019,6 +1027,7 @@ mod tests {
                 windows: 3,
             },
             Message::Display { w: 1600, h: 1200 },
+            Message::SyncDone,
             Message::Bye,
         ];
         for m in msgs {

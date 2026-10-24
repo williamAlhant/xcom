@@ -73,7 +73,8 @@ desktop; it cannot grow later, so windows are capped at it);
 `xcomd serve --spawn 1600x1200` sets the virtual display size directly;
 `--session NAME` attaches to (or creates) a named session (`default`;
 `--replace` rebuilds it); `--idle-timeout N` ends a session after N seconds
-without a client (0 = never, the default); `--hud` shows
+without a client (0 = never, the default); a dropped `--ssh` link reconnects
+in the background (`--no-reconnect` opts out); `--hud` shows
 the metrics overlay (fps, bandwidth, compression ratio, RTT, capture/encode
 time), toggled in-session with Ctrl+Shift+M; `--no-clipboard-sync` turns off
 clipboard mirroring; `--close-action ask|close|disconnect` overrides the
@@ -95,8 +96,8 @@ The client cannot be built fully static: winit and softbuffer load
 support.
 
 Tests: `cargo test --workspace`, plus `scripts/e2e-direct.sh`,
-`scripts/e2e-ssh.sh`, `scripts/e2e-persist.sh` and `scripts/e2e-clipboard.sh`
-(short end-to-end runs).
+`scripts/e2e-ssh.sh`, `scripts/e2e-persist.sh`, `scripts/e2e-reconnect.sh`
+and `scripts/e2e-clipboard.sh` (short end-to-end runs).
 
 The client warns when the remote daemon reports a different build id: a stale
 `xcomd` silently behaves like an old version, which is easy to mistake for a
@@ -115,9 +116,9 @@ client bug.
   new session to be fully usable.
 - **One attachment per session.** A second client is rejected as "session
   busy"; there is no multi-client sharing.
-- **Reattach is manual.** A client that exits or loses its connection does not
-  come back by itself yet; run `xcom connect --session NAME` again. `--direct`
-  sessions cannot be reattached (their single-use tokens only arrive over ssh).
+- **Reattach needs ssh.** A dropped `--ssh` link reconnects in the background
+  (`--no-reconnect` opts out); `--direct` clients exit instead, because their
+  single-use tokens only arrive over ssh.
 - **SSH is bootstrap-only.** After authentication the client reaches the
   daemon's advertised address directly; there is no `ssh -L` fallback yet.
 - **Clipboard is text only**, capped at 60 KB, and mirrored in the background

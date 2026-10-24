@@ -245,6 +245,28 @@ pub fn draw(buf: &mut [u32], w: usize, h: usize, hud: &Hud) {
     }
 }
 
+/// Draw a one-line status banner at the top of a presented surface.
+///
+/// Used for reconnect progress while the last frames stay frozen underneath.
+pub fn draw_banner(buf: &mut [u32], w: usize, h: usize, message: &str) {
+    if w == 0 || h == 0 || buf.len() < w * h || message.is_empty() {
+        return;
+    }
+    let text_w = message.chars().count() * GLYPH_W;
+    let panel_w = (text_w + 20).min(w);
+    let panel_h = (LINE_H + 8).min(h);
+    let panel = Rect {
+        x: (w - panel_w) / 2,
+        y: 6.min(h.saturating_sub(panel_h)),
+        w: panel_w,
+        h: panel_h,
+    };
+    fill_rect(buf, w, h, panel, 0x0020_2020, 238);
+    stroke_rect(buf, w, h, panel, 0x0080_8080);
+    let tx = panel.x + panel_w.saturating_sub(text_w) / 2;
+    text(buf, w, h, tx, panel.y + 4, message, FG);
+}
+
 /// Buttons of the last-window close dialog, in display order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CloseChoice {
