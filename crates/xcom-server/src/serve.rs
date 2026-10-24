@@ -452,6 +452,11 @@ fn serve_attachment(
         let Some((x, y, w, h)) = session.window_geometry(win) else {
             continue;
         };
+        // Hidden windows are not part of this attachment: they are announced
+        // again when the app maps them (announced starts empty per attachment).
+        if !session.is_mapped(win) {
+            continue;
+        }
         let title =
             windows::window_name(session.connection().as_ref(), win).unwrap_or_default();
         let info = windows::window_info(session.connection().as_ref(), win);

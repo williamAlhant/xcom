@@ -246,6 +246,12 @@ impl CaptureSession {
     }
 
     /// Geometry of a tracked window in root coordinates.
+    /// Whether `win` is currently mapped (visible). Unmapped windows stay
+    /// tracked but must not be re-announced as visible on reattach.
+    pub fn is_mapped(&self, win: Window) -> bool {
+        self.windows.get(&win).map(|s| s.mapped).unwrap_or(false)
+    }
+
     pub fn window_geometry(&self, win: Window) -> Option<(i16, i16, u16, u16)> {
         self.windows
             .get(&win)
