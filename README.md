@@ -29,6 +29,10 @@ below are the ones known today.
   damage-driven rectangles compressed with LZ4.
 - **Client** — applies the pixel stream to native windows (winit + softbuffer),
   forwards keyboard/mouse, and mirrors the remote pointer shape.
+- **Session** — the remote owner keeps Xvfb, the app and capture state alive
+  across connections. Each client is an *attachment*; reattaching by name
+  resyncs windows, frames, cursor and clipboard. The app defines the session's
+  life: when it exits, the session ends.
 
 ## Quick start
 
@@ -40,6 +44,11 @@ system `ssh` for the bootstrap.
 # ssh mode: the client launches the daemon on the remote host
 xcom connect --ssh user@host --exec 'xterm'
 
+# sessions outlive the client; reattach, inspect or end one by name
+xcom connect --ssh user@host --session work --exec 'xterm'
+xcom sessions --ssh user@host
+xcom kill --ssh user@host --session work
+
 # direct mode: start the daemon yourself and pass the handshake through
 xcomd serve --json --exec 'xterm' > handshake.json
 xcom connect --direct "$(jq -r .connect handshake.json)" \
@@ -47,6 +56,9 @@ xcom connect --direct "$(jq -r .connect handshake.json)" \
     --token-bulk "$(jq -r .token_bulk handshake.json)" \
     --fingerprint "$(jq -r .cert_sha256 handshake.json)"
 ```
+
+Closing the last window asks whether to close the app (ending the session) or
+disconnect and leave it running; Esc or a click outside cancels.
 
 Prebuilt binaries (static Linux `xcomd`, glibc Linux `xcom`, Windows
 `xcom.exe`) are attached to GitHub releases. CI builds the static Linux server
@@ -58,12 +70,15 @@ Useful flags: `--connect HOST:PORT` overrides the address to dial (NAT,
 containers); `--seconds N` exits after N seconds (0 = until the windows close);
 `--spawn WxH` requests the session display size (default: this machine's
 desktop; it cannot grow later, so windows are capped at it);
-`xcomd serve --spawn 1600x1200` sets the virtual display size directly; `--hud`
-shows
+`xcomd serve --spawn 1600x1200` sets the virtual display size directly;
+`--session NAME` attaches to (or creates) a named session (`default`;
+`--replace` rebuilds it); `--idle-timeout N` ends a session after N seconds
+without a client (0 = never, the default); `--hud` shows
 the metrics overlay (fps, bandwidth, compression ratio, RTT, capture/encode
 time), toggled in-session with Ctrl+Shift+M; `--no-clipboard-sync` turns off
-clipboard mirroring; `--backend auto|x11|wayland` picks the Linux client
-backend (`auto` prefers X11/XWayland, see below; ignored on Windows).
+clipboard mirroring; `--close-action ask|close|disconnect` overrides the
+last-window dialog for scripts; `--backend auto|x11|wayland` picks the Linux
+client backend (`auto` prefers X11/XWayland, see below; ignored on Windows).
 
 Builds:
 
@@ -80,7 +95,8 @@ The client cannot be built fully static: winit and softbuffer load
 support.
 
 Tests: `cargo test --workspace`, plus `scripts/e2e-direct.sh`,
-`scripts/e2e-ssh.sh` and `scripts/e2e-clipboard.sh` (short end-to-end runs).
+`scripts/e2e-ssh.sh`, `scripts/e2e-persist.sh` and `scripts/e2e-clipboard.sh`
+(short end-to-end runs).
 
 The client warns when the remote daemon reports a different build id: a stale
 `xcomd` silently behaves like an old version, which is easy to mistake for a
@@ -97,8 +113,11 @@ client bug.
   unclickable. The client sizes the session from this machine's desktop when it
   connects (`--spawn WxH` overrides it); a monitor attached afterwards needs a
   new session to be fully usable.
-- **No persistent session.** The daemon and its Xvfb exit when the client
-  disconnects; there is no reconnect or resume.
+- **One attachment per session.** A second client is rejected as "session
+  busy"; there is no multi-client sharing.
+- **Reattach is manual.** A client that exits or loses its connection does not
+  come back by itself yet; run `xcom connect --session NAME` again. `--direct`
+  sessions cannot be reattached (their single-use tokens only arrive over ssh).
 - **SSH is bootstrap-only.** After authentication the client reaches the
   daemon's advertised address directly; there is no `ssh -L` fallback yet.
 - **Clipboard is text only**, capped at 60 KB, and mirrored in the background
@@ -113,7 +132,7 @@ client bug.
   fractional scaling and input methods) with those limitations.
 - **Single remote screen**: no multi-monitor, no audio, no file transfer.
 - **Not security-audited.** Tokens and the ephemeral certificate are
-  regenerated on every run.
+  regenerated for every attachment.
 
 ## Untested / unverified
 
@@ -125,4 +144,5 @@ or on macOS.
 ## Docs
 
 - `docs/m2.md` — window management, clipboard, cursor.
+- `docs/m3.md` — persistent sessions, reattach, the close dialog.
 - `docs/windows-client.md` — Windows build and Wine findings.
