@@ -34,10 +34,17 @@ struct Cli {
     cmd: Cmd,
 }
 
+// Parsed exactly once in main; the size difference between the connect flags
+// and the tiny list commands does not matter.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Cmd {
     /// Connect to a remote session (SSH bootstrap or direct).
     Connect(ConnectArgs),
+    /// List the sessions running on the remote host.
+    Sessions(SessionsArgs),
+    /// End a session on the remote host.
+    Kill(KillArgs),
 }
 
 /// Which windowing backend to use.
@@ -65,6 +72,16 @@ struct ConnectArgs {
     /// Extra ssh arguments (e.g. "-p 2222 -i ~/.ssh/key").
     #[arg(long, allow_hyphen_values = true)]
     ssh_args: Option<String>,
+    /// Session name on the remote host: attach to it, or create it.
+    #[arg(long, default_value = "default")]
+    session: String,
+    /// Tear an existing session down and start a fresh one (destructive).
+    #[arg(long)]
+    replace: bool,
+    /// End the session after N seconds without an attached client (0 = never).
+    /// Only used when the session is created; ignored on reattach.
+    #[arg(long, default_value_t = 0)]
+    idle_timeout: u64,
     /// Direct address of a running daemon (skips the ssh bootstrap).
     #[arg(long)]
     direct: Option<String>,
@@ -129,6 +146,29 @@ struct ConnectArgs {
     /// Test aid: close one window N seconds after start (session must survive).
     #[arg(long, default_value_t = 0)]
     close_after: u64,
+}
+
+#[derive(clap::Args)]
+struct SessionsArgs {
+    /// ssh target (user@host).
+    #[arg(long)]
+    ssh: String,
+    /// Extra ssh arguments (e.g. "-p 2222 -i ~/.ssh/key").
+    #[arg(long, allow_hyphen_values = true)]
+    ssh_args: Option<String>,
+}
+
+#[derive(clap::Args)]
+struct KillArgs {
+    /// ssh target (user@host).
+    #[arg(long)]
+    ssh: String,
+    /// Extra ssh arguments (e.g. "-p 2222 -i ~/.ssh/key").
+    #[arg(long, allow_hyphen_values = true)]
+    ssh_args: Option<String>,
+    /// Session name.
+    #[arg(long, default_value = "default")]
+    session: String,
 }
 
 struct Handshake {
@@ -384,12 +424,15 @@ fn display_size() -> Option<(u16, u16)> {
     None
 }
 
-/// Run `xcomd serve --json` over ssh and parse the handshake line.
+/// Run `xcomd attach --create --json` over ssh and parse the handshake line.
 fn bootstrap_ssh(
     target: &str,
     ssh_args: Option<&str>,
     exec: Option<&str>,
     spawn: Option<(u16, u16)>,
+    session: &str,
+    replace: bool,
+    idle_timeout: u64,
 ) -> Result<Handshake> {
     // Let XCOM_DEBUG follow the session so the daemon traces too.
     let dbg = if xcom_proto::debug() {
@@ -398,7 +441,19 @@ fn bootstrap_ssh(
         ""
     };
     let remote = {
-        let mut cmd = String::from("xcomd serve --json");
+        // attach-or-create: on a reattach `--exec`/`--spawn` are ignored by the
+        // owner (the app is already running); `--replace` is the way to change
+        // them.
+        let mut cmd = format!(
+            "xcomd attach --create --json --name {}",
+            shell_quote(session)
+        );
+        if replace {
+            cmd.push_str(" --replace");
+        }
+        if idle_timeout > 0 {
+            cmd.push_str(&format!(" --idle-timeout {idle_timeout}"));
+        }
         if let Some((w, h)) = spawn {
             logln!("[xcom] requesting a {w}x{h} session display");
             cmd.push_str(&format!(" --spawn {w}x{h}"));
@@ -464,6 +519,13 @@ fn bootstrap_ssh(
                 ),
                 None => bail!("handshake line: missing proto"),
             }
+            // Reattaching does not relaunch the app, so say which one is running:
+            // a stale session is the surprising case.
+            if let Some(app) = json_field(&line, "app") {
+                if !app.is_empty() {
+                    logln!("[xcom] session app: {app}");
+                }
+            }
             return Ok(Handshake {
                 addr,
                 control_token: token32(control)?,
@@ -494,8 +556,37 @@ fn bootstrap_direct(
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let Cmd::Connect(args) = cli.cmd;
+    match cli.cmd {
+        Cmd::Connect(args) => connect(args),
+        Cmd::Sessions(args) => remote_command("xcomd sessions", &args.ssh, args.ssh_args.as_deref()),
+        Cmd::Kill(args) => remote_command(
+            &format!("xcomd kill --session {}", shell_quote(&args.session)),
+            &args.ssh,
+            args.ssh_args.as_deref(),
+        ),
+    }
+}
 
+/// Run a one-shot xcomd command over ssh (`sessions`, `kill`).
+fn remote_command(remote: &str, target: &str, ssh_args: Option<&str>) -> Result<()> {
+    let mut cmd = Command::new("ssh");
+    cmd.arg("-o").arg("BatchMode=yes");
+    if let Some(extra) = ssh_args {
+        for a in extra.split_whitespace() {
+            cmd.arg(a);
+        }
+    }
+    cmd.arg(target).arg(remote);
+    let status = cmd
+        .status()
+        .context("spawning ssh (is the OpenSSH client installed?)")?;
+    if !status.success() {
+        bail!("remote command failed ({status})");
+    }
+    Ok(())
+}
+
+fn connect(args: ConnectArgs) -> Result<()> {
     // Must run before the event loop (and before any thread) reads the
     // environment.
     let (backend, saved_wayland) = apply_backend(args.backend)?;
@@ -511,11 +602,19 @@ fn main() -> Result<()> {
             args.ssh_args.as_deref(),
             args.exec.as_deref(),
             args.spawn.or(monitor),
+            &args.session,
+            args.replace,
+            args.idle_timeout,
         )?,
         (None, Some(addr)) => {
             if args.spawn.is_some() {
                 logln!(
                     "[xcom] note: --spawn only applies to the ssh bootstrap; the direct daemon is already running"
+                );
+            }
+            if args.session != "default" || args.replace || args.idle_timeout > 0 {
+                logln!(
+                    "[xcom] note: --session/--replace/--idle-timeout only apply to the ssh bootstrap; the direct daemon is already running"
                 );
             }
             if args.token_control.is_some() || args.token_bulk.is_some() {

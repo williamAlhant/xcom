@@ -28,10 +28,7 @@ use xcom_x11::windows;
 use xcom_x11::xvfb::Xvfb;
 
 #[derive(clap::Args)]
-pub struct ServeArgs {
-    /// Print the handshake line as JSON on stdout (used by the ssh bootstrap).
-    #[arg(long)]
-    pub json: bool,
+pub struct DisplayArgs {
     /// Attach to an existing display (e.g. :9) instead of spawning one.
     /// Diagnostic: capture assumes it owns the display (manual compositing).
     #[arg(long)]
@@ -39,6 +36,13 @@ pub struct ServeArgs {
     /// Size of the spawned virtual display, e.g. 1600x1200.
     #[arg(long, default_value = "1600x1200")]
     pub spawn: String,
+    /// Command to launch inside the session (run via sh -c).
+    #[arg(long)]
+    pub exec: Option<String>,
+}
+
+#[derive(clap::Args)]
+pub struct NetArgs {
     /// Listen address for the dedicated channel. `auto` = all interfaces when
     /// bootstrapped over ssh (peer-allowlisted), loopback otherwise.
     #[arg(long, default_value = "auto")]
@@ -51,12 +55,35 @@ pub struct ServeArgs {
     /// Host the client connects to (default: SSH client address, else loopback).
     #[arg(long)]
     pub connect: Option<String>,
-    /// Command to launch inside the session (run via sh -c).
-    #[arg(long)]
-    pub exec: Option<String>,
     /// Seconds to wait for a client to connect (0 = forever).
     #[arg(long, default_value_t = 120)]
     pub accept_timeout: u64,
+}
+
+#[derive(clap::Args)]
+pub struct ServeArgs {
+    #[command(flatten)]
+    pub display: DisplayArgs,
+    #[command(flatten)]
+    pub net: NetArgs,
+    /// Print the handshake line as JSON on stdout (used by the ssh bootstrap).
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(clap::Args)]
+pub struct SessionArgs {
+    #[command(flatten)]
+    pub display: DisplayArgs,
+    #[command(flatten)]
+    pub net: NetArgs,
+    /// Session name: the rendezvous socket and `--session` on the client.
+    #[arg(long, default_value = crate::control::DEFAULT_SESSION)]
+    pub name: String,
+    /// End the session after this many seconds without an attached client
+    /// (0 = never).
+    #[arg(long, default_value_t = 0)]
+    pub idle_timeout: u64,
 }
 
 fn parse_size(s: &str) -> Result<(u16, u16)> {
@@ -71,7 +98,7 @@ fn parse_size(s: &str) -> Result<(u16, u16)> {
 /// `SSH_CONNECTION` is `<client ip> <client port> <server ip> <server port>`.
 /// The first field is both the peer we expect on the TLS channel and the
 /// address the server should advertise for it to dial back to.
-fn ssh_client_ip() -> Option<IpAddr> {
+pub(crate) fn ssh_client_ip() -> Option<IpAddr> {
     std::env::var("SSH_CONNECTION")
         .ok()
         .and_then(|s| s.split_whitespace().next().and_then(|ip| ip.parse().ok()))
@@ -125,6 +152,11 @@ type ClipboardQueue = Arc<std::sync::Mutex<mpsc::Receiver<Message>>>;
 ///
 /// Attachments come and go; everything here survives a client leaving.
 struct Owner {
+    name: String,
+    session_id: u64,
+    created: u64,
+    /// The app command line, for `sessions` and the handshake.
+    app_cmd: String,
     display: String,
     session: CaptureSession,
     keymap: Keymap,
@@ -137,12 +169,13 @@ struct Owner {
 }
 
 impl Owner {
-    fn start(args: &ServeArgs) -> Result<Owner> {
+    fn start(display_args: &DisplayArgs, name: &str) -> Result<Owner> {
+        crate::control::validate_name(name)?;
         // --- display -----------------------------------------------------
-        let (display, xvfb): (String, Option<Xvfb>) = match &args.display {
+        let (display, xvfb): (String, Option<Xvfb>) = match &display_args.display {
             Some(d) => (d.clone(), None),
             None => {
-                let (w, h) = parse_size(&args.spawn)?;
+                let (w, h) = parse_size(&display_args.spawn)?;
                 let server = Xvfb::spawn(w, h)
                     .context("spawning a virtual display (install xorg-server-xvfb)")?;
                 (server.display.clone(), Some(server))
@@ -151,7 +184,7 @@ impl Owner {
 
         // --- optional app ------------------------------------------------
         // The app's stdout must never touch ours: stdout is the handshake channel.
-        let app = match &args.exec {
+        let app = match &display_args.exec {
             Some(cmd) => {
                 let mut c = Command::new("sh");
                 c.arg("-c")
@@ -180,7 +213,7 @@ impl Owner {
         let mut session = CaptureSession::connect(
             Some(&display),
             CaptureConfig {
-                root_arrow: args.display.is_none(),
+                root_arrow: display_args.display.is_none(),
                 ..Default::default()
             },
         )?;
@@ -215,6 +248,10 @@ impl Owner {
         };
 
         Ok(Owner {
+            name: name.to_string(),
+            session_id: u64::from_le_bytes(random_token()[..8].try_into().unwrap()),
+            created: now_unix(),
+            app_cmd: display_args.exec.clone().unwrap_or_default(),
             display,
             session,
             keymap,
@@ -227,94 +264,124 @@ impl Owner {
         })
     }
 
-    /// Serve one attachment: identity/tokens, the two TLS channels, resync and
-    /// the capture loop. Returns when the client leaves (or fails); the owner
-    /// and the app stay alive.
-    fn attach_once(&mut self, args: &ServeArgs) -> Result<()> {
-        let Owner {
-            display,
-            session,
-            keymap,
-            geo,
-            screen,
-            clipboard,
-            clipboard_rx,
-            ..
-        } = self;
-        let (screen_w, screen_h) = *screen;
-        let root = session.root();
+    /// Bind the TLS acceptor and build the handshake line for one attachment.
+    fn prepare_attachment(&self, net: &NetArgs, peer: Option<IpAddr>) -> Result<Attachment> {
+        let identity = Identity::generate()?;
+        // One single-use token per role: burning the control token cannot make
+        // the bulk channel replayable, and a stolen token cannot displace either
+        // role.
+        let control_token = random_token();
+        let bulk_token = random_token();
 
-    // --- identity, tokens, listener --------------------------------------
-    let identity = Identity::generate()?;
-    // One single-use token per role: burning the control token cannot make the
-    // bulk channel replayable, and a stolen token cannot displace either role.
-    let control_token = random_token();
-    let bulk_token = random_token();
-    let ssh_client = ssh_client_ip();
+        let listen = match net.listen.as_str() {
+            "auto" => match peer {
+                Some(ip) if ip.is_ipv6() => "[::]:0".to_string(),
+                Some(_) => "0.0.0.0:0".to_string(),
+                None => "127.0.0.1:0".to_string(),
+            },
+            other => other.to_string(),
+        };
+        // Bootstrapped over ssh: only the ssh client may complete a handshake.
+        let allow_peer = if net.allow_any_peer { None } else { peer };
+        let acceptor =
+            ChannelAcceptor::bind(&listen, &identity, control_token, bulk_token, allow_peer)?;
+        let port = acceptor.local_addr()?.port();
 
-    let listen = match args.listen.as_str() {
-        "auto" => match ssh_client {
-            Some(ip) if ip.is_ipv6() => "[::]:0".to_string(),
-            Some(_) => "0.0.0.0:0".to_string(),
-            None => "127.0.0.1:0".to_string(),
-        },
-        other => other.to_string(),
-    };
-    // Bootstrapped over ssh: only the ssh client may complete a handshake.
-    let allow_peer = if args.allow_any_peer { None } else { ssh_client };
-    let acceptor =
-        ChannelAcceptor::bind(&listen, &identity, control_token, bulk_token, allow_peer)?;
-    let port = acceptor.local_addr()?.port();
+        let host = net
+            .connect
+            .clone()
+            .or_else(|| peer.and_then(local_ip_towards).map(|ip| ip.to_string()))
+            .unwrap_or_else(|| "127.0.0.1".to_string());
+        let addr = host_port(&host, port);
 
-    let host = args
-        .connect
-        .clone()
-        .or_else(|| ssh_client.and_then(local_ip_towards).map(|ip| ip.to_string()))
-        .unwrap_or_else(|| "127.0.0.1".to_string());
-    let addr = host_port(&host, port);
-
-    // Not derived from token bytes: session ids end up in logs.
-    let session_id: u64 = u64::from_le_bytes(random_token()[..8].try_into().unwrap());
-
-    // The single handshake line: everything the client needs to authenticate
-    // us (fingerprint) and itself (one token per role), plus where to dial.
-    let line = format!(
-        "{{\"proto\":{},\"build\":\"{}\",\"session\":\"{session_id:016x}\",\
-         \"display\":\"{display}\",\"connect\":\"{addr}\",\
-         \"token_control\":\"{}\",\"token_bulk\":\"{}\",\
-         \"cert_sha256\":\"{}\"}}",
-        xcom_proto::PROTO_VERSION,
-        xcom_proto::BUILD,
-        xcom_transport::hex(&control_token),
-        xcom_transport::hex(&bulk_token),
-        identity.fingerprint(),
-    );
-    if args.json {
-        // Never panic on a broken stdout: that is the bootstrap channel.
-        let mut out = std::io::stdout().lock();
-        writeln!(out, "{line}").context("writing the handshake line")?;
-        out.flush().context("flushing the handshake line")?;
-    } else {
-        logln!("[serve] {line}");
+        // The single handshake line: everything the client needs to authenticate
+        // us (fingerprint) and itself (one token per role), plus where to dial.
+        let session_id = self.session_id;
+        let line = format!(
+            "{{\"ok\":true,\"proto\":{},\"build\":\"{}\",\"session\":\"{session_id:016x}\",\
+             \"session_name\":\"{}\",\"created\":{},\"attached\":true,\
+             \"display\":\"{}\",\"app\":\"{}\",\"connect\":\"{addr}\",\
+             \"token_control\":\"{}\",\"token_bulk\":\"{}\",\
+             \"cert_sha256\":\"{}\"}}",
+            xcom_proto::PROTO_VERSION,
+            xcom_proto::BUILD,
+            self.name,
+            self.created,
+            self.display,
+            crate::control::json_escape(&self.app_cmd),
+            xcom_transport::hex(&control_token),
+            xcom_transport::hex(&bulk_token),
+            identity.fingerprint(),
+        );
+        Ok(Attachment {
+            acceptor,
+            line,
+            addr,
+        })
     }
+}
 
-    let timeout = Duration::from_secs(if args.accept_timeout == 0 {
+/// One prepared client rendezvous: bound TLS acceptor plus wire handshake.
+struct Attachment {
+    acceptor: ChannelAcceptor,
+    line: String,
+    addr: String,
+}
+
+/// How one attachment ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AttachmentEnd {
+    /// The client left, crashed or was disconnected; the session lives on.
+    Detached,
+    /// The remote app exited: the session is over.
+    AppExited,
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Accept the two TLS channels and serve one client until it leaves.
+fn serve_attachment(
+    owner: &mut Owner,
+    att: &Attachment,
+    net: &NetArgs,
+    session_end: &AtomicBool,
+) -> Result<AttachmentEnd> {
+    let Owner {
+        display,
+        session,
+        keymap,
+        geo,
+        screen,
+        clipboard,
+        clipboard_rx,
+        app,
+        ..
+    } = owner;
+    let (screen_w, screen_h) = *screen;
+    let root = session.root();
+
+    let timeout = Duration::from_secs(if net.accept_timeout == 0 {
         u64::MAX / 2
     } else {
-        args.accept_timeout
+        net.accept_timeout
     });
-
     logln!(
-        "[serve] waiting for client on {addr} (display {display}, {screen_w}x{screen_h})"
+        "[serve] waiting for client on {} (display {display}, {screen_w}x{screen_h})",
+        att.addr
     );
-    let mut control = acceptor
+    let mut control = att
+        .acceptor
         .accept(Role::Control, timeout)
         .context("accepting control channel")?;
-    let mut bulk = acceptor
+    let mut bulk = att
+        .acceptor
         .accept(Role::Bulk, timeout)
         .context("accepting bulk channel")?;
-    // Both roles are bound to their tokens; no further connections are needed.
-    drop(acceptor);
     logln!("[serve] client connected");
 
     // Announce the display first: the client caps windows at it. The X pointer
@@ -408,16 +475,29 @@ impl Owner {
         geo,
         &ctrl_thread,
         announced,
+        app,
+        session_end,
     );
 
     shutdown.store(true, Ordering::SeqCst);
     let _ = ctrl_thread.join();
     result
+}
+
+impl Owner {
+    /// True once the app has exited (and been reaped).
+    fn app_exited(&mut self) -> bool {
+        matches!(self.app.as_mut().map(Child::try_wait), Some(Ok(Some(_))))
     }
 
     /// Stop the app and let the display go: session teardown, not detach.
     fn stop_app(&mut self) {
         if let Some(mut app) = self.app.take() {
+            // Already reaped (the session ended because the app exited): do not
+            // signal a pid that may have been reused.
+            if app.try_wait().ok().flatten().is_some() {
+                return;
+            }
             #[cfg(target_os = "linux")]
             {
                 let pid = app.id() as i32;
@@ -444,13 +524,99 @@ impl Owner {
     }
 }
 
-/// Serve a session. Still a single attachment for now; the owner loop and the
-/// control socket arrive in the next commits.
+/// Serve one client over the legacy `xcomd serve` bootstrap.
 pub fn run(args: ServeArgs) -> Result<()> {
-    let mut owner = Owner::start(&args)?;
-    let result = owner.attach_once(&args);
+    let mut owner = Owner::start(&args.display, crate::control::DEFAULT_SESSION)?;
+    let att = owner.prepare_attachment(&args.net, ssh_client_ip())?;
+    if args.json {
+        // Never panic on a broken stdout: that is the bootstrap channel.
+        let mut out = std::io::stdout().lock();
+        writeln!(out, "{}", att.line).context("writing the handshake line")?;
+        out.flush().context("flushing the handshake line")?;
+    } else {
+        logln!("[serve] {}", att.line);
+    }
+    let never = AtomicBool::new(false);
+    let result = serve_attachment(&mut owner, &att, &args.net, &never);
     owner.stop_app();
-    result
+    result.map(|_| ())
+}
+
+/// Run a detached session owner: bind the rendezvous socket, then hand out a
+/// fresh handshake and serve each client that asks for one.
+pub fn run_session(args: SessionArgs) -> Result<()> {
+    crate::control::validate_name(&args.name)?;
+    let mut owner = Owner::start(&args.display, &args.name)?;
+    let info = crate::control::Info {
+        name: args.name.clone(),
+        display: owner.display.clone(),
+        app: args.display.exec.clone().unwrap_or_default(),
+        pid: std::process::id(),
+        created: owner.created,
+        idle_timeout: args.idle_timeout,
+    };
+    let control = crate::control::Control::bind(&args.name, info)?;
+    logln!(
+        "[session] {} ready (display {}, pid {})",
+        args.name,
+        owner.display,
+        std::process::id()
+    );
+
+    let mut idle_since = Instant::now();
+    loop {
+        if control.kill.load(Ordering::SeqCst) {
+            logln!("[session] killed; ending");
+            break;
+        }
+        if owner.app_exited() {
+            logln!("[session] app exited; ending");
+            break;
+        }
+        if args.idle_timeout > 0
+            && idle_since.elapsed() >= Duration::from_secs(args.idle_timeout)
+        {
+            logln!(
+                "[session] no client for {} s; ending",
+                args.idle_timeout
+            );
+            break;
+        }
+        match control
+            .rx
+            .recv_timeout(Duration::from_millis(100))
+        {
+            Ok(crate::control::Command::Attach { peer, reply }) => {
+                let att = match owner.prepare_attachment(&args.net, peer) {
+                    Ok(att) => att,
+                    Err(e) => {
+                        let _ = reply.send(Err(format!("{e:#}")));
+                        continue;
+                    }
+                };
+                // The bootstrap only needs the line; if it is already gone, do
+                // not bother accepting TLS for nobody.
+                if reply.send(Ok(att.line.clone())).is_err() {
+                    control.clear_attached();
+                    continue;
+                }
+                match serve_attachment(&mut owner, &att, &args.net, &control.kill) {
+                    Ok(AttachmentEnd::AppExited) => {
+                        logln!("[session] app exited; ending");
+                        break;
+                    }
+                    Ok(AttachmentEnd::Detached) => {}
+                    Err(e) => logln!("[session] attachment ended with error: {e:#}"),
+                }
+                control.clear_attached();
+                idle_since = Instant::now();
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    owner.stop_app();
+    Ok(())
 }
 
 /// Sets the session shutdown flag on *every* exit path, including early `?`
@@ -853,7 +1019,9 @@ fn serve_loop(
     geo: &GeometryMap,
     ctrl_thread: &std::thread::JoinHandle<()>,
     mut announced: std::collections::HashSet<Window>,
-) -> Result<()> {
+    app: &mut Option<Child>,
+    session_end: &AtomicBool,
+) -> Result<AttachmentEnd> {
     // A window's first full frame can be captured before the app has painted
     // (and a freshly named pixmap may hold recycled memory). Static apps never
     // send damage to correct it, so re-sync any window that produced no damage
@@ -880,15 +1048,27 @@ fn serve_loop(
     let mut last_stats = Instant::now();
 
     loop {
-        if shutdown.load(Ordering::SeqCst) {
-            return Ok(());
+        if shutdown.load(Ordering::SeqCst) || session_end.load(Ordering::SeqCst) {
+            return Ok(AttachmentEnd::Detached);
+        }
+        // The app defines the session's life: an exit ends it, attached or not.
+        if let Some(child) = app.as_mut() {
+            match child.try_wait() {
+                Ok(Some(_)) => {
+                    logln!("[serve] app exited; ending the session");
+                    shutdown.store(true, Ordering::SeqCst);
+                    return Ok(AttachmentEnd::AppExited);
+                }
+                Ok(None) => {}
+                Err(e) => logln!("[serve] app status: {e}"),
+            }
         }
         // The control thread owns input and lifecycle; if it is gone the
-        // session is dead even if the bulk socket still looks writable.
+        // attachment is over even if the bulk socket still looks writable.
         if ctrl_thread.is_finished() {
-            logln!("[serve] control thread exited; ending the session");
+            logln!("[serve] control thread exited; detaching");
             shutdown.store(true, Ordering::SeqCst);
-            return Ok(());
+            return Ok(AttachmentEnd::Detached);
         }
 
         // Full-refresh requests (attach, resizes, client-side repair).
@@ -898,7 +1078,7 @@ fn serve_loop(
                 let payload = frame.encode();
                 if bulk.send(MSG_DAMAGE, &payload).is_err() {
                     shutdown.store(true, Ordering::SeqCst);
-                    return Ok(());
+                    return Ok(AttachmentEnd::Detached);
                 }
             }
             sync.insert(
@@ -927,7 +1107,7 @@ fn serve_loop(
                 let payload = frame.encode();
                 if bulk.send(MSG_DAMAGE, &payload).is_err() {
                     shutdown.store(true, Ordering::SeqCst);
-                    return Ok(());
+                    return Ok(AttachmentEnd::Detached);
                 }
             }
         }
@@ -954,7 +1134,7 @@ fn serve_loop(
                 if bulk.send(MSG_DAMAGE, &payload).is_err() {
                     logln!("[serve] bulk channel closed");
                     shutdown.store(true, Ordering::SeqCst);
-                    return Ok(());
+                    return Ok(AttachmentEnd::Detached);
                 }
                 stats_frames += 1;
                 stats_raw += stats.raw_bytes as u64;
@@ -1047,7 +1227,7 @@ fn serve_loop(
                             let payload = frame.encode();
                             if bulk.send(MSG_DAMAGE, &payload).is_err() {
                                 shutdown.store(true, Ordering::SeqCst);
-                                return Ok(());
+                                return Ok(AttachmentEnd::Detached);
                             }
                         }
                         None => logln!("[serve] mapped: capture_full({win:#x}) returned None"),

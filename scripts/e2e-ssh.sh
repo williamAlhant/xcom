@@ -72,6 +72,12 @@ DISPLAY=${CLIENT_DISPLAY:-:0} XCOM_DEBUG=${XCOM_DEBUG:-0} "$XCOM" connect --ssh 
     ${CLOSE_AFTER:+--close-after "$CLOSE_AFTER"} \
     > "$OUT/client-ssh.log" 2>&1 || true
 
+# The session outlives the client by design; end it before the teardown check.
+# This also exercises the client's `kill` subcommand over ssh.
+"$XCOM" kill --ssh xcom@127.0.0.1 --ssh-args "$SSH_ARGS" --session default \
+    >/dev/null 2>&1 || true
+sleep 1
+
 echo "--- client (app: $APP) ---"
 grep -vE '^\[serve\] (waiting|client)' "$OUT/client-ssh.log" | tail -12
 
@@ -159,14 +165,14 @@ if [ "${CHECK_TEARDOWN:-1}" = 1 ]; then
     echo "--- teardown check ---"
     sleep 1
     # Only the daemon counts: the exec'd app is also named xcomd.
-    LEFT_DAEMON=$(podman exec xcom-testvm sh -c "ps -eo args | grep '^xcomd serve' || true" | tr -d '\r')
+    LEFT_DAEMON=$(podman exec xcom-testvm sh -c "ps -eo args | grep -E '^xcomd (serve|session)' || true" | tr -d '\r')
     LEFT_XVFB=$(podman exec xcom-testvm sh -c "pgrep -x Xvfb || true" | tr -d '\r')
     if [ -n "$LEFT_DAEMON$LEFT_XVFB" ]; then
         echo "check-teardown: FAIL (daemon='$LEFT_DAEMON' xvfb='$LEFT_XVFB' left behind)"
         podman exec xcom-testvm sh -c "ps -o pid,etime,stat,args -p $LEFT_DAEMON 2>/dev/null || true"
         PASS=0
     else
-        echo "check-teardown: OK (daemon and Xvfb exited with the client)"
+        echo "check-teardown: OK (daemon and Xvfb exited with the session)"
     fi
 fi
 
