@@ -483,7 +483,7 @@ fn bootstrap_ssh(
                 cmd.push_str(&format!(" --exec {}", shell_quote(exec)));
             }
         }
-        format!("{dbg}{cmd}")
+        format!("{dbg}{cmd} 2>&1")
     };
     let mut cmd = Command::new("ssh");
     cmd.arg("-o").arg("BatchMode=yes");
@@ -500,64 +500,98 @@ fn bootstrap_ssh(
         .context("spawning ssh (is the OpenSSH client installed?)")?;
     let stdout = child.stdout.take().context("ssh stdout")?;
     let mut lines = BufReader::new(stdout).lines();
-    loop {
-        let line = lines
-            .next()
-            .context("the ssh session ended before the daemon sent its handshake line")?
-            .context("reading handshake line")?;
-        if line.starts_with('{') {
-            let addr = json_field(&line, "connect").context("handshake line: connect")?;
-            let control = hex_decode(
-                &json_field(&line, "token_control").context("handshake line: token_control")?,
-            )?;
-            let bulk = hex_decode(
-                &json_field(&line, "token_bulk").context("handshake line: token_bulk")?,
-            )?;
-            let fingerprint =
-                json_field(&line, "cert_sha256").context("handshake line: cert_sha256")?;
-            // A daemon from another revision can look like a bug (e.g. a
-            // missing feature that exists in this client).
-            match json_field(&line, "build") {
-                Some(remote) if remote != xcom_proto::BUILD => logln!(
-                    "[xcom] warning: remote xcomd build {remote} differs from this client \
-                     ({}); update the remote binary",
-                    xcom_proto::BUILD
-                ),
-                Some(_) => {}
-                None => logln!(
-                    "[xcom] warning: remote xcomd does not report its build (older version); \
-                     update it if something misbehaves"
-                ),
-            }
-            // The JSON is informational, but a version mismatch here means the
-            // remote binary is from a different build: say so plainly instead of
-            // failing later on an unknown message type. (The TLS hello checks it
-            // too; this is the friendlier early error.)
-            match json_number(&line, "proto") {
-                Some(p) if p == xcom_proto::PROTO_VERSION as u64 => {}
-                Some(p) => bail!(
-                    "remote speaks protocol {p}, this client speaks {} (update the other side)",
-                    xcom_proto::PROTO_VERSION
-                ),
-                None => bail!("handshake line: missing proto"),
-            }
-            // Reattaching does not relaunch the app, so say which one is running:
-            // a stale session is the surprising case.
-            if let Some(app) = json_field(&line, "app") {
-                if !app.is_empty() {
-                    logln!("[xcom] session app: {app}");
+    // The remote command's stderr is redirected into this stream (2>&1), so a
+    // handshake failure carries the reason (e.g. "session default is gone") to
+    // the reconnect supervisor instead of being lost on the terminal.
+    let parsed = (|| -> Result<(String, [u8; 32], [u8; 32], String)> {
+        let mut last: Option<String> = None;
+        loop {
+            let line = match lines.next() {
+                Some(Ok(line)) => line,
+                Some(Err(e)) => return Err(e).context("reading handshake line"),
+                None => {
+                    let detail = last
+                        .as_deref()
+                        .map(|l| format!(": {l}"))
+                        .unwrap_or_default();
+                    bail!(
+                        "the ssh session ended before the daemon sent its handshake line{detail}"
+                    );
                 }
+            };
+            if line.starts_with('{') {
+                let addr = json_field(&line, "connect").context("handshake line: connect")?;
+                let control = hex_decode(
+                    &json_field(&line, "token_control")
+                        .context("handshake line: token_control")?,
+                )?;
+                let bulk = hex_decode(
+                    &json_field(&line, "token_bulk").context("handshake line: token_bulk")?,
+                )?;
+                let fingerprint =
+                    json_field(&line, "cert_sha256").context("handshake line: cert_sha256")?;
+                // A daemon from another revision can look like a bug (e.g. a
+                // missing feature that exists in this client).
+                match json_field(&line, "build") {
+                    Some(remote) if remote != xcom_proto::BUILD => logln!(
+                        "[xcom] warning: remote xcomd build {remote} differs from this client \
+                         ({}); update the remote binary",
+                        xcom_proto::BUILD
+                    ),
+                    Some(_) => {}
+                    None => logln!(
+                        "[xcom] warning: remote xcomd does not report its build (older version); \
+                         update it if something misbehaves"
+                    ),
+                }
+                // The JSON is informational, but a version mismatch here means
+                // the remote binary is from a different build: say so plainly
+                // instead of failing later on an unknown message type. (The TLS
+                // hello checks it too; this is the friendlier early error.)
+                match json_number(&line, "proto") {
+                    Some(p) if p == xcom_proto::PROTO_VERSION as u64 => {}
+                    Some(p) => bail!(
+                        "remote speaks protocol {p}, this client speaks {} (update the other side)",
+                        xcom_proto::PROTO_VERSION
+                    ),
+                    None => bail!("handshake line: missing proto"),
+                }
+                // Reattaching does not relaunch the app, so say which one is
+                // running: a stale session is the surprising case.
+                if let Some(app) = json_field(&line, "app") {
+                    if !app.is_empty() {
+                        logln!("[xcom] session app: {app}");
+                    }
+                }
+                return Ok((
+                    addr,
+                    token32(control)?,
+                    token32(bulk)?,
+                    fingerprint,
+                ));
             }
-            return Ok(Handshake {
-                addr,
-                control_token: token32(control)?,
-                bulk_token: token32(bulk)?,
-                fingerprint,
-                ssh: Some(child),
-            });
+            // Anything else is daemon log output; show it and keep the last
+            // line for the failure diagnostic.
+            logln!("[remote] {line}");
+            last = Some(line);
         }
-        // Anything else is daemon log output; show it.
-        logln!("[remote] {line}");
+    })();
+
+    match parsed {
+        Ok((addr, control_token, bulk_token, fingerprint)) => Ok(Handshake {
+            addr,
+            control_token,
+            bulk_token,
+            fingerprint,
+            ssh: Some(child),
+        }),
+        Err(e) => {
+            // Child::drop does not reap: without this, every failed reconnect
+            // leaves an `[ssh] <defunct>` under the long-lived client.
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(e)
+        }
     }
 }
 
@@ -845,6 +879,9 @@ fn permanent_failure(error: &str) -> bool {
         || error.contains("is not running")
         || error.contains("session busy")
         || error.contains("did not return a handshake")
+        || error.contains("did not start")
+        || error.contains("not found")
+        || error.contains("Permission denied")
 }
 
 /// Keep a --ssh session attached: on link loss, re-bootstrap attach-only and
@@ -1134,5 +1171,31 @@ mod tests {
         assert!(parse_spawn("1920x").is_err());
         assert!(parse_spawn("0x1080").is_err());
         assert!(parse_spawn("axb").is_err());
+    }
+
+    #[test]
+    fn reconnect_failure_classes() {
+        use super::permanent_failure;
+        // Remote attach errors that no amount of retrying can fix.
+        assert!(permanent_failure(
+            "the ssh session ended before the daemon sent its handshake line: \
+             Error: session default is gone (No such file or directory (os error 2)); \
+             use --create to start it"
+        ));
+        assert!(permanent_failure("session busy"));
+        assert!(permanent_failure(
+            "the ssh session ended ...: sh: 1: xcomd: not found"
+        ));
+        assert!(permanent_failure("session default did not start"));
+        // Network and ssh failures are transient.
+        assert!(!permanent_failure(
+            "spawning ssh (is the OpenSSH client installed?)"
+        ));
+        assert!(!permanent_failure(
+            "control channel: io: Connection reset by peer (os error 104)"
+        ));
+        assert!(!permanent_failure(
+            "the ssh session ended before the daemon sent its handshake line"
+        ));
     }
 }

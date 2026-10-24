@@ -77,9 +77,38 @@ if [ -f "$OUT/frame.ppm" ]; then
     python3 "$REPO/scripts/check-ppm.py" "$OUT/frame.ppm" "$PPMKIND" || fail "reconnected frame is wrong"
 fi
 
-echo "--- kill ---"
+echo "--- session gone during reattach: clean exit, no retry loop ---"
+DISPLAY=$DISP "$XCOM" connect --ssh xcom@127.0.0.1 --ssh-args "$SSH_ARGS" \
+    --session default --exec "$APP" > "$OUT/client-gone.log" 2>&1 &
+CPID=$!
+for _ in $(seq 1 100); do
+    grep -q 'window .* opened' "$OUT/client-gone.log" 2>/dev/null && break
+    sleep 0.1
+done
 "$XCOM" kill --ssh xcom@127.0.0.1 --ssh-args "$SSH_ARGS" --session default \
     >/dev/null 2>&1 || true
+ALIVE=1
+for _ in $(seq 1 100); do
+    if ! kill -0 "$CPID" 2>/dev/null; then
+        ALIVE=0
+        break
+    fi
+    sleep 0.1
+done
+if [ "$ALIVE" = 1 ]; then
+    fail "client kept retrying after the session was killed"
+    kill "$CPID" 2>/dev/null || true
+fi
+wait "$CPID" 2>/dev/null || true
+CPID=
+grep -q 'session is gone' "$OUT/client-gone.log" \
+    || fail "client did not report the gone session"
+grep -q 'connection lost, keeping' "$OUT/client-gone.log" \
+    || fail "client did not notice the link drop"
+# Every bootstrap ssh is reaped: the old error path left one zombie per retry.
+ZOMBIES=$(ps -eo stat=,args= | awk '$1 ~ /^Z/ && $0 ~ /ssh/ {n++} END {print n+0}')
+[ "$ZOMBIES" -eq 0 ] || fail "$ZOMBIES defunct ssh process(es) left behind"
+
 sleep 1
 LEFT=$($SSH "kill -0 $PID 2>/dev/null && echo app || true; pgrep -x Xvfb || true; ps -eo args | grep '^xcomd session' || true" | tr -d '\r')
 [ -z "$LEFT" ] || fail "left behind: $LEFT"
@@ -88,6 +117,8 @@ $SSH 'xcomd sessions' | grep -q 'no sessions' || fail "session still listed afte
 echo "--- client log (reconnects) ---"
 grep -E 'secure channel|connection lost|reconnecting|reconnected|session is gone' \
     "$OUT/client.log" | tail -15
+echo "--- client-gone log ---"
+tail -5 "$OUT/client-gone.log"
 if [ "$PASS" = 1 ]; then
     echo "=== e2e-reconnect: PASS ==="
 else
