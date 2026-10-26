@@ -11,22 +11,32 @@ set -euo pipefail
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 XCOMD=${XCOMD:-$REPO/target/release/xcomd}
 XCOM=${XCOM:-$REPO/target/release/xcom}
+# shellcheck source=scripts/e2e-lib.sh
+. "$REPO/scripts/e2e-lib.sh"
 SECS=${1:-3}
 SIZE=${SIZE:-800x600}
 OUT=/tmp/opencode/e2e/$$
 mkdir -p "$OUT"   # per-run: parallel runs must not share handshake files
 
-# Xvfb: PATH first, then the user-local install used on this dev box.
+# Xvfb: PATH first, then the user-local install used on this dev box. This is
+# also how the daemon finds Xvfb for the remote display.
 if [ -z "${XCOM_XVFB:-}" ]; then
     XCOM_XVFB=$(command -v Xvfb || echo "$HOME/.local/xvfb/usr/bin/Xvfb")
 fi
 export XCOM_XVFB
 
+e2e_choose_display 0 1600x1000 "$OUT/xvfb.log" || exit 2
+
+cleanup() {
+    kill "${SERVE_PID:-}" 2>/dev/null || true
+    e2e_stop_xvfb
+}
+trap cleanup EXIT
+
 "$XCOMD" serve --json --spawn "$SIZE" --listen 127.0.0.1:0 \
     --exec "$XCOMD m0 anim --mode box --fps 60 --size $SIZE --seconds $((SECS + 8))" \
     > "$OUT/handshake.json" 2> "$OUT/serve.log" &
 SERVE_PID=$!
-trap 'kill "$SERVE_PID" 2>/dev/null || true' EXIT
 
 for _ in $(seq 1 100); do
     [ -s "$OUT/handshake.json" ] && break
@@ -45,7 +55,7 @@ TOKEN_CONTROL=$(sed -n 's/.*"token_control":"\([^"]*\)".*/\1/p' <<< "$LINE")
 TOKEN_BULK=$(sed -n 's/.*"token_bulk":"\([^"]*\)".*/\1/p' <<< "$LINE")
 FP=$(sed -n 's/.*"cert_sha256":"\([^"]*\)".*/\1/p' <<< "$LINE")
 
-DISPLAY=${CLIENT_DISPLAY:-:0} "$XCOM" connect --direct "$ADDR" \
+DISPLAY=$CLIENT_DISPLAY "$XCOM" connect --direct "$ADDR" \
     --token-control "$TOKEN_CONTROL" --token-bulk "$TOKEN_BULK" \
     --fingerprint "$FP" --seconds "$SECS" --dump-ppm "$OUT/frame.ppm" --hud \
     > "$OUT/client.log" 2>&1 || true

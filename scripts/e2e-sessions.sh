@@ -9,9 +9,11 @@ set -euo pipefail
 
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 XCOM=${XCOM:-$REPO/target/release/xcom}
+# shellcheck source=scripts/e2e-lib.sh
+. "$REPO/scripts/e2e-lib.sh"
 KEY=/tmp/opencode/e2e/id_ed25519
 OUT=/tmp/opencode/e2e/sessions-$$
-DISP=${PERSIST_DISPLAY:-:98}
+CLIENT_DISPLAY=${PERSIST_DISPLAY:-${CLIENT_DISPLAY:-}}
 mkdir -p "$OUT"
 
 SSH_ARGS="-p 2222 -i $KEY -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
@@ -20,8 +22,6 @@ APP='echo $$ > /tmp/sessions.pid; exec xterm -T sessions-test -e sleep 600'
 APP2='echo $$ > /tmp/idle.pid; exec xterm -T idle-test -e sleep 60'
 
 PASS=1
-STARTED_XVFB=0
-XPID=
 CPID=
 fail() {
     echo "check: FAIL - $*"
@@ -30,8 +30,8 @@ fail() {
 cleanup() {
     set +e
     [ -n "$CPID" ] && kill "$CPID" 2>/dev/null
-    [ "$STARTED_XVFB" = 1 ] && [ -n "$XPID" ] && kill "$XPID" 2>/dev/null
     ${SSH:-true} 'xcomd kill --session e2e; xcomd kill --session idle' >/dev/null 2>&1
+    e2e_stop_xvfb
 }
 trap cleanup EXIT
 
@@ -49,14 +49,8 @@ wait_window() {
 $SSH 'xcomd kill --session e2e; xcomd kill --session idle' >/dev/null 2>&1 || true
 $SSH 'rm -f /tmp/sessions.pid /tmp/idle.pid' >/dev/null 2>&1 || true
 
-if [ ! -S "/tmp/.X11-unix/X${DISP#:}" ]; then
-    XVFB=${XCOM_XVFB:-$(command -v Xvfb || echo "$HOME/.local/xvfb/usr/bin/Xvfb")}
-    "$XVFB" "$DISP" -screen 0 1024x768x24 -nolisten tcp +extension XTEST \
-        > "$OUT/xvfb.log" 2>&1 &
-    XPID=$!
-    STARTED_XVFB=1
-    sleep 1
-fi
+e2e_choose_display 0 1024x768 "$OUT/xvfb.log" || exit 2
+DISP=$E2E_DISPLAY
 
 echo "--- create + list + permissions ---"
 DISPLAY=$DISP "$XCOM" connect --ssh xcom@127.0.0.1 \

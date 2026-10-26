@@ -8,14 +8,15 @@
 set -euo pipefail
 
 REPO=$(cd "$(dirname "$0")/.." && pwd)
+# shellcheck source=scripts/e2e-lib.sh
+. "$REPO/scripts/e2e-lib.sh"
 SECS=${1:-20}
-DISP=${CLIP_DISPLAY:-:98}
+CLIENT_DISPLAY=${CLIP_DISPLAY:-${CLIENT_DISPLAY:-}}
 XCOM=${XCOM:-$REPO/target/release/xcom}
 X11I=$REPO/target/debug/examples/x11_input
 OUT=/tmp/opencode/e2e/clip-$$
 mkdir -p "$OUT"
 
-STARTED_XVFB=0
 cleanup() {
     set +e
     podman exec xcom-testvm pkill -x gtk3-widget-factory 2>/dev/null
@@ -24,7 +25,7 @@ cleanup() {
     [ -n "${DPID:-}" ] && kill "$DPID" 2>/dev/null
     [ -n "${RPID:-}" ] && kill "$RPID" 2>/dev/null
     [ -n "${LPID:-}" ] && kill "$LPID" 2>/dev/null
-    if [ "$STARTED_XVFB" = 1 ] && [ -n "${XPID:-}" ]; then kill "$XPID" 2>/dev/null; fi
+    e2e_stop_xvfb
 }
 trap cleanup EXIT
 
@@ -33,14 +34,8 @@ cargo build -q -p xcom-x11 --example x11_input
 "$REPO/scripts/testvm.sh" up >/dev/null
 podman cp "$X11I" xcom-testvm:/usr/local/bin/x11_input
 
-if ! DISPLAY=$DISP "$X11I" pointer >/dev/null 2>&1; then
-    XVFB=${XCOM_XVFB:-$(command -v Xvfb || echo "$HOME/.local/xvfb/usr/bin/Xvfb")}
-    "$XVFB" "$DISP" -screen 0 1920x1080x24 -nolisten tcp +extension XTEST \
-        > "$OUT/xvfb.log" 2>&1 &
-    XPID=$!
-    STARTED_XVFB=1
-    sleep 1
-fi
+e2e_choose_display 0 1920x1080 "$OUT/xvfb.log" || exit 2
+DISP=$E2E_DISPLAY
 
 echo "== start daemon + client =="
 podman exec -e XCOM_DEBUG=1 xcom-testvm xcomd serve --json --listen 127.0.0.1:0 \

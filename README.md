@@ -99,10 +99,13 @@ support.
 Tests: `cargo test --workspace`, plus `scripts/e2e-direct.sh`,
 `scripts/e2e-ssh.sh`, `scripts/e2e-persist.sh`, `scripts/e2e-reconnect.sh`,
 `scripts/e2e-sessions.sh` and `scripts/e2e-clipboard.sh` (short end-to-end
-runs). `scripts/e2e-kitty.sh` is an opt-in, fast idle check: it runs OpenGL
-kitty in the test VM with forced cursor blinking and fails if post-startup
-frames still contain full-window damage rects. `--interactive` opens the same
-session on the desktop for manual browsing instead of asserting.
+runs). The e2e clients run on a private Xvfb unless `CLIENT_DISPLAY` is set;
+`CLIENT_DISPLAY=:0` shows the window on the desktop while the script still
+runs its checks. `scripts/e2e-kitty.sh` is an opt-in, fast idle check: it runs
+OpenGL kitty in the test VM with forced cursor blinking and fails if
+post-startup frames still contain full-window damage rects. `--interactive`
+opens the same session on the desktop for manual browsing instead of
+asserting.
 
 The client warns when the remote daemon reports a different build id: a stale
 `xcomd` silently behaves like an old version, which is easy to mistake for a

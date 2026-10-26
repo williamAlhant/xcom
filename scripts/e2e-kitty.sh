@@ -41,6 +41,8 @@ set -euo pipefail
 
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 XCOM=${XCOM:-$REPO/target/release/xcom}
+# shellcheck source=scripts/e2e-lib.sh
+. "$REPO/scripts/e2e-lib.sh"
 INTERACTIVE=${INTERACTIVE:-0}
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -70,7 +72,6 @@ mkdir -p "$OUT"   # per-run: parallel runs must not share logs or sessions
 SSH_ARGS="-p 2222 -i $KEY -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
 CONFIG=/tmp/xcom-kitty-clean-$$
 RUNTIME=/tmp/xcom-kitty-runtime-$$
-XVFB_PID=""
 
 cleanup() {
     kill "${CLIENT_PID:-}" 2>/dev/null || true
@@ -80,10 +81,7 @@ cleanup() {
         podman exec xcom-testvm sh -c "rm -rf '$CONFIG' '$RUNTIME'" \
             >/dev/null 2>&1 || true
     fi
-    if [ -n "$XVFB_PID" ]; then
-        kill "$XVFB_PID" 2>/dev/null || true
-        wait "$XVFB_PID" 2>/dev/null || true
-    fi
+    e2e_stop_xvfb
 }
 trap cleanup EXIT
 
@@ -93,47 +91,11 @@ if [ ! -x "$XCOM" ]; then
     exit 2
 fi
 
-# Automated runs must not receive desktop input: a click or key makes kitty
-# redraw and swamps the idle blink. Start our own display unless the caller
-# explicitly selected one (for watching an automated run on the desktop).
-start_private_xvfb() {
-    local xvfb display
-    xvfb=${XCOM_XVFB:-$(command -v Xvfb || echo "$HOME/.local/xvfb/usr/bin/Xvfb")}
-    if [ ! -x "$xvfb" ]; then
-        echo "error: Xvfb not found; set XCOM_XVFB to its path" >&2
-        exit 2
-    fi
-    for display in $(seq 99 109); do
-        [ -e "/tmp/.X11-unix/X$display" ] && continue
-        "$xvfb" ":$display" -screen 0 1600x1000x24 -nolisten tcp \
-            > "$OUT/xvfb.log" 2>&1 &
-        XVFB_PID=$!
-        for _ in $(seq 1 40); do
-            [ -S "/tmp/.X11-unix/X$display" ] && break
-            kill -0 "$XVFB_PID" 2>/dev/null || break
-            sleep 0.05
-        done
-        if [ -S "/tmp/.X11-unix/X$display" ]; then
-            sleep 0.1   # X server finished its post-socket setup
-            CLIENT_DISPLAY=":$display"
-            return 0
-        fi
-        kill "$XVFB_PID" 2>/dev/null || true
-        wait "$XVFB_PID" 2>/dev/null || true
-        XVFB_PID=""
-    done
-    echo "error: could not start a private Xvfb (tried :99-:109)" >&2
-    exit 2
-}
-
 SETUP0=$(date +%s%N)
-if [ "$INTERACTIVE" = 1 ]; then
-    CLIENT_DISPLAY=${CLIENT_DISPLAY:-:0}
-else
-    if [ -z "${CLIENT_DISPLAY:-}" ]; then
-        start_private_xvfb
-    fi
-fi
+# Automated runs must not receive desktop input: a click or key makes kitty
+# redraw and swamps the idle blink. The shared helper starts a private display
+# in that case and uses CLIENT_DISPLAY (default :0) for interactive runs.
+e2e_choose_display "$INTERACTIVE" 1600x1000 "$OUT/xvfb.log" || exit 2
 
 if [ "${SKIP_TESTVM_UP:-0}" != 1 ]; then
     "$REPO/scripts/testvm.sh" up

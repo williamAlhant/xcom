@@ -24,6 +24,8 @@ set -euo pipefail
 
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 XCOM=${XCOM:-$REPO/target/release/xcom}
+# shellcheck source=scripts/e2e-lib.sh
+. "$REPO/scripts/e2e-lib.sh"
 SECS=${1:-3}
 APP=${APP:-"xterm -geometry 60x20"}
 TYPE_TEXT=${TYPE_TEXT:-}
@@ -31,6 +33,12 @@ TYPE_DELAY=${TYPE_DELAY:-1}   # keep well inside the session
 KEY=/tmp/opencode/e2e/id_ed25519
 OUT=/tmp/opencode/e2e/$$
 mkdir -p "$OUT"   # per-run: parallel runs must not share handshake files
+
+e2e_choose_display 0 1600x1000 "$OUT/xvfb.log" || exit 2
+cleanup() {
+    e2e_stop_xvfb
+}
+trap cleanup EXIT
 
 # CHECK_KEYS=1: the anim logs received keysyms, so typed text can be verified
 # at the application end rather than just at the transport.
@@ -66,7 +74,7 @@ if [ -n "${DUMP_AFTER:-}" ] && [ "${DUMP_AFTER}" != 0 ]; then
     RESIZE_ARGS="$RESIZE_ARGS --dump-after $DUMP_AFTER"
 fi
 
-DISPLAY=${CLIENT_DISPLAY:-:0} XCOM_DEBUG=${XCOM_DEBUG:-0} "$XCOM" connect --ssh xcom@127.0.0.1 \
+DISPLAY=$CLIENT_DISPLAY XCOM_DEBUG=${XCOM_DEBUG:-0} "$XCOM" connect --ssh xcom@127.0.0.1 \
     --ssh-args "$SSH_ARGS" --replace --exec "$APP" \
     --seconds "$SECS" --dump-ppm "$OUT/frame-ssh.ppm" $TYPE_ARGS $RESIZE_ARGS \
     ${CLOSE_AFTER:+--close-after "$CLOSE_AFTER"} \

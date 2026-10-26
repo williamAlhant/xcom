@@ -12,10 +12,12 @@ set -euo pipefail
 
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 XCOM=${XCOM:-$REPO/target/release/xcom}
+# shellcheck source=scripts/e2e-lib.sh
+. "$REPO/scripts/e2e-lib.sh"
 SECS=${1:-4}
 KEY=/tmp/opencode/e2e/id_ed25519
 OUT=/tmp/opencode/e2e/persist-$$
-DISP=${PERSIST_DISPLAY:-:98}
+CLIENT_DISPLAY=${PERSIST_DISPLAY:-${CLIENT_DISPLAY:-}}
 X11I=$REPO/target/debug/examples/x11_input
 mkdir -p "$OUT"
 
@@ -24,9 +26,7 @@ SSH="ssh $SSH_ARGS xcom@127.0.0.1"
 APP='echo $$ > /tmp/persist.pid; exec xterm -T persist-test -e sleep 600'
 
 PASS=1
-STARTED_XVFB=0
 CPID=
-XPID=
 fail() {
     echo "check: FAIL - $*"
     PASS=0
@@ -34,8 +34,8 @@ fail() {
 cleanup() {
     set +e
     [ -n "$CPID" ] && kill "$CPID" 2>/dev/null
-    [ "$STARTED_XVFB" = 1 ] && [ -n "$XPID" ] && kill "$XPID" 2>/dev/null
     ${SSH:-true} 'xcomd kill --session persist' >/dev/null 2>&1
+    e2e_stop_xvfb
 }
 trap cleanup EXIT
 
@@ -45,15 +45,9 @@ podman cp "$X11I" xcom-testvm:/usr/local/bin/x11_input
 $SSH 'xcomd kill --session persist' >/dev/null 2>&1 || true
 $SSH 'rm -f /tmp/persist.pid' >/dev/null 2>&1 || true
 
-# A private display for the clients; reuse one only if it already exists.
-if ! DISPLAY=$DISP "$X11I" pointer >/dev/null 2>&1; then
-    XVFB=${XCOM_XVFB:-$(command -v Xvfb || echo "$HOME/.local/xvfb/usr/bin/Xvfb")}
-    "$XVFB" "$DISP" -screen 0 1280x1024x24 -nolisten tcp +extension XTEST \
-        > "$OUT/xvfb.log" 2>&1 &
-    XPID=$!
-    STARTED_XVFB=1
-    sleep 1
-fi
+# A private display for the clients; PERSIST_DISPLAY/CLIENT_DISPLAY override.
+e2e_choose_display 0 1280x1024 "$OUT/xvfb.log" || exit 2
+DISP=$E2E_DISPLAY
 
 client() {
     local log=$1

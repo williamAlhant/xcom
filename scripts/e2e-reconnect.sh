@@ -10,10 +10,12 @@ set -euo pipefail
 
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 XCOM=${XCOM:-$REPO/target/release/xcom}
+# shellcheck source=scripts/e2e-lib.sh
+. "$REPO/scripts/e2e-lib.sh"
 SECS=${1:-10}
 KEY=/tmp/opencode/e2e/id_ed25519
 OUT=/tmp/opencode/e2e/reconnect-$$
-DISP=${PERSIST_DISPLAY:-:98}
+CLIENT_DISPLAY=${PERSIST_DISPLAY:-${CLIENT_DISPLAY:-}}
 X11I=$REPO/target/debug/examples/x11_input
 mkdir -p "$OUT"
 
@@ -22,16 +24,14 @@ SSH="ssh $SSH_ARGS xcom@127.0.0.1"
 APP='echo $$ > /tmp/reconnect.pid; exec xterm -T reconnect-test -e sleep 600'
 
 PASS=1
-STARTED_XVFB=0
-XPID=
 fail() {
     echo "check: FAIL - $*"
     PASS=0
 }
 cleanup() {
     set +e
-    [ "$STARTED_XVFB" = 1 ] && [ -n "$XPID" ] && kill "$XPID" 2>/dev/null
     ${SSH:-true} 'xcomd kill --session default' >/dev/null 2>&1
+    e2e_stop_xvfb
 }
 trap cleanup EXIT
 
@@ -40,14 +40,8 @@ cargo build -q -p xcom-x11 --example x11_input
 $SSH 'xcomd kill --session default' >/dev/null 2>&1 || true
 $SSH 'rm -f /tmp/reconnect.pid' >/dev/null 2>&1 || true
 
-if ! DISPLAY=$DISP "$X11I" pointer >/dev/null 2>&1; then
-    XVFB=${XCOM_XVFB:-$(command -v Xvfb || echo "$HOME/.local/xvfb/usr/bin/Xvfb")}
-    "$XVFB" "$DISP" -screen 0 1280x1024x24 -nolisten tcp +extension XTEST \
-        > "$OUT/xvfb.log" 2>&1 &
-    XPID=$!
-    STARTED_XVFB=1
-    sleep 1
-fi
+e2e_choose_display 0 1280x1024 "$OUT/xvfb.log" || exit 2
+DISP=$E2E_DISPLAY
 
 echo "--- client (drops every 3 s, exits after ${SECS}s) ---"
 DISPLAY=$DISP "$XCOM" connect --ssh xcom@127.0.0.1 --ssh-args "$SSH_ARGS" \
