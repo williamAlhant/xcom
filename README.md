@@ -28,7 +28,8 @@ below are the ones known today.
   override-redirect popups), injects input with XTEST, and streams
   damage-driven rectangles compressed with LZ4.
 - **Client** — applies the pixel stream to native windows (winit + softbuffer),
-  forwards keyboard/mouse, and mirrors the remote pointer shape.
+  forwards keyboard/mouse (Alt+Tab and Super/Win+Tab stay with the local
+  desktop), and mirrors the remote pointer shape.
 - **Session** — the remote owner keeps Xvfb, the app and capture state alive
   across connections. Each client is an *attachment*; reattaching by name
   resyncs windows, frames, cursor and clipboard. The app defines the session's
@@ -123,6 +124,10 @@ client bug.
   single-use tokens only arrive over ssh.
 - **SSH is bootstrap-only.** After authentication the client reaches the
   daemon's advertised address directly; there is no `ssh -L` fallback yet.
+- **Alt+Tab and Super/Win+Tab are local.** The client never forwards Tab while
+  Alt or Super is held, because Windows delivers the Tab to the focused window
+  before it performs the switch; forwarding it typed a stray Tab in the remote
+  app. Plain Tab, Ctrl+Tab and Shift+Tab still reach the application.
 - **Clipboard is text only**, capped at 60 KB, and mirrored in the background
   (CLIPBOARD only; no PRIMARY/middle-click). Disable with
   `--no-clipboard-sync`, since mirroring lets the remote read your local

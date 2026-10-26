@@ -289,6 +289,18 @@ impl KeyState {
         let alt_super = mods.alt_key() || mods.super_key() || held_any(ALT) || held_any(SUPER);
         let ctrl_alt = ctrl || alt_super;
 
+        // Alt+Tab, Super/Win+Tab and their Shift/Ctrl variants belong to the
+        // local desktop's window switcher. Windows delivers the Tab to the
+        // focused window before it performs the switch, so forwarding it would
+        // type a Tab in the remote app. Ctrl+Tab and Shift+Tab stay remote
+        // input.
+        if is_window_switch(logical, physical, alt_super) {
+            if xcom_proto::debug_keys() {
+                logln!("[ui] Tab with Alt/Super held is a local window switch; not forwarded");
+            }
+            return KeyAction::None;
+        }
+
         // Local shortcut (never forwarded).
         if is_hud_toggle(logical, physical, ctrl, shift, alt_super) {
             return KeyAction::ToggleHud;
@@ -374,6 +386,20 @@ pub fn is_hud_toggle(
 fn is_shortcut(physical: &PhysicalKey, logical: &Key, code: KeyCode, ch: &str) -> bool {
     matches!(physical, PhysicalKey::Code(c) if *c == code)
         || matches!(logical, Key::Character(c) if c.eq_ignore_ascii_case(ch))
+}
+
+/// True for the Tab key, by physical code or logical name: layouts and Wine
+/// report one or the other reliably.
+fn is_tab(physical: &PhysicalKey, logical: &Key) -> bool {
+    matches!(physical, PhysicalKey::Code(KeyCode::Tab))
+        || matches!(logical, Key::Named(NamedKey::Tab))
+}
+
+/// True when Tab is part of the local desktop's window-switcher gesture
+/// (Alt+Tab, Super/Win+Tab, and their Shift/Ctrl variants) rather than input
+/// for the remote app.
+pub fn is_window_switch(logical: &Key, physical: &PhysicalKey, alt_super: bool) -> bool {
+    alt_super && is_tab(physical, logical)
 }
 
 #[cfg(test)]
@@ -486,6 +512,111 @@ mod tests {
         assert_eq!(
             ks.on_key(&code(KeyCode::KeyA), &ch("a"), Some("a"), true, true, ModifiersState::empty()),
             KeyAction::None
+        );
+    }
+
+    #[test]
+    fn tab_is_recognized_by_name_or_physical_code() {
+        assert!(is_tab(&code(KeyCode::Tab), &Key::Named(NamedKey::Tab)));
+        assert!(is_tab(&code(KeyCode::KeyQ), &Key::Named(NamedKey::Tab)));
+        assert!(is_tab(&code(KeyCode::Tab), &Key::Named(NamedKey::F17)));
+        assert!(!is_tab(&code(KeyCode::KeyQ), &ch("q")));
+        assert!(is_window_switch(
+            &Key::Named(NamedKey::Tab),
+            &code(KeyCode::Tab),
+            true
+        ));
+        assert!(!is_window_switch(
+            &Key::Named(NamedKey::Tab),
+            &code(KeyCode::Tab),
+            false
+        ));
+        assert!(!is_window_switch(&ch("m"), &code(KeyCode::KeyM), true));
+    }
+
+    #[test]
+    fn window_switch_tab_is_not_forwarded() {
+        let mut ks = KeyState::new();
+        let phys = code(KeyCode::Tab);
+        let tab = Key::Named(NamedKey::Tab);
+        for mods in [
+            ModifiersState::ALT,
+            ModifiersState::SUPER,
+            ModifiersState::ALT | ModifiersState::SHIFT,
+            ModifiersState::CONTROL | ModifiersState::ALT,
+        ] {
+            assert_eq!(
+                ks.on_key(&phys, &tab, Some("\t"), true, false, mods),
+                KeyAction::None,
+                "Tab with {mods:?} must stay local"
+            );
+            assert_eq!(
+                ks.on_key(&phys, &tab, None, false, false, mods),
+                KeyAction::None,
+                "the release after a filtered press sends nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn tab_is_local_when_alt_is_held_through_the_keysym_map() {
+        // Wine may report the held modifier only through the keysym map.
+        let mut ks = KeyState::new();
+        assert_eq!(
+            ks.on_key(
+                &code(KeyCode::AltLeft),
+                &Key::Named(NamedKey::Alt),
+                None,
+                true,
+                false,
+                ModifiersState::empty()
+            ),
+            KeyAction::Press(XK_ALT_L)
+        );
+        assert_eq!(
+            ks.on_key(
+                &code(KeyCode::Tab),
+                &Key::Named(NamedKey::Tab),
+                Some("\t"),
+                true,
+                false,
+                ModifiersState::empty()
+            ),
+            KeyAction::None
+        );
+    }
+
+    #[test]
+    fn plain_ctrl_and_shift_tab_are_forwarded() {
+        let mut ks = KeyState::new();
+        let phys = code(KeyCode::Tab);
+        let tab = Key::Named(NamedKey::Tab);
+        assert_eq!(
+            ks.on_key(&phys, &tab, None, true, false, ModifiersState::CONTROL),
+            KeyAction::Press(XK_TAB)
+        );
+        assert_eq!(
+            ks.on_key(&phys, &tab, None, false, false, ModifiersState::CONTROL),
+            KeyAction::Release(XK_TAB)
+        );
+        assert_eq!(
+            ks.on_key(&phys, &tab, Some("\t"), true, false, ModifiersState::SHIFT),
+            KeyAction::Press(XK_TAB)
+        );
+        assert_eq!(
+            ks.on_key(&phys, &tab, None, false, false, ModifiersState::SHIFT),
+            KeyAction::Release(XK_TAB)
+        );
+        assert_eq!(
+            ks.on_key(
+                &phys,
+                &tab,
+                Some("\t"),
+                true,
+                false,
+                ModifiersState::empty()
+            ),
+            KeyAction::Press(XK_TAB)
         );
     }
 

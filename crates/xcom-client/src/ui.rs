@@ -1482,7 +1482,16 @@ impl ApplicationHandler<UserEvent> for App {
                 // The close dialog is modal: keys drive it locally and never
                 // reach the remote app.
                 if self.dialog.is_some() {
-                    if event.state == ElementState::Pressed && !event.repeat {
+                    // Alt+Tab belongs to the local desktop even while the
+                    // dialog is modal: switching away must not also move the
+                    // dialog's focus. (The key never reaches the remote app
+                    // here because the dialog branch returns below.)
+                    let window_switch = crate::keys::is_window_switch(
+                        &event.logical_key,
+                        &event.physical_key,
+                        self.mods.alt_key() || self.mods.super_key(),
+                    );
+                    if event.state == ElementState::Pressed && !event.repeat && !window_switch {
                         use winit::keyboard::{Key, NamedKey};
                         let window = self.dialog.as_ref().map(|d| d.window).unwrap_or(remote);
                         match event.logical_key {
