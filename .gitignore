@@ -4,3 +4,6 @@
 *.swp
 *.kate-swp
 *~
+
+# Local machine/user notes (see AGENTS.md)
+/AGENTS.local.md

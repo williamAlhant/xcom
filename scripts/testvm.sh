@@ -79,7 +79,9 @@ up() {
     # Build only when the image inputs changed. Podman would reuse layers, but
     # it still commits a new image (and a new created timestamp) on every
     # invocation; a label lets us skip the build entirely and keeps the image
-    # date meaningful. Bump the v1 prefix if the build context format changes.
+    # date meaningful. Do not pin timestamps with --source-date-epoch: it
+    # produces 1970-dated images and defeats the cache. Bump the v1 prefix if
+    # the build context format changes.
     local image_state image_label build_log
     image_state="v1:$(cat "$BUILDCTX/Dockerfile" "$BUILDCTX/authorized_keys" | sha256sum | cut -d' ' -f1)"
     image_label=$(podman image inspect -f '{{index .Config.Labels "xcom.build-state"}}' "$NAME" 2>/dev/null || true)
