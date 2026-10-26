@@ -26,6 +26,24 @@ scripts/e2e-kitty.sh          # fast idle full-window-frame check
 `target/release/xcomd`); build them if missing. CI does not run the e2e
 scripts; they are local checks.
 
+## Releasing
+
+```sh
+scripts/release.sh patch|minor|major|X.Y.Z   # clean main: bump, commit, annotated tag
+scripts/release.sh patch --dry-run
+scripts/release.sh patch --verify            # also run scripts/ci.sh first
+```
+
+The script updates `Cargo.toml` and `Cargo.lock`, commits `Bump version to
+X.Y.Z`, and creates the annotated tag `vX.Y.Z`. It never pushes. Review, then:
+
+```sh
+git push origin main
+git push origin vX.Y.Z
+```
+
+The release workflow is triggered by the tag.
+
 ## Repository map
 
 - `crates/xcom-proto` — wire messages, framing, build id, logging.
