@@ -9,6 +9,7 @@ description = "X11 display lifecycle, window capture and input injection for xco
 anyhow = { workspace = true }
 getrandom = "0.3"
 libc = { workspace = true }
+twox-hash = { version = "2.1", default-features = false, features = ["xxhash64", "std"] }
 x11rb = { workspace = true }
 xcom-codec = { path = "../xcom-codec" }
 xcom-proto = { path = "../xcom-proto" }

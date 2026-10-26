@@ -41,6 +41,8 @@ use xcom_codec::{coalesce, Compressor, Rect};
 use xcom_proto::{now_ns, DamageFrame, WireRect};
 use xcom_proto::logln;
 
+use crate::frame_diff::TileGrid;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DamageMode {
     Raw,
@@ -120,6 +122,8 @@ struct WinState {
     pending: Vec<Rect>,
     need_fetch: bool,
     t_first_event_ns: u64,
+    /// Hashes of the pixels last sent for large damage frames.
+    tiles: TileGrid,
 }
 
 struct Shm {
@@ -333,6 +337,7 @@ impl CaptureSession {
                 pending: Vec::new(),
                 need_fetch: false,
                 t_first_event_ns: 0,
+                tiles: TileGrid::new(geom.width, geom.height),
             },
         );
         self.conn.flush()?;
@@ -359,7 +364,32 @@ impl CaptureSession {
         let full = Rect::new(0, 0, state.w, state.h);
         let t = now_ns();
         let (frame, stats) = self.capture_frame(win, vec![full], t)?;
+        // The full-window pixels are still at SHM offset 0: seed the tile
+        // hashes so the next large damage frame can diff against them. A
+        // failed read leaves stale bytes there, so do not trust them.
+        if !frame.rects.is_empty() {
+            self.refresh_tiles_from_shm(win)?;
+        }
         Ok(Some((frame, stats)))
+    }
+
+    /// Refresh the tile hashes from the full-window pixels currently in SHM.
+    fn refresh_tiles_from_shm(&mut self, win: Window) -> Result<()> {
+        let Some((w, h)) = self.windows.get(&win).map(|s| (s.w, s.h)) else {
+            return Ok(());
+        };
+        let len = w as usize * h as usize * 4;
+        if self.shm.len < len {
+            // capture_frame always grows first; never seed from a fresh
+            // zeroed segment if that invariant is ever broken.
+            return Ok(());
+        }
+        let map = self.shm.map;
+        let raw = unsafe { std::slice::from_raw_parts(map, len) };
+        if let Some(state) = self.windows.get_mut(&win) {
+            state.tiles.update_full(raw);
+        }
+        Ok(())
     }
 
     /// Wait for the next display event (bounded by `deadline`, if any).
@@ -482,6 +512,11 @@ impl CaptureSession {
                 match remapped {
                     // Already tracked: the window was hidden, announce it again.
                     Some(true) => {
+                        // Pixels may have changed while hidden; the full frame
+                        // sent for the remap will repopulate the hashes.
+                        if let Some(state) = self.windows.get_mut(&e.window) {
+                            state.tiles = TileGrid::new(state.w, state.h);
+                        }
                         // The named backing pixmap can be invalidated while the
                         // window is unmapped; re-name it before the client
                         // asks for a full frame.
@@ -617,7 +652,30 @@ impl CaptureSession {
         if rects.is_empty() {
             return Ok(());
         }
+
+        // A full-window damage report (common with OpenGL swaps) is worth
+        // diffing; small damage is cheaper to send as-is.
+        let damage_area: usize = rects.iter().map(|r| r.area()).sum();
+        if damage_area * 4 >= w as usize * h as usize {
+            if let Some((frame, stats)) = self.capture_large(win, &rects, t_event_ns)? {
+                self.queue.push_back(PumpEvent::Frame {
+                    window: win,
+                    frame,
+                    stats,
+                });
+            }
+            return Ok(());
+        }
+
         let (frame, stats) = self.capture_frame(win, rects, t_event_ns)?;
+        // The small path did not diff. Mark its tiles unknown so the next large
+        // frame reads them and refreshes the hashes instead of trusting stale
+        // ones.
+        if let Some(state) = self.windows.get_mut(&win) {
+            for r in &frame.rects {
+                state.tiles.mark_unknown_rect(Rect::new(r.x, r.y, r.w, r.h));
+            }
+        }
         self.queue.push_back(PumpEvent::Frame {
             window: win,
             frame,
@@ -670,6 +728,7 @@ impl CaptureSession {
             state.pixmap = pixmap;
             state.w = w;
             state.h = h;
+            state.tiles = TileGrid::new(w, h);
         }
         self.ensure_shm(w as usize * h as usize * 4)?;
         self.conn.flush()?;
@@ -697,6 +756,82 @@ impl CaptureSession {
         }
         self.conn.flush()?;
         Ok(())
+    }
+
+    /// Large-damage path: read the whole window, hash/diff its tiles, and
+    /// return only the changed rects. Returns `None` when nothing changed.
+    fn capture_large(
+        &mut self,
+        win: Window,
+        rects: &[Rect],
+        t_event_ns: u64,
+    ) -> Result<Option<(DamageFrame, FrameStats)>> {
+        let Some((w, h, pixmap)) = self.windows.get(&win).map(|s| (s.w, s.h, s.pixmap)) else {
+            return Ok(None);
+        };
+        let len = w as usize * h as usize * 4;
+        self.ensure_shm(len)?;
+        let cookie = self.conn.shm_get_image(
+            pixmap,
+            0,
+            0,
+            w,
+            h,
+            !0u32,
+            2, // ZPixmap
+            self.shm.seg,
+            0,
+        )?;
+        match cookie.reply() {
+            Ok(_) => {}
+            Err(ReplyError::X11Error(x)) if x.error_kind == ErrorKind::Drawable => {
+                // The window vanished between damage and readback.
+                if let Some(state) = self.windows.get_mut(&win) {
+                    state.tiles = TileGrid::new(state.w, state.h);
+                }
+                return self
+                    .capture_frame(win, rects.to_vec(), t_event_ns)
+                    .map(Some);
+            }
+            Err(e) => {
+                logln!("capture: full-window read for {win:#x} failed: {e}");
+                if let Some(state) = self.windows.get_mut(&win) {
+                    state.tiles = TileGrid::new(state.w, state.h);
+                }
+                return self
+                    .capture_frame(win, rects.to_vec(), t_event_ns)
+                    .map(Some);
+            }
+        }
+
+        let changed = {
+            let map = self.shm.map;
+            let raw = unsafe { std::slice::from_raw_parts(map, len) };
+            let Some(state) = self.windows.get_mut(&win) else {
+                return Ok(None);
+            };
+            state.tiles.diff(raw, false)
+        };
+        if changed.is_empty() {
+            return Ok(None);
+        }
+
+        let total = self
+            .windows
+            .get(&win)
+            .map(|s| s.tiles.tile_count())
+            .unwrap_or(1);
+        let send = if changed.len() * 4 >= total * 3 {
+            // A real full-window change (animation/scroll): one rect is
+            // cheaper than describing many tiles.
+            vec![Rect::new(0, 0, w, h)]
+        } else {
+            let mut send = changed;
+            coalesce(&mut send, self.cfg.max_rects);
+            send
+        };
+        let (frame, stats) = self.capture_frame(win, send, t_event_ns)?;
+        Ok(Some((frame, stats)))
     }
 
     fn capture_frame(

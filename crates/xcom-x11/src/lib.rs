@@ -5,6 +5,7 @@
 
 pub mod capture;
 pub mod clipboard;
+pub mod frame_diff;
 pub mod input;
 pub mod keymap;
 pub mod windows;
