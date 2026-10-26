@@ -13,14 +13,11 @@ XCOM=${XCOM:-$REPO/target/release/xcom}
 # shellcheck source=scripts/e2e-lib.sh
 . "$REPO/scripts/e2e-lib.sh"
 SECS=${1:-10}
-KEY=/tmp/opencode/e2e/id_ed25519
 OUT=/tmp/opencode/e2e/reconnect-$$
 CLIENT_DISPLAY=${PERSIST_DISPLAY:-${CLIENT_DISPLAY:-}}
 X11I=$REPO/target/debug/examples/x11_input
 mkdir -p "$OUT"
 
-SSH_ARGS="-p 2222 -i $KEY -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
-SSH="ssh $SSH_ARGS xcom@127.0.0.1"
 APP='echo $$ > /tmp/reconnect.pid; exec xterm -T reconnect-test -e sleep 600'
 
 PASS=1
@@ -30,21 +27,20 @@ fail() {
 }
 cleanup() {
     set +e
-    ${SSH:-true} 'xcomd kill --session default' >/dev/null 2>&1
+    e2e_ssh 'xcomd kill --session default' >/dev/null 2>&1
     e2e_stop_xvfb
 }
 trap cleanup EXIT
 
-"$REPO/scripts/testvm.sh" up >/dev/null
-cargo build -q -p xcom-x11 --example x11_input
-$SSH 'xcomd kill --session default' >/dev/null 2>&1 || true
-$SSH 'rm -f /tmp/reconnect.pid' >/dev/null 2>&1 || true
+e2e_prepare_x11_input
+e2e_ssh 'xcomd kill --session default' >/dev/null 2>&1 || true
+e2e_ssh 'rm -f /tmp/reconnect.pid' >/dev/null 2>&1 || true
 
 e2e_choose_display 0 1280x1024 "$OUT/xvfb.log" || exit 2
 DISP=$E2E_DISPLAY
 
 echo "--- client (drops every 3 s, exits after ${SECS}s) ---"
-DISPLAY=$DISP "$XCOM" connect --ssh xcom@127.0.0.1 --ssh-args "$SSH_ARGS" \
+DISPLAY=$DISP "$XCOM" connect --ssh xcom@127.0.0.1 --ssh-args "$E2E_SSH_ARGS" \
     --session default --exec "$APP" --drop-after 3 --seconds "$SECS" \
     --dump-ppm "$OUT/frame.ppm" > "$OUT/client.log" 2>&1 || true
 
@@ -59,10 +55,10 @@ grep -q 'connection lost, keeping' "$OUT/client.log" || fail "no frozen-window b
 grep -q 'reconnected; waiting for the window resync' "$OUT/client.log" \
     || fail "no resync notice"
 
-PID=$($SSH 'cat /tmp/reconnect.pid 2>/dev/null' | tr -d '\r' || true)
+PID=$(e2e_ssh 'cat /tmp/reconnect.pid 2>/dev/null' | tr -d '\r' || true)
 [ -n "$PID" ] || fail "app did not record its pid"
-$SSH "kill -0 $PID" 2>/dev/null || fail "app $PID died across reconnects"
-LIST=$($SSH 'xcomd sessions' | tr -d '\r')
+e2e_ssh "kill -0 $PID" 2>/dev/null || fail "app $PID died across reconnects"
+LIST=$(e2e_ssh 'xcomd sessions' | tr -d '\r')
 echo "$LIST"
 grep -q 'detached' <<< "$LIST" || fail "session not detached after the client exited"
 
@@ -72,18 +68,18 @@ if [ -f "$OUT/frame.ppm" ]; then
 fi
 
 echo "--- session gone during reattach: clean exit, no retry loop ---"
-DISPLAY=$DISP "$XCOM" connect --ssh xcom@127.0.0.1 --ssh-args "$SSH_ARGS" \
+DISPLAY=$DISP "$XCOM" connect --ssh xcom@127.0.0.1 --ssh-args "$E2E_SSH_ARGS" \
     --session default --exec "$APP" > "$OUT/client-gone.log" 2>&1 &
 CPID=$!
 for _ in $(seq 1 100); do
     grep -q 'window .* opened' "$OUT/client-gone.log" 2>/dev/null && break
     sleep 0.1
 done
-OWNER=$($SSH 'xcomd sessions' | awk '{print $5}' | tr -d '\r')
+OWNER=$(e2e_ssh 'xcomd sessions' | awk '{print $5}' | tr -d '\r')
 [ -n "$OWNER" ] || fail "session owner pid missing"
 # SIGKILL sends no SessionEnded: the client must notice the crash, retry once
 # (attach-only) and classify the missing session as permanent.
-$SSH "kill -9 $OWNER" 2>/dev/null || fail "could not kill the owner"
+e2e_ssh "kill -9 $OWNER" 2>/dev/null || fail "could not kill the owner"
 ALIVE=1
 for _ in $(seq 1 100); do
     if ! kill -0 "$CPID" 2>/dev/null; then
@@ -96,7 +92,7 @@ if [ "$ALIVE" = 1 ]; then
     fail "client kept retrying after the session was killed"
     kill "$CPID" 2>/dev/null || true
 fi
-wait "$CPID" 2>/dev/null || true
+e2e_wait_pid "$CPID" 5 "gone-session client" || true
 CPID=
 grep -q 'session is gone' "$OUT/client-gone.log" \
     || fail "client did not report the gone session"
@@ -107,9 +103,9 @@ ZOMBIES=$(ps -eo stat=,args= | awk '$1 ~ /^Z/ && $0 ~ /ssh/ {n++} END {print n+0
 [ "$ZOMBIES" -eq 0 ] || fail "$ZOMBIES defunct ssh process(es) left behind"
 
 sleep 1
-LEFT=$($SSH "kill -0 $PID 2>/dev/null && echo app || true; pgrep -x Xvfb || true; ps -eo args | grep '^xcomd session' || true" | tr -d '\r')
+LEFT=$(e2e_ssh "kill -0 $PID 2>/dev/null && echo app || true; pgrep -x Xvfb || true; ps -eo args | grep '^xcomd session' || true" | tr -d '\r')
 [ -z "$LEFT" ] || fail "left behind: $LEFT"
-$SSH 'xcomd sessions' | grep -q 'no sessions' || fail "session still listed after kill"
+e2e_ssh 'xcomd sessions' | grep -q 'no sessions' || fail "session still listed after kill"
 
 echo "--- client log (reconnects) ---"
 grep -E 'secure channel|connection lost|reconnecting|reconnected|session is gone' \

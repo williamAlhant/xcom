@@ -14,6 +14,48 @@
 # The private display is picked from :99 upwards and readiness is the X socket,
 # not a fixed sleep.
 
+E2E_REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+E2E_KEY=${E2E_KEY:-/tmp/opencode/e2e/id_ed25519}
+E2E_SSH_ARGS="-p 2222 -i $E2E_KEY -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+
+# Run a command in the test VM over ssh.
+e2e_ssh() {
+    ssh -p 2222 -i "$E2E_KEY" -o StrictHostKeyChecking=no \
+        -o UserKnownHostsFile=/dev/null xcom@127.0.0.1 "$@"
+}
+
+# Ensure the test VM is current and running.
+e2e_ensure_testvm() {
+    "$E2E_REPO/scripts/testvm.sh" up
+}
+
+# Build the XTEST helper and install it in the test VM.
+e2e_prepare_x11_input() {
+    e2e_ensure_testvm >/dev/null
+    (cd "$E2E_REPO" && cargo build -q -p xcom-x11 --example x11_input)
+    podman cp "$E2E_REPO/target/debug/examples/x11_input" \
+        xcom-testvm:/usr/local/bin/x11_input
+}
+
+# Wait for a pid with a bound, so a missed dialog/click fails the test instead
+# of hanging it. Kills and reaps the process on timeout.
+e2e_wait_pid() {
+    local pid=$1
+    local timeout=$2
+    local label=${3:-process}
+    local deadline=$((SECONDS + timeout))
+    while kill -0 "$pid" 2>/dev/null; do
+        if [ "$SECONDS" -ge "$deadline" ]; then
+            echo "error: $label still running after ${timeout}s" >&2
+            kill "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+            return 1
+        fi
+        sleep 0.1
+    done
+    wait "$pid" 2>/dev/null || true
+}
+
 # Find Xvfb without assuming it is on PATH (the dev box has it under
 # ~/.local/xvfb). XCOM_XVFB overrides the lookup.
 e2e_find_xvfb() {

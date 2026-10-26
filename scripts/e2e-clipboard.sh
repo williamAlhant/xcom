@@ -30,9 +30,7 @@ cleanup() {
 trap cleanup EXIT
 
 echo "== build helper and test VM =="
-cargo build -q -p xcom-x11 --example x11_input
-"$REPO/scripts/testvm.sh" up >/dev/null
-podman cp "$X11I" xcom-testvm:/usr/local/bin/x11_input
+e2e_prepare_x11_input
 
 e2e_choose_display 0 1920x1080 "$OUT/xvfb.log" || exit 2
 DISP=$E2E_DISPLAY

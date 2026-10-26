@@ -65,18 +65,16 @@ KITTY_OPTS=${KITTY_OPTS:-"-o cursor_blink_interval=0.5 -o cursor_stop_blinking_a
 EXPECT_FRAMES=${EXPECT_FRAMES:-1}
 KEEP_SESSION=${KEEP_SESSION:-0}
 NAME="kitty-idle-$$"
-KEY=/tmp/opencode/e2e/id_ed25519
 OUT=/tmp/opencode/e2e-kitty/$$
 mkdir -p "$OUT"   # per-run: parallel runs must not share logs or sessions
 
-SSH_ARGS="-p 2222 -i $KEY -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
 CONFIG=/tmp/xcom-kitty-clean-$$
 RUNTIME=/tmp/xcom-kitty-runtime-$$
 
 cleanup() {
     kill "${CLIENT_PID:-}" 2>/dev/null || true
     if [ "$KEEP_SESSION" != 1 ]; then
-        "$XCOM" kill --ssh xcom@127.0.0.1 --ssh-args "$SSH_ARGS" --session "$NAME" \
+        "$XCOM" kill --ssh xcom@127.0.0.1 --ssh-args "$E2E_SSH_ARGS" --session "$NAME" \
             >/dev/null 2>&1 || true
         podman exec xcom-testvm sh -c "rm -rf '$CONFIG' '$RUNTIME'" \
             >/dev/null 2>&1 || true
@@ -98,7 +96,7 @@ SETUP0=$(date +%s%N)
 e2e_choose_display "$INTERACTIVE" 1600x1000 "$OUT/xvfb.log" || exit 2
 
 if [ "${SKIP_TESTVM_UP:-0}" != 1 ]; then
-    "$REPO/scripts/testvm.sh" up
+    e2e_ensure_testvm
 fi
 TEST0=$(date +%s%N)
 
@@ -122,7 +120,7 @@ APP="env -u WAYLAND_DISPLAY LIBGL_ALWAYS_SOFTWARE=1 \
 
 run_client() {
     DISPLAY="$CLIENT_DISPLAY" "$XCOM" connect --ssh xcom@127.0.0.1 \
-        --ssh-args "$SSH_ARGS" --session "$NAME" --replace --spawn "$SPAWN" \
+        --ssh-args "$E2E_SSH_ARGS" --session "$NAME" --replace --spawn "$SPAWN" \
         --exec "$APP" --seconds "$SECS" --no-clipboard-sync "$@"
 }
 
@@ -132,7 +130,7 @@ if [ "$INTERACTIVE" = 1 ]; then
     run_client
     if [ "$KEEP_SESSION" = 1 ]; then
         echo "session $NAME left running; stop it with:"
-        echo "  $XCOM kill --ssh xcom@127.0.0.1 --ssh-args \"$SSH_ARGS\" --session $NAME"
+        echo "  $XCOM kill --ssh xcom@127.0.0.1 --ssh-args \"$E2E_SSH_ARGS\" --session $NAME"
     fi
     exit 0
 fi

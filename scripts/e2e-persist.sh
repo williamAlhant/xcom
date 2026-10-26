@@ -15,14 +15,11 @@ XCOM=${XCOM:-$REPO/target/release/xcom}
 # shellcheck source=scripts/e2e-lib.sh
 . "$REPO/scripts/e2e-lib.sh"
 SECS=${1:-4}
-KEY=/tmp/opencode/e2e/id_ed25519
 OUT=/tmp/opencode/e2e/persist-$$
 CLIENT_DISPLAY=${PERSIST_DISPLAY:-${CLIENT_DISPLAY:-}}
 X11I=$REPO/target/debug/examples/x11_input
 mkdir -p "$OUT"
 
-SSH_ARGS="-p 2222 -i $KEY -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
-SSH="ssh $SSH_ARGS xcom@127.0.0.1"
 APP='echo $$ > /tmp/persist.pid; exec xterm -T persist-test -e sleep 600'
 
 PASS=1
@@ -34,16 +31,14 @@ fail() {
 cleanup() {
     set +e
     [ -n "$CPID" ] && kill "$CPID" 2>/dev/null
-    ${SSH:-true} 'xcomd kill --session persist' >/dev/null 2>&1
+    e2e_ssh 'xcomd kill --session persist' >/dev/null 2>&1
     e2e_stop_xvfb
 }
 trap cleanup EXIT
 
-"$REPO/scripts/testvm.sh" up >/dev/null
-cargo build -q -p xcom-x11 --example x11_input
-podman cp "$X11I" xcom-testvm:/usr/local/bin/x11_input
-$SSH 'xcomd kill --session persist' >/dev/null 2>&1 || true
-$SSH 'rm -f /tmp/persist.pid' >/dev/null 2>&1 || true
+e2e_prepare_x11_input
+e2e_ssh 'xcomd kill --session persist' >/dev/null 2>&1 || true
+e2e_ssh 'rm -f /tmp/persist.pid' >/dev/null 2>&1 || true
 
 # A private display for the clients; PERSIST_DISPLAY/CLIENT_DISPLAY override.
 e2e_choose_display 0 1280x1024 "$OUT/xvfb.log" || exit 2
@@ -53,7 +48,7 @@ client() {
     local log=$1
     shift
     DISPLAY=$DISP "$XCOM" connect --ssh xcom@127.0.0.1 \
-        --ssh-args "$SSH_ARGS" --session persist --exec "$APP" "$@" \
+        --ssh-args "$E2E_SSH_ARGS" --session persist --exec "$APP" "$@" \
         > "$log" 2>&1 || true
 }
 
@@ -62,29 +57,29 @@ client "$OUT/client1.log" --seconds "$SECS" --dump-ppm "$OUT/first.ppm"
 grep -qE '[1-9][0-9]* frames blitted' "$OUT/client1.log" || fail "first client got no frames"
 grep -q 'window .* opened' "$OUT/client1.log" || fail "first client opened no window"
 
-PID1=$($SSH 'cat /tmp/persist.pid' 2>/dev/null | tr -d '\r' || true)
+PID1=$(e2e_ssh 'cat /tmp/persist.pid' 2>/dev/null | tr -d '\r' || true)
 [ -n "$PID1" ] || fail "app did not record its pid"
 sleep 1
-LIST1=$($SSH 'xcomd sessions' | tr -d '\r')
+LIST1=$(e2e_ssh 'xcomd sessions' | tr -d '\r')
 echo "$LIST1"
 grep -q 'persist' <<< "$LIST1" || fail "session missing after detach"
 grep -q 'detached' <<< "$LIST1" || fail "session still marked attached after the client left"
 D1=$(awk '{print $3}' <<< "$LIST1")
-$SSH "kill -0 $PID1" 2>/dev/null || fail "app $PID1 died with the client"
+e2e_ssh "kill -0 $PID1" 2>/dev/null || fail "app $PID1 died with the client"
 
 echo "--- second attach (same session) ---"
 client "$OUT/client2.log" --seconds "$SECS" --dump-ppm "$OUT/second.ppm"
 grep -qE '[1-9][0-9]* frames blitted' "$OUT/client2.log" || fail "reattached client got no frames"
 grep -q 'session app:' "$OUT/client2.log" || fail "reattach did not report the running app"
-PID2=$($SSH 'cat /tmp/persist.pid' 2>/dev/null | tr -d '\r' || true)
-LIST2=$($SSH 'xcomd sessions' | tr -d '\r')
+PID2=$(e2e_ssh 'cat /tmp/persist.pid' 2>/dev/null | tr -d '\r' || true)
+LIST2=$(e2e_ssh 'xcomd sessions' | tr -d '\r')
 D2=$(awk '{print $3}' <<< "$LIST2")
 [ "$PID1" = "$PID2" ] || fail "app restarted on reattach ($PID1 -> $PID2)"
 [ "$D1" = "$D2" ] || fail "display changed on reattach ($D1 -> $D2)"
 
 echo "--- last-window dialog: disconnect ---"
 DISPLAY=$DISP "$XCOM" connect --ssh xcom@127.0.0.1 \
-    --ssh-args "$SSH_ARGS" --session persist --exec "$APP" \
+    --ssh-args "$E2E_SSH_ARGS" --session persist --exec "$APP" \
     > "$OUT/client3.log" 2>&1 &
 CPID=$!
 for _ in $(seq 1 100); do
@@ -107,17 +102,18 @@ for _ in 1 2 3; do
     DISPLAY=$DISP "$X11I" keys 36 || true
     sleep 0.3
 done
-wait "$CPID" || true
+e2e_wait_pid "$CPID" 10 "disconnect dialog" \
+    || fail "client did not exit after the disconnect dialog"
 CPID=
 grep -q 'close dialog: disconnect' "$OUT/client3.log" || fail "dialog did not disconnect"
 sleep 1
-LIST3=$($SSH 'xcomd sessions' | tr -d '\r')
+LIST3=$(e2e_ssh 'xcomd sessions' | tr -d '\r')
 grep -q 'detached' <<< "$LIST3" || fail "session did not stay up after the dialog disconnect"
-$SSH "kill -0 $PID1" 2>/dev/null || fail "app died after the dialog disconnect"
+e2e_ssh "kill -0 $PID1" 2>/dev/null || fail "app died after the dialog disconnect"
 
 echo "--- held key released when the client dies ---"
 DISPLAY=$DISP "$XCOM" connect --ssh xcom@127.0.0.1 \
-    --ssh-args "$SSH_ARGS" --session persist --exec "$APP" \
+    --ssh-args "$E2E_SSH_ARGS" --session persist --exec "$APP" \
     > "$OUT/client4.log" 2>&1 &
 CPID=$!
 for _ in $(seq 1 100); do
@@ -129,10 +125,10 @@ sleep 0.3
 DISPLAY=$DISP "$X11I" down 38 # physical 'A'
 sleep 0.4
 kill -9 "$CPID" 2>/dev/null || true
-wait "$CPID" 2>/dev/null || true
+e2e_wait_pid "$CPID" 5 "killed client" || fail "killed client did not exit"
 CPID=
 sleep 1
-RDISP=$($SSH 'xcomd sessions' | awk '{print $3}' | tr -d '\r')
+RDISP=$(e2e_ssh 'xcomd sessions' | awk '{print $3}' | tr -d '\r')
 if podman exec xcom-testvm sh -c \
     "A=\$(ls -t /tmp/xcom-xauth-* 2>/dev/null | head -1); DISPLAY=$RDISP XAUTHORITY=\$A /usr/local/bin/x11_input keystate 38"; then
     echo "check-keyrelease: OK (detach released the held key)"
@@ -142,7 +138,7 @@ fi
 
 echo "--- last-window dialog: close the app ---"
 DISPLAY=$DISP "$XCOM" connect --ssh xcom@127.0.0.1 \
-    --ssh-args "$SSH_ARGS" --session persist --exec "$APP" \
+    --ssh-args "$E2E_SSH_ARGS" --session persist --exec "$APP" \
     > "$OUT/client5.log" 2>&1 &
 CPID=$!
 for _ in $(seq 1 100); do
@@ -165,11 +161,8 @@ REST=${GEOM#*+}
 WY=${REST%%+*}
 DISPLAY=$DISP "$X11I" clickat $((WX + 91)) $((WY + 199)) \
     || fail "could not click the dialog button"
-for _ in $(seq 1 100); do
-    kill -0 "$CPID" 2>/dev/null || break
-    sleep 0.1
-done
-wait "$CPID" 2>/dev/null || true
+e2e_wait_pid "$CPID" 15 "close-window dialog" \
+    || fail "client did not exit after choosing Close"
 CPID=
 grep -q 'close dialog: closing the window' "$OUT/client5.log" \
     || fail "dialog did not choose Close"
@@ -184,9 +177,9 @@ fi
 
 echo "--- teardown ---"
 sleep 1
-LEFT=$($SSH "kill -0 $PID1 2>/dev/null && echo app || true; pgrep -x Xvfb || true; ps -eo args | grep '^xcomd session' || true" | tr -d '\r')
+LEFT=$(e2e_ssh "kill -0 $PID1 2>/dev/null && echo app || true; pgrep -x Xvfb || true; ps -eo args | grep '^xcomd session' || true" | tr -d '\r')
 [ -z "$LEFT" ] || fail "left behind after closing the app: $LEFT"
-$SSH 'xcomd sessions' | grep -q 'no sessions' || fail "session still listed after the app closed"
+e2e_ssh 'xcomd sessions' | grep -q 'no sessions' || fail "session still listed after the app closed"
 
 echo "--- client 1 ---"; tail -4 "$OUT/client1.log"
 echo "--- client 2 ---"; tail -4 "$OUT/client2.log"

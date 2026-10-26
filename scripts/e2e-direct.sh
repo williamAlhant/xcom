@@ -18,10 +18,13 @@ SIZE=${SIZE:-800x600}
 OUT=/tmp/opencode/e2e/$$
 mkdir -p "$OUT"   # per-run: parallel runs must not share handshake files
 
-# Xvfb: PATH first, then the user-local install used on this dev box. This is
-# also how the daemon finds Xvfb for the remote display.
+# Also how the daemon finds Xvfb for the remote display.
 if [ -z "${XCOM_XVFB:-}" ]; then
-    XCOM_XVFB=$(command -v Xvfb || echo "$HOME/.local/xvfb/usr/bin/Xvfb")
+    XCOM_XVFB=$(e2e_find_xvfb || true)
+fi
+if [ -z "$XCOM_XVFB" ]; then
+    echo "error: Xvfb not found; set XCOM_XVFB to its path" >&2
+    exit 2
 fi
 export XCOM_XVFB
 
