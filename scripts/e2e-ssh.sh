@@ -67,7 +67,7 @@ if [ -n "${DUMP_AFTER:-}" ] && [ "${DUMP_AFTER}" != 0 ]; then
 fi
 
 DISPLAY=${CLIENT_DISPLAY:-:0} XCOM_DEBUG=${XCOM_DEBUG:-0} "$XCOM" connect --ssh xcom@127.0.0.1 \
-    --ssh-args "$SSH_ARGS" --exec "$APP" \
+    --ssh-args "$SSH_ARGS" --replace --exec "$APP" \
     --seconds "$SECS" --dump-ppm "$OUT/frame-ssh.ppm" $TYPE_ARGS $RESIZE_ARGS \
     ${CLOSE_AFTER:+--close-after "$CLOSE_AFTER"} \
     > "$OUT/client-ssh.log" 2>&1 || true

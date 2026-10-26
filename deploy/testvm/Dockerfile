@@ -11,10 +11,14 @@ FROM debian:bookworm-slim
 # X11 apps (xterm, shells) need a UTF-8 locale to convert non-ASCII keysyms.
 ENV LANG=C.UTF-8
 
+# kitty is an OpenGL terminal kept for damage/full-window-frame tests (it
+# blinks its cursor by default). Xvfb has no GPU, so Mesa's llvmpipe provides
+# the GL context; mesa-utils' glxinfo makes a startup failure diagnosable.
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         openssh-server \
         xauth xvfb xfonts-base fonts-dejavu-core \
         x11-apps xterm gtk-3-examples \
+        kitty libgl1-mesa-dri mesa-utils \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /run/sshd \
     && ssh-keygen -A
