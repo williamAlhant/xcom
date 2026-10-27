@@ -133,7 +133,10 @@ client bug.
 - **Alt+Tab and Super/Win+Tab are local.** The client never forwards Tab while
   Alt or Super is held, because Windows delivers the Tab to the focused window
   before it performs the switch; forwarding it typed a stray Tab in the remote
-  app. Plain Tab, Ctrl+Tab and Shift+Tab still reach the application.
+  app. Keys that winit synthesizes for keys already held when a window gains
+  focus are dropped unless they are modifiers, so the Tab that lands the
+  switch on the way back in does not leak either. Plain Tab, Ctrl+Tab and
+  Shift+Tab still reach the application.
 - **Clipboard is text only**, capped at 60 KB, and mirrored in the background
   (CLIPBOARD only; no PRIMARY/middle-click). Disable with
   `--no-clipboard-sync`, since mirroring lets the remote read your local

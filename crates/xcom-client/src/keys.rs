@@ -402,6 +402,55 @@ pub fn is_window_switch(logical: &Key, physical: &PhysicalKey, alt_super: bool) 
     alt_super && is_tab(physical, logical)
 }
 
+/// True for a press winit synthesized for a key that was already down when the
+/// window gained focus.
+///
+/// Winit synthesizes presses for every held key on focus gain (X11 and
+/// Windows), before `Focused(true)` and, on Windows, *before* the modifier
+/// presses. Such a key was pressed while another window had focus: after
+/// Alt+Tab it is the Tab that landed the switch, which therefore arrives with
+/// no Alt in the modifier state and slips past `is_window_switch`. Modifiers
+/// are kept, because losing OS focus released them remotely and the remote
+/// needs their state re-sent.
+pub fn is_stale_focus_press(
+    logical: &Key,
+    physical: &PhysicalKey,
+    pressed: bool,
+    synthetic: bool,
+) -> bool {
+    synthetic && pressed && !is_modifier(logical, physical)
+}
+
+/// Modifier keys, by logical name or physical code: layouts and Wine report
+/// one or the other reliably.
+fn is_modifier(logical: &Key, physical: &PhysicalKey) -> bool {
+    matches!(
+        logical,
+        Key::Named(
+            NamedKey::Shift
+                | NamedKey::Control
+                | NamedKey::Alt
+                | NamedKey::AltGraph
+                | NamedKey::Super
+                | NamedKey::Meta
+                | NamedKey::Hyper
+                | NamedKey::Symbol
+        )
+    ) || matches!(
+        physical,
+        PhysicalKey::Code(
+            KeyCode::ShiftLeft
+                | KeyCode::ShiftRight
+                | KeyCode::ControlLeft
+                | KeyCode::ControlRight
+                | KeyCode::AltLeft
+                | KeyCode::AltRight
+                | KeyCode::SuperLeft
+                | KeyCode::SuperRight
+        )
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -584,6 +633,60 @@ mod tests {
             ),
             KeyAction::None
         );
+    }
+
+    #[test]
+    fn focus_gain_presses_keep_modifiers_and_drop_other_held_keys() {
+        // Winit synthesizes a press for every key already down when a window
+        // gains focus. Only modifiers must reach the remote (focus loss
+        // released them there); the rest were pressed elsewhere.
+        for logical in [
+            Key::Named(NamedKey::Tab),
+            Key::Named(NamedKey::CapsLock),
+            Key::Named(NamedKey::NumLock),
+            ch("a"),
+        ] {
+            assert!(is_stale_focus_press(
+                &logical,
+                &code(KeyCode::KeyA),
+                true,
+                true
+            ));
+        }
+        for (logical, physical) in [
+            (Key::Named(NamedKey::Shift), code(KeyCode::ShiftLeft)),
+            (Key::Named(NamedKey::Control), code(KeyCode::ControlLeft)),
+            (Key::Named(NamedKey::Alt), code(KeyCode::AltLeft)),
+            (Key::Named(NamedKey::Super), code(KeyCode::SuperLeft)),
+        ] {
+            assert!(!is_stale_focus_press(&logical, &physical, true, true));
+        }
+        // Wine may report a bogus logical key for the held key.
+        assert!(is_stale_focus_press(
+            &Key::Named(NamedKey::F17),
+            &code(KeyCode::Tab),
+            true,
+            true
+        ));
+        assert!(!is_stale_focus_press(
+            &Key::Named(NamedKey::F17),
+            &code(KeyCode::ShiftLeft),
+            true,
+            true
+        ));
+        // Releases and real presses are unaffected.
+        assert!(!is_stale_focus_press(
+            &Key::Named(NamedKey::Tab),
+            &code(KeyCode::Tab),
+            false,
+            true
+        ));
+        assert!(!is_stale_focus_press(
+            &Key::Named(NamedKey::Tab),
+            &code(KeyCode::Tab),
+            true,
+            false
+        ));
     }
 
     #[test]

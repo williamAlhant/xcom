@@ -1478,7 +1478,34 @@ impl ApplicationHandler<UserEvent> for App {
                 // remote pointer happens to be over.
                 self.send(Message::Focus { window: remote });
             }
-            WindowEvent::KeyboardInput { event, .. } => {
+            WindowEvent::KeyboardInput {
+                event,
+                is_synthetic,
+                ..
+            } => {
+                // Winit synthesizes presses for the keys already held when a
+                // window gains focus, before `Focused(true)` and (on Windows)
+                // before the modifier presses. Such a key was pressed while
+                // another window had focus: after Alt+Tab into this window it
+                // is the Tab that landed the switch, arriving without Alt in
+                // `self.mods` or the held map, so the Alt+Tab filter below
+                // cannot see it. Modifiers are still forwarded: losing OS
+                // focus released them remotely.
+                if crate::keys::is_stale_focus_press(
+                    &event.logical_key,
+                    &event.physical_key,
+                    event.state == ElementState::Pressed,
+                    is_synthetic,
+                ) {
+                    if xcom_proto::debug_keys() {
+                        logln!(
+                            "[ui] ignoring focus-gain key {:?}/{:?}; held before focus",
+                            event.logical_key,
+                            event.physical_key
+                        );
+                    }
+                    return;
+                }
                 // The close dialog is modal: keys drive it locally and never
                 // reach the remote app.
                 if self.dialog.is_some() {
