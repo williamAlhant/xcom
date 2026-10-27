@@ -2370,7 +2370,7 @@ checksum = "ea6fc2961e4ef194dcbfe56bb845534d0dc8098940c7e5c012a258bfec6701bd"
 
 [[package]]
 name = "xcom-client"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "arboard",
@@ -2388,14 +2388,14 @@ dependencies = [
 
 [[package]]
 name = "xcom-codec"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "lz4_flex",
 ]
 
 [[package]]
 name = "xcom-proto"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "libc",
  "serde",
@@ -2404,7 +2404,7 @@ dependencies = [
 
 [[package]]
 name = "xcom-server"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -2420,7 +2420,7 @@ dependencies = [
 
 [[package]]
 name = "xcom-transport"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "getrandom 0.3.4",
  "rcgen",
@@ -2433,7 +2433,7 @@ dependencies = [
 
 [[package]]
 name = "xcom-x11"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "getrandom 0.3.4",
