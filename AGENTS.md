@@ -20,6 +20,7 @@ scripts/testvm.sh down
 scripts/e2e-direct.sh 3
 scripts/e2e-ssh.sh 3
 scripts/e2e-kitty.sh          # fast idle full-window-frame check
+scripts/e2e-overlap.sh        # overlapping windows: input reaches the clicked one
 ```
 
 `scripts/ci.sh` and `e2e-direct` use release binaries (`target/release/xcom`,

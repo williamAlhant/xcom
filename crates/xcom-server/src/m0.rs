@@ -85,6 +85,9 @@ pub struct AnimArgs {
     /// Window size, e.g. 800x600.
     #[arg(long, default_value = "800x600")]
     pub size: String,
+    /// Window title (several anims in one session need distinct names).
+    #[arg(long, default_value = "xcom-m0-anim")]
+    pub title: String,
     #[arg(long, default_value_t = 60)]
     pub fps: u64,
     /// Damage pattern: a small moving box, or a full-window repaint.
@@ -132,6 +135,8 @@ fn anim(args: AnimArgs) -> Result<()> {
             .background_pixel(screen.black_pixel)
             .event_mask(
                 EventMask::KEY_PRESS
+                    | EventMask::BUTTON_PRESS
+                    | EventMask::BUTTON_RELEASE
                     | EventMask::STRUCTURE_NOTIFY
                     | EventMask::EXPOSURE,
             ),
@@ -142,8 +147,8 @@ fn anim(args: AnimArgs) -> Result<()> {
         AtomEnum::WM_NAME,
         AtomEnum::STRING,
         8u8,
-        12u32,
-        b"xcom-m0-anim",
+        args.title.len() as u32,
+        args.title.as_bytes(),
     )?;
     conn.map_window(win)?;
 
@@ -290,6 +295,32 @@ fn handle_anim_event(
                     log,
                     "recv sym={sym:#x} code={} state={mods:#x} t_ns={}",
                     e.detail,
+                    now_ns()
+                )?;
+                log.flush()?;
+            }
+        }
+        Event::ButtonPress(e) => {
+            if let Some(log) = log.as_mut() {
+                writeln!(
+                    log,
+                    "recv button={} pressed=true x={} y={} t_ns={}",
+                    e.detail,
+                    e.event_x,
+                    e.event_y,
+                    now_ns()
+                )?;
+                log.flush()?;
+            }
+        }
+        Event::ButtonRelease(e) => {
+            if let Some(log) = log.as_mut() {
+                writeln!(
+                    log,
+                    "recv button={} pressed=false x={} y={} t_ns={}",
+                    e.detail,
+                    e.event_x,
+                    e.event_y,
                     now_ns()
                 )?;
                 log.flush()?;

@@ -11,7 +11,9 @@
 
 use anyhow::{bail, Context, Result};
 use x11rb::connection::Connection;
-use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _, InputFocus, Timestamp, Window};
+use x11rb::protocol::xproto::{
+    AtomEnum, ConfigureWindowAux, ConnectionExt as _, InputFocus, StackMode, Timestamp, Window,
+};
 use x11rb::protocol::xtest::ConnectionExt as _;
 
 fn main() -> Result<()> {
@@ -204,6 +206,15 @@ fn main() -> Result<()> {
                 .check()?;
             conn.flush()?;
             println!("focused {win:#x}");
+        }
+        "raise" => {
+            // Test aid: raise without a WM (XRaiseWindow's job on a desktop).
+            let needle = args.next().context("raise needs a title substring")?;
+            let win = find_window(&conn, root, &needle)?.context("no window matched")?;
+            conn.configure_window(win, &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE))?
+                .check()?;
+            conn.flush()?;
+            println!("raised {win:#x}");
         }
         "click" => {
             let needle = args.next().context("click needs a title substring")?;
