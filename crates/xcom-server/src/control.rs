@@ -17,7 +17,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -138,12 +138,68 @@ pub enum Command {
     },
 }
 
+/// What holds the single attachment slot.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AttachmentState {
+    /// No handshake handed out.
+    Idle,
+    /// A bootstrap got a handshake, but its control channel has not arrived.
+    Reserved,
+    /// The control channel is up: a client is attached.
+    Attached,
+}
+
+/// Slot state plus when it was entered, for the busy reply and its log line.
+struct AttachmentStatus {
+    state: AttachmentState,
+    since: Instant,
+}
+
+impl AttachmentStatus {
+    fn idle() -> Self {
+        Self {
+            state: AttachmentState::Idle,
+            since: Instant::now(),
+        }
+    }
+
+    /// Why an attach must be refused, and for how long the slot has been held.
+    ///
+    /// The reservation case is not a real client: a bootstrap's direct TLS
+    /// connect never completed, and `serve_attachment` is still waiting for
+    /// it. Distinguishing this from a live client is what makes a "session
+    /// busy" report diagnosable.
+    fn busy(&self) -> Option<String> {
+        let secs = self.since.elapsed().as_secs();
+        match self.state {
+            AttachmentState::Idle => None,
+            AttachmentState::Reserved => Some(format!(
+                "session busy (handshake reserved for {secs}s, no client connected yet)"
+            )),
+            AttachmentState::Attached => Some(format!(
+                "session busy (another client attached for {secs}s)"
+            )),
+        }
+    }
+
+    fn mark_attached(&mut self) {
+        if self.state == AttachmentState::Reserved {
+            self.state = AttachmentState::Attached;
+            self.since = Instant::now();
+        }
+    }
+}
+
+fn clear_status(status: &Mutex<AttachmentStatus>) {
+    *status.lock().unwrap_or_else(|e| e.into_inner()) = AttachmentStatus::idle();
+}
+
 /// The owner's control socket. Dropping it removes the socket file.
 pub struct Control {
     pub rx: mpsc::Receiver<Command>,
     /// Set by `xcomd kill`; the owner and the attachment loop poll it.
     pub kill: Arc<AtomicBool>,
-    attached: Arc<AtomicBool>,
+    status: Arc<Mutex<AttachmentStatus>>,
     path: PathBuf,
 }
 
@@ -169,26 +225,33 @@ impl Control {
             .context("configuring the session socket")?;
 
         let (tx, rx) = mpsc::channel();
-        let attached = Arc::new(AtomicBool::new(false));
+        let status = Arc::new(Mutex::new(AttachmentStatus::idle()));
         let kill = Arc::new(AtomicBool::new(false));
         let info = Arc::new(info);
-        let attached_thread = Arc::clone(&attached);
+        let status_thread = Arc::clone(&status);
         let kill_thread = Arc::clone(&kill);
-        std::thread::spawn(move || {
-            serve_socket(listener, info, tx, attached_thread, kill_thread)
-        });
+        std::thread::spawn(move || serve_socket(listener, info, tx, status_thread, kill_thread));
 
         Ok(Control {
             rx,
             kill,
-            attached,
+            status,
             path,
         })
     }
 
     /// The attachment is over (detached, failed to start, or the client left).
     pub fn clear_attached(&self) {
-        self.attached.store(false, Ordering::SeqCst);
+        clear_status(&self.status);
+    }
+
+    /// The control channel arrived: the slot now holds a real client, not just
+    /// a handed-out handshake.
+    pub fn mark_attached(&self) {
+        self.status
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .mark_attached();
     }
 }
 
@@ -202,12 +265,12 @@ fn serve_socket(
     listener: UnixListener,
     info: Arc<Info>,
     commands: mpsc::Sender<Command>,
-    attached: Arc<AtomicBool>,
+    status: Arc<Mutex<AttachmentStatus>>,
     kill: Arc<AtomicBool>,
 ) {
     while !kill.load(Ordering::SeqCst) {
         match listener.accept() {
-            Ok((stream, _)) => handle(stream, &info, &commands, &attached, &kill),
+            Ok((stream, _)) => handle(stream, &info, &commands, &status, &kill),
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(50));
             }
@@ -223,7 +286,7 @@ fn handle(
     mut stream: UnixStream,
     info: &Info,
     commands: &mpsc::Sender<Command>,
-    attached: &AtomicBool,
+    status: &Mutex<AttachmentStatus>,
     kill: &AtomicBool,
 ) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
@@ -247,13 +310,25 @@ fn handle(
             let peer = peer.and_then(|peer| peer.parse().ok());
             // Reserve the slot before handing the request to the owner loop, so
             // two bootstraps cannot both think they got it.
-            if attached.swap(true, Ordering::SeqCst) {
-                reply_error(&mut stream, "session busy");
+            let busy = {
+                let mut status = status.lock().unwrap_or_else(|e| e.into_inner());
+                match status.busy() {
+                    Some(busy) => Some(busy),
+                    None => {
+                        status.state = AttachmentState::Reserved;
+                        status.since = Instant::now();
+                        None
+                    }
+                }
+            };
+            if let Some(busy) = busy {
+                logln!("[control] attach refused: {busy}");
+                reply_error(&mut stream, &busy);
                 return;
             }
             let (tx, rx) = mpsc::sync_channel(1);
             if commands.send(Command::Attach { peer, reply: tx }).is_err() {
-                attached.store(false, Ordering::SeqCst);
+                clear_status(status);
                 reply_error(&mut stream, "session is shutting down");
                 return;
             }
@@ -263,17 +338,19 @@ fn handle(
                     let _ = stream.flush();
                 }
                 Ok(Err(e)) => {
-                    attached.store(false, Ordering::SeqCst);
+                    clear_status(status);
                     reply_error(&mut stream, &e);
                 }
                 Err(_) => {
-                    attached.store(false, Ordering::SeqCst);
+                    clear_status(status);
                     reply_error(&mut stream, "attach timed out");
                 }
             }
         }
         Request::Info => {
-            let info = info.session(attached.load(Ordering::SeqCst));
+            let attached =
+                status.lock().unwrap_or_else(|e| e.into_inner()).state != AttachmentState::Idle;
+            let info = info.session(attached);
             match serde_json::to_string(&info) {
                 Ok(line) => reply(&mut stream, &line),
                 Err(e) => logln!("[control] encoding info: {e}"),
@@ -636,6 +713,23 @@ fn human_age(secs: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn busy_replies_name_the_state() {
+        let mut status = AttachmentStatus::idle();
+        assert_eq!(status.busy(), None);
+
+        status.state = AttachmentState::Reserved;
+        status.since = Instant::now() - Duration::from_secs(3);
+        let reserved = status.busy().unwrap();
+        assert!(reserved.starts_with("session busy"), "{reserved}");
+        assert!(reserved.contains("handshake reserved"), "{reserved}");
+
+        status.mark_attached();
+        assert_eq!(status.state, AttachmentState::Attached);
+        let attached = status.busy().unwrap();
+        assert!(attached.contains("another client attached"), "{attached}");
+    }
 
     #[test]
     fn session_names_are_restricted() {

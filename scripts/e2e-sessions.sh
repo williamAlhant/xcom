@@ -80,6 +80,11 @@ if grep -q 'window .* opened' "$OUT/client2.log"; then
     fail "busy client still opened a window"
 fi
 kill -0 "$CPID" 2>/dev/null || fail "the first client died when the second was rejected"
+LOG="${SOCK%.sock}.log"
+BUSY_LOG=$(e2e_ssh "grep 'attach refused' '$LOG' 2>/dev/null | tail -1" | tr -d '\r')
+echo "busy log: $BUSY_LOG"
+grep -q 'another client attached' <<< "$BUSY_LOG" \
+    || fail "busy refusal was not logged as an attached client"
 
 echo "--- client sessions wrapper ---"
 "$XCOM" sessions --ssh xcom@127.0.0.1 --ssh-args "$E2E_SSH_ARGS" \

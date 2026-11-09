@@ -374,6 +374,7 @@ fn serve_attachment(
     att: &Attachment,
     net: &NetArgs,
     session_end: &AtomicBool,
+    owner_control: Option<&crate::control::Control>,
 ) -> Result<AttachmentEnd> {
     let Owner {
         display,
@@ -403,6 +404,11 @@ fn serve_attachment(
         .acceptor
         .accept(Role::Control, timeout)
         .context("accepting control channel")?;
+    // The slot now holds a real client: `xcomd sessions` and a refused attach
+    // report "attached" rather than "reserved" from here on.
+    if let Some(owner_control) = owner_control {
+        owner_control.mark_attached();
+    }
     // The second role must follow promptly. A partial connect (control up,
     // bulk fails) otherwise keeps the session "busy" for the whole
     // --accept-timeout, which kills the client's reconnect.
@@ -601,7 +607,7 @@ pub fn run(args: ServeArgs) -> Result<()> {
         logln!("[serve] {}", att.line);
     }
     let never = AtomicBool::new(false);
-    let result = serve_attachment(&mut owner, &att, &args.net, &never);
+    let result = serve_attachment(&mut owner, &att, &args.net, &never, None);
     owner.stop_app();
     result.map(|_| ())
 }
@@ -664,7 +670,13 @@ pub fn run_session(args: SessionArgs) -> Result<()> {
                     control.clear_attached();
                     continue;
                 }
-                match serve_attachment(&mut owner, &att, &args.net, &control.kill) {
+                match serve_attachment(
+                    &mut owner,
+                    &att,
+                    &args.net,
+                    &control.kill,
+                    Some(&control),
+                ) {
                     Ok(AttachmentEnd::AppExited) => {
                         logln!("[session] app exited; ending");
                         break;
