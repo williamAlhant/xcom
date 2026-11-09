@@ -1088,6 +1088,26 @@ pub(crate) fn control_reader_loop(
     }
 }
 
+/// How long the writer waits for input before sending a keepalive probe.
+const PING_INTERVAL: Duration = Duration::from_secs(5);
+
+/// A probe older than this means the peer is gone.
+const NO_PONG_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Only one probe may be outstanding.
+///
+/// Sending a fresh ping every interval would replace the timestamp the
+/// [`pong_overdue`] check compares against, so an idle link whose peer vanished
+/// (sleep/wake, NAT drop) would never be declared dead.
+fn ping_due(pending: &Option<(u64, Instant)>) -> bool {
+    pending.is_none()
+}
+
+/// True when the outstanding probe has gone unanswered for too long.
+fn pong_overdue(pending: Option<(u64, Instant)>, now: Instant) -> bool {
+    pending.is_some_and(|(_, at)| now.saturating_duration_since(at) > NO_PONG_TIMEOUT)
+}
+
 /// Writer half: writes queued input immediately (no read timeout to wait for)
 /// and sends the keepalive ping when idle.
 /// Send one keepalive/RTT probe and remember when it was sent.
@@ -1122,14 +1142,15 @@ pub(crate) fn control_writer_loop(
         }
         // Liveness: a ping outstanding for 20 s means the peer is gone. This is
         // the app-level equivalent of the old "no traffic for 20 s" check.
-        if let Some((_, at)) = *pending.lock().unwrap() {
-            if at.elapsed() > Duration::from_secs(20) {
-                logln!("[xcom] no pong for 20 s; assuming the peer is gone");
-                writer.force_close();
-                return;
-            }
+        if pong_overdue(*pending.lock().unwrap(), Instant::now()) {
+            logln!(
+                "[xcom] no pong for {} s; assuming the peer is gone",
+                NO_PONG_TIMEOUT.as_secs()
+            );
+            writer.force_close();
+            return;
         }
-        match input_rx.recv_timeout(Duration::from_secs(5)) {
+        match input_rx.recv_timeout(PING_INTERVAL) {
             Ok((msg, at)) => {
                 let waited = at.elapsed().as_micros().min(u32::MAX as u128) as u32;
                 queue_us.fetch_max(waited, Ordering::Relaxed);
@@ -1144,7 +1165,10 @@ pub(crate) fn control_writer_loop(
                 }
             }
             Err(RecvTimeoutError::Timeout) => {
-                if !send_ping(&mut writer, &pending) {
+                // Keep one probe outstanding so its age can reach the timeout
+                // above; the pong clears it as soon as it arrives.
+                let due = ping_due(&pending.lock().unwrap());
+                if due && !send_ping(&mut writer, &pending) {
                     writer.force_close();
                     return;
                 }
@@ -1179,7 +1203,21 @@ pub(crate) fn bulk_loop(
 
 #[cfg(test)]
 mod tests {
-    use super::parse_spawn;
+    use super::{parse_spawn, ping_due, pong_overdue, NO_PONG_TIMEOUT};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn keepalive_keeps_one_probe_outstanding() {
+        let at = Instant::now();
+        assert!(ping_due(&None));
+        assert!(!ping_due(&Some((1, at))));
+        assert!(!pong_overdue(None, at));
+        assert!(!pong_overdue(Some((1, at)), at + Duration::from_secs(5)));
+        assert!(pong_overdue(
+            Some((1, at)),
+            at + NO_PONG_TIMEOUT + Duration::from_secs(1)
+        ));
+    }
 
     #[test]
     fn spawn_sizes_parse() {
