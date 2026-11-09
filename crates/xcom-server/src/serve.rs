@@ -829,6 +829,11 @@ fn control_loop_inner(
                         logln!("[serve] focus {window:#x}: not a tracked window");
                         continue;
                     }
+                    // Local focus follows the user's window manager, so the
+                    // remote stack must follow it too: pointer events go to the
+                    // topmost window under the pointer, not to the X input
+                    // focus, and this display has no WM to raise anything.
+                    injector.raise(window)?;
                     injector.focus(window)?;
                 }
                 Message::InputButton {
@@ -846,6 +851,15 @@ fn control_loop_inner(
                         logln!(
                             "[serve] recv button {button} {pressed} {window:#x} rel=({x},{y}) -> root=({rx},{ry})"
                         );
+                    }
+                    if pressed {
+                        // The press is delivered to the topmost remote window
+                        // under the pointer, and the remote windows may
+                        // overlap even when the local WM cascaded them apart.
+                        // Raise the window the user actually clicked before
+                        // injecting, or a sibling receives the press (text
+                        // selection silently goes to the wrong terminal).
+                        injector.raise(window)?;
                     }
                     injector.motion(rx, ry)?;
                     injector.button(button, pressed)?;

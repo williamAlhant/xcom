@@ -9,7 +9,9 @@ use std::collections::{HashMap, HashSet};
 
 use anyhow::{anyhow, Result};
 use x11rb::connection::Connection;
-use x11rb::protocol::xproto::{ConnectionExt, InputFocus, Keycode, Timestamp, Window};
+use x11rb::protocol::xproto::{
+    ConfigureWindowAux, ConnectionExt, InputFocus, Keycode, StackMode, Timestamp, Window,
+};
 use x11rb::protocol::xtest::ConnectionExt as _;
 
 use crate::keymap::{Binding, Keymap, MASK_CONTROL, MASK_MOD1, MASK_SHIFT, XK_ALT_L, XK_CONTROL_L, XK_SHIFT_L};
@@ -265,6 +267,20 @@ impl<'c, C: Connection> Injector<'c, C> {
 
     pub fn motion(&self, x: i16, y: i16) -> Result<()> {
         self.fake(FAKE_MOTION, 0, x, y)
+    }
+
+    /// Raise a window to the top of the stack.
+    ///
+    /// Pointer events are delivered by position and stacking order, not by the
+    /// input focus, and the remote display has no window manager to raise the
+    /// clicked window. Callers must raise the target before injecting a press,
+    /// or it lands on whichever remote sibling happens to be on top.
+    pub fn raise(&self, win: Window) -> Result<()> {
+        self.conn
+            .configure_window(win, &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE))
+            .map_err(|e| anyhow::anyhow!(e))?;
+        self.conn.flush().map_err(|e| anyhow::anyhow!(e))?;
+        Ok(())
     }
 
     /// Give a window keyboard focus (what a window manager would do on click).
