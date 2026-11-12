@@ -254,6 +254,56 @@ struct Attached {
     placed: (i32, i32),
 }
 
+/// Reconnect status banner.
+///
+/// The link's reader thread starts before the supervisor sends
+/// `UserEvent::Reconnected`, so it can deliver `SyncDone` first. The banner is
+/// therefore driven by whether a resync is still outstanding, not by event
+/// arrival order: re-arming it after the sync completed would leave it stuck
+/// until the next outage.
+#[derive(Default)]
+struct ReconnectBanner {
+    text: Option<String>,
+    awaiting_sync: bool,
+}
+
+impl ReconnectBanner {
+    fn connection_lost(&mut self) {
+        self.awaiting_sync = true;
+        self.text = Some("connection lost — reconnecting…".to_string());
+    }
+
+    fn reconnecting(&mut self, attempt: u32) {
+        self.text = Some(format!(
+            "connection lost — reconnecting (attempt {attempt})…"
+        ));
+    }
+
+    /// Show the resync banner. Returns false when the sync already finished
+    /// before this event was processed.
+    fn reconnected(&mut self) -> bool {
+        if !self.awaiting_sync {
+            self.text = None;
+            return false;
+        }
+        self.text = Some("reconnected — resyncing…".to_string());
+        true
+    }
+
+    fn reconnect_failed(&mut self, error: &str) {
+        self.text = Some(format!("reconnect failed: {error}"));
+    }
+
+    fn sync_done(&mut self) {
+        self.awaiting_sync = false;
+        self.text = None;
+    }
+
+    fn text(&self) -> Option<&str> {
+        self.text.as_deref()
+    }
+}
+
 pub struct App {
     input_tx: crate::link::InputSink,
     pixels: HashMap<u32, Pixels>,
@@ -300,8 +350,8 @@ pub struct App {
     close_action: CloseAction,
     /// Modal "close the last window?" dialog, when one is up.
     dialog: Option<CloseDialog>,
-    /// Reconnect status banner (none while the link is healthy).
-    banner: Option<String>,
+    /// Reconnect status banner (empty while the link is healthy).
+    banner: ReconnectBanner,
     /// Windows that existed before the current outage. On SyncDone, the ones
     /// the server did not re-announce are closed.
     stale: Option<std::collections::HashSet<u32>>,
@@ -452,7 +502,7 @@ impl App {
             close_action,
             dialog: None,
             pointer: (0.0, 0.0),
-            banner: None,
+            banner: ReconnectBanner::default(),
             stale: None,
             confirmed: std::collections::HashSet::new(),
             ended: false,
@@ -721,7 +771,7 @@ impl App {
             .as_ref()
             .filter(|d| d.window == id)
             .map(|d| (d.focus, d.hover));
-        let banner = self.banner.clone();
+        let banner = self.banner.text().map(str::to_owned);
         let (Some(att), Some(pix)) = (self.attached.get_mut(&id), self.pixels.get(&id)) else {
             return;
         };
@@ -1135,7 +1185,7 @@ impl ApplicationHandler<UserEvent> for App {
                     );
                     self.stale = Some(self.attached.keys().copied().collect());
                     self.confirmed.clear();
-                    self.banner = Some("connection lost — reconnecting…".to_string());
+                    self.banner.connection_lost();
                     self.redraw_all();
                 } else {
                     self.dialog = None;
@@ -1157,16 +1207,18 @@ impl ApplicationHandler<UserEvent> for App {
                 if self.ended {
                     return;
                 }
-                self.banner =
-                    Some(format!("connection lost — reconnecting (attempt {attempt})…"));
+                self.banner.reconnecting(attempt);
                 self.redraw_all();
             }
             UserEvent::Reconnected => {
                 if self.ended {
                     return;
                 }
-                logln!("[ui] reconnected; waiting for the window resync");
-                self.banner = Some("reconnected — resyncing…".to_string());
+                if self.banner.reconnected() {
+                    logln!("[ui] reconnected; waiting for the window resync");
+                } else {
+                    logln!("[ui] reconnected; resync already complete");
+                }
                 self.redraw_all();
             }
             UserEvent::ReconnectFailed(error) => {
@@ -1174,7 +1226,7 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
                 logln!("[ui] reconnect failed: {error}");
-                self.banner = Some(format!("reconnect failed: {error}"));
+                self.banner.reconnect_failed(&error);
                 self.redraw_all();
             }
             UserEvent::SessionGone(error) => {
@@ -1197,7 +1249,7 @@ impl ApplicationHandler<UserEvent> for App {
                 if self.ended {
                     return;
                 }
-                self.banner = None;
+                self.banner.sync_done();
                 if let Some(stale) = self.stale.take() {
                     let gone: Vec<u32> = stale.difference(&self.confirmed).copied().collect();
                     for id in gone {
@@ -1758,6 +1810,43 @@ fn ppm_bytes(w: u16, h: u16, buf: &[u32]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resync_banner_is_order_independent() {
+        let mut banner = ReconnectBanner::default();
+
+        // Normal order: reconnect first, then the server's sync completes.
+        banner.connection_lost();
+        assert!(banner.reconnected());
+        assert_eq!(banner.text(), Some("reconnected — resyncing…"));
+        banner.sync_done();
+        assert_eq!(banner.text(), None);
+
+        // The reader thread can deliver SyncDone before Reconnected. That must
+        // not re-arm the banner after the sync has completed.
+        banner.connection_lost();
+        banner.sync_done();
+        assert!(!banner.reconnected());
+        assert_eq!(banner.text(), None);
+    }
+
+    #[test]
+    fn resync_banner_survives_a_failed_attempt() {
+        let mut banner = ReconnectBanner::default();
+        banner.connection_lost();
+        banner.reconnect_failed("boom");
+        assert_eq!(banner.text(), Some("reconnect failed: boom"));
+        // A failed attempt must not end the resync wait.
+        assert!(banner.reconnected());
+        assert_eq!(banner.text(), Some("reconnected — resyncing…"));
+    }
+
+    #[test]
+    fn initial_sync_done_leaves_no_banner() {
+        let mut banner = ReconnectBanner::default();
+        banner.sync_done();
+        assert_eq!(banner.text(), None);
+    }
 
     #[test]
     fn resize_preserves_content() {

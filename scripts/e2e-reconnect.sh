@@ -52,8 +52,8 @@ echo "channels=$CHANNELS reconnects=$RECONNECTS window-opens=$OPENS"
 [ "$RECONNECTS" -ge 2 ] || fail "reconnect supervisor did not reconnect twice"
 [ "$OPENS" -eq 1 ] || fail "the window was not reused across reconnects ($OPENS opens)"
 grep -q 'connection lost, keeping' "$OUT/client.log" || fail "no frozen-window banner"
-grep -q 'reconnected; waiting for the window resync' "$OUT/client.log" \
-    || fail "no resync notice"
+grep -qE 'reconnected; (waiting for the window resync|resync already complete)' \
+    "$OUT/client.log" || fail "no resync notice"
 
 PID=$(e2e_ssh 'cat /tmp/reconnect.pid 2>/dev/null' | tr -d '\r' || true)
 [ -n "$PID" ] || fail "app did not record its pid"
